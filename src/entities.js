@@ -40,20 +40,27 @@ entities.get('/:entity', async (c) => {
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
+  console.log(`[GET /entities/${entity}] table=${table} query=${JSON.stringify(c.req.query())}`);
   let q = db.from(table).select('*');
+  
   // Apply filters from query parameters
-  for (const [k, v] of Object.entries(c.req.query())) {
-    if (k === 'limit' || k === 'order') continue; // Already handled
-    if (v === null || v === 'null') q = q.is(k, null);
-    else if (String(v).startsWith('in:')) q = q.in(k, String(v).substring(3).split(','));
-    else if (String(v).startsWith('neq:')) q = q.neq(k, String(v).substring(4));
-    else if (String(v).startsWith('gt:')) q = q.gt(k, String(v).substring(3));
-    else if (String(v).startsWith('gte:')) q = q.gte(k, String(v).substring(4));
-    else if (String(v).startsWith('lt:')) q = q.lt(k, String(v).substring(3));
-    else if (String(v).startsWith('lte:')) q = q.lte(k, String(v).substring(4));
-    else if (String(v).startsWith('like:')) q = q.like(k, String(v).substring(5));
-    else if (String(v).startsWith('ilike:')) q = q.ilike(k, String(v).substring(6));
-    else q = q.eq(k, v);
+  // Use c.req.queries() to handle multiple values for the same key
+  const allQueries = c.req.queries();
+  for (const [k, values] of Object.entries(allQueries)) {
+    if (k === 'limit' || k === 'order') continue;
+    
+    for (const v of values) {
+      if (v === null || v === 'null') q = q.is(k, null);
+      else if (String(v).startsWith('in:')) q = q.in(k, String(v).substring(3).split(','));
+      else if (String(v).startsWith('neq:')) q = q.neq(k, String(v).substring(4));
+      else if (String(v).startsWith('gt:')) q = q.gt(k, String(v).substring(3));
+      else if (String(v).startsWith('gte:')) q = q.gte(k, String(v).substring(4));
+      else if (String(v).startsWith('lt:')) q = q.lt(k, String(v).substring(3));
+      else if (String(v).startsWith('lte:')) q = q.lte(k, String(v).substring(4));
+      else if (String(v).startsWith('like:')) q = q.like(k, String(v).substring(5));
+      else if (String(v).startsWith('ilike:')) q = q.ilike(k, String(v).substring(6));
+      else q = q.eq(k, v);
+    }
   }
   q = q.order(column, { ascending }).limit(limit);
   const { data, error } = await q;
