@@ -43,7 +43,7 @@ export async function getUserFromRequest(c) {
     return {
       id: p.id,
       email: p.email,
-      role: p.role,
+      role: p.role || 'admin',
       company_name: p.company_name,
       company_cnpj: p.company_cnpj,
       company_phone: p.company_phone,
@@ -58,16 +58,33 @@ export async function getUserFromRequest(c) {
   const { data, error } = await admin.auth.getUser(token);
   if (error || !data?.user) return null;
   const user = data.user;
-  const { data: profile } = await admin.from('profiles').select('*').eq('id', user.id).maybeSingle();
+
+  let { data: profile } = await admin.from('profiles').select('*').eq('id', user.id).maybeSingle();
+
+  // Garante perfil (usuários antigos / login sem register completo)
+  if (!profile) {
+    const seed = {
+      id: user.id,
+      email: user.email,
+      role: 'admin',
+      company_name: user.user_metadata?.company_name || null,
+      company_cnpj: user.user_metadata?.company_cnpj || null,
+      company_phone: user.user_metadata?.company_phone || null,
+    };
+    const { data: created } = await admin.from('profiles').upsert(seed).select().maybeSingle();
+    profile = created || seed;
+  }
+
   return {
     id: user.id,
     email: user.email,
-    role: profile?.role || 'user',
-    company_name: profile?.company_name,
-    company_cnpj: profile?.company_cnpj,
-    company_phone: profile?.company_phone,
-    company_instagram: profile?.company_instagram,
-    referral_code: profile?.referral_code,
+    role: profile?.role || 'admin',
+    company_name: profile?.company_name || null,
+    company_cnpj: profile?.company_cnpj || null,
+    company_phone: profile?.company_phone || null,
+    company_instagram: profile?.company_instagram || null,
+    company_address: profile?.company_address || null,
+    referral_code: profile?.referral_code || null,
     full_name: profile?.company_name || user.email,
     data: profile || {},
   };
@@ -164,26 +181,74 @@ auth.post('/logout', async (c) => c.json({ ok: true }));
 auth.patch('/me', async (c) => {
   const user = await getUserFromRequest(c);
   if (!user) return c.json({ error: 'unauthorized' }, 401);
-  const body = await c.req.json();
-  const allowed = ['company_name', 'company_cnpj', 'company_phone', 'company_instagram', 'referral_code', 'role'];
+  const body = await c.req.json().catch(() => ({}));
+  // company_address pode não existir na tabela — tentamos e removemos se falhar
+  const allowed = ['company_name', 'company_cnpj', 'company_phone', 'company_instagram', 'company_address', 'referral_code', 'role'];
   const patch = {};
-  for (const k of allowed) if (k in body) patch[k] = body[k];
+  for (const k of allowed) {
+    if (k in body) patch[k] = body[k] === '' ? null : body[k];
+  }
+
+  const shape = (p) => ({
+    id: user.id,
+    email: user.email,
+    role: p?.role || user.role || 'admin',
+    company_name: p?.company_name ?? null,
+    company_cnpj: p?.company_cnpj ?? null,
+    company_phone: p?.company_phone ?? null,
+    company_instagram: p?.company_instagram ?? null,
+    company_address: p?.company_address ?? null,
+    referral_code: p?.referral_code ?? null,
+    full_name: p?.company_name || user.email,
+    data: p || {},
+  });
 
   if (useLocal) {
     const keys = Object.keys(patch);
-    if (!keys.length) return c.json(user);
+    if (!keys.length) return c.json(shape(user.data || user));
     const sets = keys.map((k, i) => `${k} = $${i + 2}`).join(', ');
     const vals = keys.map((k) => patch[k]);
     const { rows } = await query(
       `update profiles set ${sets}, updated_at = now() where id = $1 returning *`,
       [user.id, ...vals]
     );
-    return c.json({ id: user.id, email: user.email, ...rows[0] });
+    return c.json(shape(rows[0] || {}));
   }
 
-  const { data, error } = await admin.from('profiles').update(patch).eq('id', user.id).select().single();
+  if (!Object.keys(patch).length) return c.json(shape(user.data || {}));
+
+  // Upsert evita erro quando perfil ainda não existe
+  let payload = { id: user.id, email: user.email, ...patch };
+  if (!payload.role) payload.role = user.role || 'admin';
+
+  let { data, error } = await admin.from('profiles').upsert(payload).select().maybeSingle();
+
+  // Se company_address não existe no schema, remove e tenta de novo
+  if (error && String(error.message || '').includes('company_address')) {
+    delete payload.company_address;
+    delete patch.company_address;
+    ({ data, error } = await admin.from('profiles').upsert(payload).select().maybeSingle());
+  }
+
   if (error) return c.json({ error: error.message }, 400);
-  return c.json({ id: user.id, email: user.email, ...data });
+
+  // Espelha nome da empresa no AppSettings (catálogo / recibos)
+  if (patch.company_name) {
+    try {
+      const { data: settings } = await admin
+        .from('app_settings')
+        .select('id')
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (settings?.[0]?.id) {
+        await admin.from('app_settings').update({ company_name: patch.company_name }).eq('id', settings[0].id);
+      }
+    } catch (e) {
+      console.warn('sync app_settings company_name', e.message);
+    }
+  }
+
+  return c.json(shape(data || payload));
 });
 
 auth.post('/oauth', async (c) => {
