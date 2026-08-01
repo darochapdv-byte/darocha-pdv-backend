@@ -86,9 +86,8 @@ functions.post('/open-cash-session', async (c) => {
     if (!operator_id) return c.json({ error: 'Selecione o funcionário.' }, 400);
     if (!device_id) return c.json({ error: 'Dispositivo não identificado.' }, 400);
 
-    // Se já existe caixa aberto do mesmo operador no mesmo dispositivo, retoma (evita duplicar).
-    // NÃO bloqueia: permite múltiplos caixas de operadores/dispositivos diferentes.
-    const { data: existingSame } = await admin
+    // Se já existe caixa aberto do mesmo operador no mesmo dispositivo (deste usuário), retoma.
+    let existingQuery = admin
       .from('cash_session')
       .select('*')
       .eq('operator_id', operator_id)
@@ -96,6 +95,9 @@ functions.post('/open-cash-session', async (c) => {
       .eq('status', 'aberto')
       .order('created_at', { ascending: false })
       .limit(1);
+    if (user?.id) existingQuery = existingQuery.eq('created_by', user.id);
+
+    const { data: existingSame } = await existingQuery;
 
     if (existingSame?.length) {
       const session = existingSame[0];
@@ -119,6 +121,7 @@ functions.post('/open-cash-session', async (c) => {
       terminal: body.terminal || '',
       status: 'aberto',
       last_active_at: new Date().toISOString(),
+      created_by: user.id,
     };
 
     const { data: session, error } = await admin.from('cash_session').insert(payload).select().single();
@@ -144,6 +147,10 @@ functions.post('/takeover-cash-session', async (c) => {
 
     const { data: session } = await admin.from('cash_session').select('*').eq('id', session_id).maybeSingle();
     if (!session) return c.json({ error: 'Caixa não encontrado.' }, 404);
+    // Só permite assumir caixa do próprio usuário
+    if (user?.id && session.created_by && session.created_by !== user.id) {
+      return c.json({ error: 'Caixa não pertence a este usuário.' }, 403);
+    }
     if (session.status !== 'aberto') {
       return c.json({ error: 'Este caixa já foi fechado e não pode ser assumido.' }, 400);
     }
@@ -238,11 +245,15 @@ functions.post("/list-open-cash-sessions", async (c) => {
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
-    const { data: openSessions, error } = await admin
+    // Só lista caixas abertos DO usuário logado (multi-tenant)
+    let q = admin
       .from('cash_session')
       .select('*')
       .eq('status', 'aberto')
       .order('created_at', { ascending: false });
+    if (user?.id) q = q.eq('created_by', user.id);
+
+    const { data: openSessions, error } = await q;
 
     if (error) return c.json({ error: error.message }, 500);
     return c.json(toBase44Rows(openSessions));
