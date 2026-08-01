@@ -40,7 +40,23 @@ entities.get('/:entity', async (c) => {
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
-  const { data, error } = await db.from(table).select('*').order(column, { ascending }).limit(limit);
+  let q = db.from(table).select('*');
+  // Apply filters from query parameters
+  for (const [k, v] of Object.entries(c.req.query())) {
+    if (k === 'limit' || k === 'order') continue; // Already handled
+    if (v === null || v === 'null') q = q.is(k, null);
+    else if (String(v).startsWith('in:')) q = q.in(k, String(v).substring(3).split(','));
+    else if (String(v).startsWith('neq:')) q = q.neq(k, String(v).substring(4));
+    else if (String(v).startsWith('gt:')) q = q.gt(k, String(v).substring(3));
+    else if (String(v).startsWith('gte:')) q = q.gte(k, String(v).substring(4));
+    else if (String(v).startsWith('lt:')) q = q.lt(k, String(v).substring(3));
+    else if (String(v).startsWith('lte:')) q = q.lte(k, String(v).substring(4));
+    else if (String(v).startsWith('like:')) q = q.like(k, String(v).substring(5));
+    else if (String(v).startsWith('ilike:')) q = q.ilike(k, String(v).substring(6));
+    else q = q.eq(k, v);
+  }
+  q = q.order(column, { ascending }).limit(limit);
+  const { data, error } = await q;
   if (error) return c.json({ error: error.message }, 400);
   return c.json(data);
 });
@@ -66,8 +82,16 @@ entities.post('/:entity/query', async (c) => {
 
   let q = db.from(table).select('*');
   for (const [k, v] of Object.entries(query)) {
-    if (v === null) q = q.is(k, null);
+    if (v === null || v === 'null') q = q.is(k, null);
     else if (Array.isArray(v)) q = q.in(k, v);
+    else if (String(v).startsWith('in:')) q = q.in(k, String(v).substring(3).split(','));
+    else if (String(v).startsWith('neq:')) q = q.neq(k, String(v).substring(4));
+    else if (String(v).startsWith('gt:')) q = q.gt(k, String(v).substring(3));
+    else if (String(v).startsWith('gte:')) q = q.gte(k, String(v).substring(4));
+    else if (String(v).startsWith('lt:')) q = q.lt(k, String(v).substring(3));
+    else if (String(v).startsWith('lte:')) q = q.lte(k, String(v).substring(4));
+    else if (String(v).startsWith('like:')) q = q.like(k, String(v).substring(5));
+    else if (String(v).startsWith('ilike:')) q = q.ilike(k, String(v).substring(6));
     else q = q.eq(k, v);
   }
   q = q.order(column, { ascending }).limit(limit);
