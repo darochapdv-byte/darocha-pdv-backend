@@ -210,7 +210,28 @@ functions.post('/release-pdv-reservations', async (c) => {
 
 // ─── finalize-sale ─────────────────────────────────────────────────────────
 
-functions.post('/finalize-sale', async (c) => {
+functions.post("/list-open-cash-sessions", async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    const { data: openSessions, error } = await admin
+      .from('cash_session')
+      .select('*')
+      .eq('status', 'aberto')
+      .order('created_at', { ascending: false });
+
+    if (error) return c.json({ error: error.message }, 500);
+    return c.json(openSessions);
+  } catch (error) {
+    return c.json({ error: error.message }, 500);
+  }
+});
+
+// ─── finalize-sale ─────────────────────────────────────────────────────────
+
+functions.post("/finalize-sale", async (c) => {
   let session_id = '';
   let device_id = '';
   let client_ref = '';
@@ -344,7 +365,7 @@ functions.post('/finalize-sale', async (c) => {
 functions.post('/:name', async (c) => {
   const name = c.req.param('name');
   const implemented = [
-  'open-cash-session','takeover-cash-session','cash-session-heartbeat','finalize-sale',
+  'open-cash-session','takeover-cash-session','cash-session-heartbeat','list-open-cash-sessions','finalize-sale',
   'release-pdv-reservations','product-inquiry',
   'catalog-data','catalog-checkout','catalog-store-status','catalog-receipt','catalog-expire-pickups',
   'barcode-lookup','product-name-lookup','enrich-product','save-product','refresh-products-catalog',
