@@ -1,8 +1,19 @@
 import { Hono } from 'hono';
 import { admin, userClient, tableFor } from './db.js';
-import { sanitizeDateFields, toBase44Row, toBase44Rows } from './helpers.js';
+import { sanitizeDateFields, toBase44Row, toBase44Rows, requireUser } from './helpers.js';
 
 const entities = new Hono();
+
+// Entidades de negócio isoladas por usuário (multi-tenant)
+const TENANT_ENTITIES = new Set([
+  'Product', 'Customer', 'Seller', 'Supplier', 'Courier',
+  'Sale', 'CashSession', 'CashMovement', 'CashClosing',
+  'StockEntry', 'StockCount', 'StockCountItem', 'StockReservation',
+  'Commission', 'FinancialTransaction', 'FixedExpense',
+  'DeliveryFee', 'ExpenseCategory', 'AppSettings', 'NFeImport',
+  'SaleReturn', 'SaleAuditLog', 'Payroll', 'WishlistItem',
+  'Notification', 'ProblemReport', 'Referral', 'Reward',
+]);
 
 function clientFrom(c) {
   // Always use admin client to bypass RLS (no per-user policies defined)
@@ -16,6 +27,18 @@ function parseOrder(order) {
   // map Base44 virtual fields
   const map = { created_date: 'created_at', updated_date: 'updated_at' };
   return { column: map[column] || column, ascending: !desc };
+}
+
+function isTenantEntity(entityName) {
+  return TENANT_ENTITIES.has(entityName);
+}
+
+/** Aplica filtro de dono (created_by) quando a entidade é multi-tenant */
+function applyTenantFilter(q, entityName, user) {
+  if (user && isTenantEntity(entityName)) {
+    q = q.eq('created_by', user.id);
+  }
+  return q;
 }
 
 // SSE realtime (deve vir ANTES de /:entity/:id)
@@ -39,8 +62,11 @@ entities.get('/:entity', async (c) => {
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
-  console.log(`[GET /entities/${entity}] table=${table} query=${JSON.stringify(c.req.query())}`);
+  const user = await requireUser(c);
+
+  console.log(`[GET /entities/${entity}] table=${table} user=${user?.id || 'anon'} query=${JSON.stringify(c.req.query())}`);
   let q = db.from(table).select('*');
+  q = applyTenantFilter(q, entity, user);
 
   const allQueries = c.req.queries();
   for (const [k, values] of Object.entries(allQueries)) {
@@ -66,17 +92,24 @@ entities.get('/:entity', async (c) => {
 });
 
 entities.get('/:entity/:id', async (c) => {
-  const table = tableFor(c.req.param('entity'));
+  const entity = c.req.param('entity');
+  const table = tableFor(entity);
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
-  const { data, error } = await db.from(table).select('*').eq('id', c.req.param('id')).maybeSingle();
+
+  const user = await requireUser(c);
+  let q = db.from(table).select('*').eq('id', c.req.param('id'));
+  q = applyTenantFilter(q, entity, user);
+
+  const { data, error } = await q.maybeSingle();
   if (error) return c.json({ error: error.message }, 400);
   if (!data) return c.json({ error: 'not_found' }, 404);
   return c.json(toBase44Row(data));
 });
 
 entities.post('/:entity/query', async (c) => {
-  const table = tableFor(c.req.param('entity'));
+  const entity = c.req.param('entity');
+  const table = tableFor(entity);
   const body = await c.req.json().catch(() => ({}));
   const query = body.query || {};
   const limit = Math.min(Number(body.limit || 100), 1000);
@@ -84,7 +117,10 @@ entities.post('/:entity/query', async (c) => {
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
+  const user = await requireUser(c);
   let q = db.from(table).select('*');
+  q = applyTenantFilter(q, entity, user);
+
   for (const [k, v] of Object.entries(query)) {
     if (v === null || v === 'null') q = q.is(k, null);
     else if (Array.isArray(v)) q = q.in(k, v);
@@ -105,49 +141,77 @@ entities.post('/:entity/query', async (c) => {
 });
 
 entities.post('/:entity', async (c) => {
-  const table = tableFor(c.req.param('entity'));
+  const entity = c.req.param('entity');
+  const table = tableFor(entity);
   let body = await c.req.json();
   body = sanitizeDateFields(body);
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
+
+  // Garante ownership no cadastro
+  const user = await requireUser(c);
+  if (user && isTenantEntity(entity)) {
+    body.created_by = user.id;
+  }
+
   const { data, error } = await db.from(table).insert(body).select().single();
   if (error) return c.json({ error: error.message }, 400);
   return c.json(toBase44Row(data), 201);
 });
 
 entities.patch("/:entity/:id", async (c) => {
-  const table = tableFor(c.req.param("entity"));
+  const entity = c.req.param("entity");
+  const table = tableFor(entity);
   let body = await c.req.json();
   body = sanitizeDateFields(body);
+  // Impede troca de dono pelo cliente
+  delete body.created_by;
+
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
-  const { data, error } = await db.from(table).update(body).eq('id', c.req.param('id')).select().single();
+
+  const user = await requireUser(c);
+  let q = db.from(table).update(body).eq('id', c.req.param('id'));
+  q = applyTenantFilter(q, entity, user);
+
+  const { data, error } = await q.select().single();
   if (error) return c.json({ error: error.message }, 400);
   return c.json(toBase44Row(data));
 });
 
 entities.delete('/:entity/:id', async (c) => {
-  const table = tableFor(c.req.param('entity'));
+  const entity = c.req.param('entity');
+  const table = tableFor(entity);
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
-  const { error } = await db.from(table).delete().eq('id', c.req.param('id'));
+
+  const user = await requireUser(c);
+  let q = db.from(table).delete().eq('id', c.req.param('id'));
+  q = applyTenantFilter(q, entity, user);
+
+  const { error } = await q;
   if (error) return c.json({ error: error.message }, 400);
   return c.json({ ok: true });
 });
 
 entities.post("/:entity/bulk-update", async (c) => {
-  const table = tableFor(c.req.param("entity"));
+  const entity = c.req.param("entity");
+  const table = tableFor(entity);
   let { items } = await c.req.json();
   items = items.map(item => sanitizeDateFields(item));
   const db = clientFrom(c) || admin;
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
   if (!Array.isArray(items) || items.length === 0) return c.json([]);
 
+  const user = await requireUser(c);
   const results = [];
   for (const item of items) {
     const { id, ...rest } = item;
     if (!id) continue;
-    const { data, error } = await db.from(table).update(rest).eq('id', id).select().single();
+    delete rest.created_by;
+    let q = db.from(table).update(rest).eq('id', id);
+    q = applyTenantFilter(q, entity, user);
+    const { data, error } = await q.select().single();
     if (error) return c.json({ error: error.message }, 400);
     results.push(toBase44Row(data));
   }
@@ -155,11 +219,18 @@ entities.post("/:entity/bulk-update", async (c) => {
 });
 
 entities.post("/:entity/bulk-create", async (c) => {
-  const table = tableFor(c.req.param("entity"));
+  const entity = c.req.param("entity");
+  const table = tableFor(entity);
   let { items } = await c.req.json();
   items = items.map(item => sanitizeDateFields(item));
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
+
+  const user = await requireUser(c);
+  if (user && isTenantEntity(entity)) {
+    items = items.map((item) => ({ ...item, created_by: user.id }));
+  }
+
   const { data, error } = await db.from(table).insert(items).select();
   if (error) return c.json({ error: error.message }, 400);
   return c.json(toBase44Rows(data), 201);
