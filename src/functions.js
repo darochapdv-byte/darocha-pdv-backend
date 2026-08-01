@@ -86,8 +86,8 @@ functions.post('/open-cash-session', async (c) => {
     if (!operator_id) return c.json({ error: 'Selecione o funcionário.' }, 400);
     if (!device_id) return c.json({ error: 'Dispositivo não identificado.' }, 400);
 
-    // Se já existe caixa aberto do mesmo operador no mesmo dispositivo (deste usuário), retoma.
-    let existingQuery = admin
+    // 1) Mesmo operador + mesmo dispositivo → retoma
+    let sameDeviceQuery = admin
       .from('cash_session')
       .select('*')
       .eq('operator_id', operator_id)
@@ -95,9 +95,9 @@ functions.post('/open-cash-session', async (c) => {
       .eq('status', 'aberto')
       .order('created_at', { ascending: false })
       .limit(1);
-    if (user?.id) existingQuery = existingQuery.eq('created_by', user.id);
+    if (user?.id) sameDeviceQuery = sameDeviceQuery.eq('created_by', user.id);
 
-    const { data: existingSame } = await existingQuery;
+    const { data: existingSame } = await sameDeviceQuery;
 
     if (existingSame?.length) {
       const session = existingSame[0];
@@ -106,6 +106,28 @@ functions.post('/open-cash-session', async (c) => {
         inactive: false,
       }).eq('id', session.id);
       return c.json({ session: toBase44Row(session), resumed: true });
+    }
+
+    // 2) Mesmo operador com caixa aberto em OUTRO dispositivo → não cria outro;
+    //    devolve o existente para o frontend fazer takeover (1 dispositivo por caixa)
+    let otherDeviceQuery = admin
+      .from('cash_session')
+      .select('*')
+      .eq('operator_id', operator_id)
+      .eq('status', 'aberto')
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (user?.id) otherDeviceQuery = otherDeviceQuery.eq('created_by', user.id);
+
+    const { data: existingOther } = await otherDeviceQuery;
+    if (existingOther?.length) {
+      const session = existingOther[0];
+      return c.json({
+        error: 'Este operador já possui um caixa aberto em outro dispositivo. Assuma o caixa para continuar neste aparelho.',
+        requires_takeover: true,
+        session: toBase44Row(session),
+        current_device_id: session.device_id,
+      }, 409);
     }
 
     const operatorIsVendedor = Array.isArray(body.operator_funcoes) && body.operator_funcoes.includes('vendedor');
@@ -164,6 +186,8 @@ functions.post('/takeover-cash-session', async (c) => {
       terminal: body.terminal || session.terminal || '',
     };
 
+    const previousDeviceId = session.device_id || null;
+
     const { data: updated, error } = await admin
       .from('cash_session')
       .update({
@@ -181,11 +205,18 @@ functions.post('/takeover-cash-session', async (c) => {
 
     await logOperation({
       type: 'cash_recovery', level: 'warn',
-      description: `Caixa ${session_id} assumido por ${entry.operator_name} no dispositivo ${device_id}.`,
+      description: `Caixa ${session_id} assumido por ${entry.operator_name} no dispositivo ${device_id} (antes: ${previousDeviceId || 'nenhum'}).`,
       operator_name: entry.operator_name, device_id, cash_session_id: session_id,
     });
 
-    return c.json({ session: toBase44Row(updated), resumed: false });
+    // O dispositivo anterior deixa de ser válido: no próximo heartbeat receberá force_exit
+    return c.json({
+      session: toBase44Row(updated),
+      resumed: false,
+      exclusive: true,
+      previous_device_id: previousDeviceId,
+      message: 'Caixa assumido neste dispositivo. O outro aparelho será desconectado automaticamente.',
+    });
   } catch (error) {
     return c.json({ error: error.message }, 500);
   }
@@ -205,11 +236,26 @@ functions.post('/cash-session-heartbeat', async (c) => {
     if (!session_id) return c.json({ error: 'Sessão não informada.' }, 400);
 
     const { data: session } = await admin.from('cash_session').select('*').eq('id', session_id).maybeSingle();
-    if (!session) return c.json({ error: 'Caixa não encontrado.' }, 404);
-    if (session.status !== 'aberto') return c.json({ error: 'Caixa fechado.' }, 400);
+    if (!session) return c.json({ error: 'Caixa não encontrado.', force_exit: true }, 404);
+    if (session.status !== 'aberto') {
+      return c.json({
+        ok: false,
+        force_exit: true,
+        reason: 'closed',
+        message: 'Este caixa foi fechado. Saia do PDV e abra novamente se necessário.',
+      }, 409);
+    }
 
+    // Caixa foi assumido em outro dispositivo → força saída neste
     if (session.device_id && device_id && session.device_id !== device_id) {
-      return c.json({ ok: true, foreign: true });
+      return c.json({
+        ok: false,
+        foreign: true,
+        force_exit: true,
+        reason: 'taken_over',
+        message: 'Este caixa foi assumido em outro dispositivo. Apenas um dispositivo pode usar o caixa por vez.',
+        current_device_id: session.device_id,
+      }, 409);
     }
 
     const now = new Date().toISOString();
@@ -284,6 +330,33 @@ functions.post("/finalize-sale", async (c) => {
 
     if (!items.length) {
       return c.json({ error: 'Carrinho vazio. Nenhuma alteração foi realizada.' }, 400);
+    }
+
+    // Garante exclusividade do dispositivo no caixa
+    if (session_id) {
+      const { data: cashSession } = await admin
+        .from('cash_session')
+        .select('id,status,device_id,created_by')
+        .eq('id', session_id)
+        .maybeSingle();
+      if (!cashSession || cashSession.status !== 'aberto') {
+        return c.json({
+          error: 'Caixa fechado ou inválido. Abra o caixa novamente.',
+          force_exit: true,
+          reason: 'closed',
+        }, 409);
+      }
+      if (user?.id && cashSession.created_by && cashSession.created_by !== user.id) {
+        return c.json({ error: 'Caixa não pertence a este usuário.', force_exit: true }, 403);
+      }
+      if (device_id && cashSession.device_id && cashSession.device_id !== device_id) {
+        return c.json({
+          error: 'Este caixa foi assumido em outro dispositivo. Apenas um aparelho pode usá-lo por vez.',
+          force_exit: true,
+          foreign: true,
+          reason: 'taken_over',
+        }, 409);
+      }
     }
 
     // RPC atômica (se 002_finalize_sale_rpc.sql foi aplicado)
