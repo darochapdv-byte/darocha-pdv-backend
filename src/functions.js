@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin } from './db.js';
-import { logOperation, releaseSessionReservations, requireUser, stackOf } from './helpers.js';
+import { logOperation, releaseSessionReservations, requireUser, stackOf, sanitizeDateFields } from './helpers.js';
 
 /**
  * Backend functions portadas da Base44.
@@ -84,61 +84,23 @@ functions.post('/open-cash-session', async (c) => {
     if (!operator_id) return c.json({ error: 'Selecione o funcionário.' }, 400);
     if (!device_id) return c.json({ error: 'Dispositivo não identificado.' }, 400);
 
-    const { data: existingOperator } = await admin
+    // Verifica se já existe um caixa aberto para este operador OU neste dispositivo
+    const { data: existingSessions } = await admin
       .from('cash_session')
       .select('*')
-      .eq('operator_id', operator_id)
+      .or(`operator_id.eq.${operator_id},device_id.eq.${device_id}`)
       .eq('status', 'aberto')
-      .order('created_at', { ascending: false })
-      .limit(50);
+      .order('created_at', { ascending: false });
 
-    const sameDevice = (existingOperator || []).find((s) => !s.device_id || s.device_id === device_id);
-    if (sameDevice) {
-      if (!sameDevice.device_id) {
-        await admin.from('cash_session').update({ device_id }).eq('id', sameDevice.id);
-      }
-      return c.json({ session: { ...sameDevice, device_id: sameDevice.device_id || device_id }, resumed: true });
+    // 1. Se houver um caixa no MESMO dispositivo, assume ele independente do operador (Requisito: Permitir assumir qualquer caixa)
+    const sessionOnDevice = (existingSessions || []).find(s => s.device_id === device_id);
+    if (sessionOnDevice) {
+      return c.json({ session: sessionOnDevice, resumed: true });
     }
 
-    if (existingOperator?.length > 0) {
-      const prev = existingOperator[0];
-      const lastActive = prev.last_active_at || prev.created_at;
-      const stale = !lastActive || Date.now() - new Date(lastActive).getTime() > INACTIVE_THRESHOLD_MS;
-      if (stale || prev.inactive) {
-        const now = new Date().toISOString();
-        await admin.from('cash_session').update({
-          device_id, inactive: false, last_active_at: now,
-        }).eq('id', prev.id);
-        await logOperation({
-          type: 'cash_recovery', level: 'warn',
-          description: `Caixa inativo ${prev.id} recuperado automaticamente.`,
-          operator_name: operator_name || '', device_id, cash_session_id: prev.id,
-        });
-        return c.json({
-          session: { ...prev, device_id, inactive: false, last_active_at: now },
-          resumed: true, inactive_recovery: true,
-        });
-      }
-      return c.json({
-        blocked: true,
-        error: `Este funcionário já possui um caixa aberto em outro dispositivo${prev?.terminal ? ` (${prev.terminal})` : ''}. Feche o caixa atual ou aguarde a inatividade para assumi-lo.`,
-      });
-    }
-
-    const { data: existingDevice } = await admin
-      .from('cash_session')
-      .select('*')
-      .eq('device_id', device_id)
-      .eq('status', 'aberto')
-      .limit(50);
-
-    if (existingDevice?.length > 0) {
-      const prev = existingDevice[0];
-      return c.json({
-        blocked: true,
-        error: `Este terminal já possui um caixa aberto por ${prev?.operator_name || 'outro funcionário'}. Feche o caixa atual antes de abrir outro.`,
-      });
-    }
+    // 2. Se o operador tiver um caixa em outro dispositivo, o comportamento anterior bloqueava.
+    // Agora permitimos múltiplos caixas, então ignoramos e deixamos criar um novo abaixo.
+    // (A menos que queiramos retomar o caixa dele de outro lugar, mas o requisito pede múltiplos caixas).
 
     const operatorIsVendedor = Array.isArray(body.operator_funcoes) && body.operator_funcoes.includes('vendedor');
     const payload = {
@@ -276,7 +238,7 @@ functions.post('/finalize-sale', async (c) => {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
     const body = await c.req.json().catch(() => ({}));
-    const sale = body.sale || body;
+    const sale = sanitizeDateFields(body.sale || body);
     session_id = body.session_id || sale.cash_session_id || '';
     device_id = body.device_id || '';
     client_ref = sale.client_ref || '';
@@ -319,7 +281,7 @@ functions.post('/finalize-sale', async (c) => {
         .order('created_at', { ascending: false }).limit(1);
       if (existing?.length) {
         if (session_id) await releaseSessionReservations(session_id);
-        return c.json({ sale: existing[0], idempotent: true });
+        return c.json(existing[0]);
       }
     }
 
@@ -384,7 +346,7 @@ functions.post('/finalize-sale', async (c) => {
     }
 
     if (session_id) await releaseSessionReservations(session_id);
-    return c.json({ sale: createdSale });
+    return c.json(createdSale);
   } catch (error) {
     await logOperation({
       type: 'unexpected_error', level: 'error',
