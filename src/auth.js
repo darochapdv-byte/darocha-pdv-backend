@@ -71,8 +71,14 @@ export async function getUserFromRequest(c) {
       company_cnpj: user.user_metadata?.company_cnpj || null,
       company_phone: user.user_metadata?.company_phone || null,
     };
-    const { data: created } = await admin.from('profiles').upsert(seed).select().maybeSingle();
-    profile = created || seed;
+    // Service role às vezes ainda esbarra em RLS no INSERT; tenta e segue com seed em memória
+    const { data: created, error: cErr } = await admin.from('profiles').insert(seed).select().maybeSingle();
+    if (cErr) {
+      console.warn('profile seed insert', cErr.message);
+      profile = seed;
+    } else {
+      profile = created || seed;
+    }
   }
 
   return {
@@ -217,20 +223,46 @@ auth.patch('/me', async (c) => {
 
   if (!Object.keys(patch).length) return c.json(shape(user.data || {}));
 
-  // Upsert evita erro quando perfil ainda não existe
-  let payload = { id: user.id, email: user.email, ...patch };
-  if (!payload.role) payload.role = user.role || 'admin';
+  // Remove company_address se a coluna não existir (detectado em runtime)
+  const tryUpdate = async (fields) => {
+    const { data, error } = await admin
+      .from('profiles')
+      .update(fields)
+      .eq('id', user.id)
+      .select()
+      .maybeSingle();
+    return { data, error };
+  };
 
-  let { data, error } = await admin.from('profiles').upsert(payload).select().maybeSingle();
+  let fields = { ...patch };
+  let { data, error } = await tryUpdate(fields);
 
-  // Se company_address não existe no schema, remove e tenta de novo
   if (error && String(error.message || '').includes('company_address')) {
-    delete payload.company_address;
-    delete patch.company_address;
-    ({ data, error } = await admin.from('profiles').upsert(payload).select().maybeSingle());
+    delete fields.company_address;
+    ({ data, error } = await tryUpdate(fields));
+  }
+
+  // Perfil inexistente → tenta INSERT
+  if (!error && !data) {
+    const insertPayload = {
+      id: user.id,
+      email: user.email,
+      role: user.role || 'admin',
+      ...fields,
+    };
+    ({ data, error } = await admin.from('profiles').insert(insertPayload).select().maybeSingle());
+    if (error && String(error.message || '').includes('company_address')) {
+      delete insertPayload.company_address;
+      ({ data, error } = await admin.from('profiles').insert(insertPayload).select().maybeSingle());
+    }
   }
 
   if (error) return c.json({ error: error.message }, 400);
+  if (!data) {
+    // Fallback: re-lê o que existir
+    const { data: again } = await admin.from('profiles').select('*').eq('id', user.id).maybeSingle();
+    data = again || { ...user.data, ...fields };
+  }
 
   // Espelha nome da empresa no AppSettings (catálogo / recibos)
   if (patch.company_name) {
