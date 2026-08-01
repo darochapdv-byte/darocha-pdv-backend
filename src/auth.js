@@ -1,0 +1,242 @@
+import { Hono } from 'hono';
+import bcrypt from 'bcryptjs';
+import { SignJWT, jwtVerify } from 'jose';
+import { admin, userClient, useLocal, query } from './db.js';
+
+const auth = new Hono();
+const JWT_SECRET = new TextEncoder().encode(
+  process.env.JWT_SECRET || 'darocha-dev-secret-change-me-in-prod-32'
+);
+
+async function signToken(payload) {
+  return new SignJWT(payload)
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime('30d')
+    .sign(JWT_SECRET);
+}
+
+export async function verifyToken(token) {
+  try {
+    const { payload } = await jwtVerify(token, JWT_SECRET);
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+export async function getUserFromRequest(c) {
+  const header = c.req.header('Authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return null;
+
+  if (useLocal) {
+    const payload = await verifyToken(token);
+    if (!payload?.sub) return null;
+    const { rows } = await query(
+      `select id, email, role, company_name, company_cnpj, company_phone, company_instagram, referral_code
+       from profiles where id = $1`,
+      [payload.sub]
+    );
+    const p = rows[0];
+    if (!p) return null;
+    return {
+      id: p.id,
+      email: p.email,
+      role: p.role,
+      company_name: p.company_name,
+      company_cnpj: p.company_cnpj,
+      company_phone: p.company_phone,
+      company_instagram: p.company_instagram,
+      referral_code: p.referral_code,
+      full_name: p.company_name || p.email,
+      data: p,
+    };
+  }
+
+  if (!admin) return null;
+  const { data, error } = await admin.auth.getUser(token);
+  if (error || !data?.user) return null;
+  const user = data.user;
+  const { data: profile } = await admin.from('profiles').select('*').eq('id', user.id).maybeSingle();
+  return {
+    id: user.id,
+    email: user.email,
+    role: profile?.role || 'user',
+    company_name: profile?.company_name,
+    company_cnpj: profile?.company_cnpj,
+    company_phone: profile?.company_phone,
+    company_instagram: profile?.company_instagram,
+    referral_code: profile?.referral_code,
+    full_name: profile?.company_name || user.email,
+    data: profile || {},
+  };
+}
+
+auth.get('/me', async (c) => {
+  const user = await getUserFromRequest(c);
+  if (!user) return c.json({ error: 'unauthorized' }, 401);
+  return c.json(user);
+});
+
+auth.post('/login', async (c) => {
+  const { email, password } = await c.req.json();
+  if (!email || !password) return c.json({ error: 'email_password_required' }, 400);
+
+  if (useLocal) {
+    const { rows } = await query(`select * from profiles where lower(email) = lower($1)`, [email]);
+    const p = rows[0];
+    if (!p?.password_hash) return c.json({ error: 'Invalid login credentials' }, 401);
+    const ok = await bcrypt.compare(password, p.password_hash);
+    if (!ok) return c.json({ error: 'Invalid login credentials' }, 401);
+    const token = await signToken({ sub: p.id, email: p.email, role: p.role });
+    return c.json({
+      token,
+      user: { id: p.id, email: p.email, role: p.role, company_name: p.company_name },
+    });
+  }
+
+  if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+  const { data, error } = await admin.auth.signInWithPassword({ email, password });
+  if (error) return c.json({ error: error.message }, 401);
+  return c.json({
+    token: data.session?.access_token,
+    refresh_token: data.session?.refresh_token,
+    user: data.user,
+  });
+});
+
+auth.post('/register', async (c) => {
+  const body = await c.req.json();
+  const { email, password, ...extra } = body;
+  if (!email || !password) return c.json({ error: 'email_password_required' }, 400);
+  if (String(password).length < 6) return c.json({ error: 'password_too_short' }, 400);
+
+  if (useLocal) {
+    const hash = await bcrypt.hash(password, 10);
+    try {
+      const { rows } = await query(
+        `insert into profiles (email, password_hash, role, company_name, company_phone, company_cnpj)
+         values ($1, $2, $3, $4, $5, $6)
+         returning id, email, role, company_name`,
+        [
+          email.toLowerCase(),
+          hash,
+          extra.role || 'admin',
+          extra.company_name || null,
+          extra.company_phone || null,
+          extra.company_cnpj || null,
+        ]
+      );
+      const p = rows[0];
+      const token = await signToken({ sub: p.id, email: p.email, role: p.role });
+      return c.json({ token, user: p }, 201);
+    } catch (e) {
+      if (String(e.message).includes('unique')) {
+        return c.json({ error: 'Email already registered' }, 400);
+      }
+      return c.json({ error: e.message }, 400);
+    }
+  }
+
+  if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+  const { data, error } = await admin.auth.admin.createUser({
+    email,
+    password,
+    email_confirm: true,
+    user_metadata: extra,
+  });
+  if (error) return c.json({ error: error.message }, 400);
+  await admin.from('profiles').upsert({
+    id: data.user.id,
+    email,
+    role: extra.role || 'admin',
+    company_name: extra.company_name || null,
+    company_cnpj: extra.company_cnpj || null,
+    company_phone: extra.company_phone || null,
+  });
+  const login = await admin.auth.signInWithPassword({ email, password });
+  return c.json({ token: login.data.session?.access_token, user: data.user }, 201);
+});
+
+auth.post('/logout', async (c) => c.json({ ok: true }));
+
+auth.patch('/me', async (c) => {
+  const user = await getUserFromRequest(c);
+  if (!user) return c.json({ error: 'unauthorized' }, 401);
+  const body = await c.req.json();
+  const allowed = ['company_name', 'company_cnpj', 'company_phone', 'company_instagram', 'referral_code', 'role'];
+  const patch = {};
+  for (const k of allowed) if (k in body) patch[k] = body[k];
+
+  if (useLocal) {
+    const keys = Object.keys(patch);
+    if (!keys.length) return c.json(user);
+    const sets = keys.map((k, i) => `${k} = $${i + 2}`).join(', ');
+    const vals = keys.map((k) => patch[k]);
+    const { rows } = await query(
+      `update profiles set ${sets}, updated_at = now() where id = $1 returning *`,
+      [user.id, ...vals]
+    );
+    return c.json({ id: user.id, email: user.email, ...rows[0] });
+  }
+
+  const { data, error } = await admin.from('profiles').update(patch).eq('id', user.id).select().single();
+  if (error) return c.json({ error: error.message }, 400);
+  return c.json({ id: user.id, email: user.email, ...data });
+});
+
+auth.post('/oauth', async (c) => {
+  if (useLocal) {
+    return c.json({
+      error: 'oauth_not_available_local',
+      message: 'Google OAuth requer modo Supabase. Use e-mail/senha no modo local.',
+    }, 501);
+  }
+  const { provider, redirect_to } = await c.req.json();
+  if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+  const { data, error } = await admin.auth.signInWithOAuth({
+    provider,
+    options: { redirectTo: redirect_to },
+  });
+  if (error) return c.json({ error: error.message }, 400);
+  return c.json({ url: data.url });
+});
+
+auth.post('/reset-password', async (c) => {
+  const { email, redirect_to } = await c.req.json();
+  if (useLocal) {
+    return c.json({
+      ok: true,
+      message: 'No modo local, altere a senha via SQL ou crie nova conta. Configure Supabase para e-mail de recovery.',
+    });
+  }
+  if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+  const { error } = await admin.auth.resetPasswordForEmail(email, {
+    redirectTo: redirect_to || process.env.APP_URL || 'http://localhost:5173/reset-password',
+  });
+  if (error) return c.json({ error: error.message }, 400);
+  return c.json({ ok: true });
+});
+
+auth.post('/reset-password/confirm', async (c) => {
+  const user = await getUserFromRequest(c);
+  const { password } = await c.req.json();
+  if (!password || password.length < 6) return c.json({ error: 'password_too_short' }, 400);
+  if (!user) return c.json({ error: 'token_required' }, 400);
+
+  if (useLocal) {
+    const hash = await bcrypt.hash(password, 10);
+    await query(`update profiles set password_hash = $1, updated_at = now() where id = $2`, [
+      hash,
+      user.id,
+    ]);
+    return c.json({ ok: true });
+  }
+
+  const { error } = await admin.auth.admin.updateUserById(user.id, { password });
+  if (error) return c.json({ error: error.message }, 400);
+  return c.json({ ok: true });
+});
+
+export default auth;
