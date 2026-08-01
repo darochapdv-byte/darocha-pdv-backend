@@ -274,6 +274,9 @@ catalog.post('/catalog-checkout', async (c) => {
       }
     }
 
+    // Vincula ao caixa aberto (mesmo fluxo da loja — um único caixa)
+    const openSession = openSessions[0];
+
     const salePayload = {
       customer_name: customer.name,
       customer_phone: customer.phone,
@@ -285,8 +288,11 @@ catalog.post('/catalog-checkout', async (c) => {
       subtotal,
       discount: 0,
       total,
-      status: 'orcamento',
+      // Retirada no balcão pode ser tratada como pedido em aberto até retirada;
+      // entrega começa em orçamento/aguardando e só conclui na entrega + prestação.
+      status: deliveryType === 'retirada' ? 'orcamento' : 'orcamento',
       source: 'catalog',
+      cash_session_id: openSession?.id || null,
       notes: customer.notes || '',
       delivery_address: deliveryType === 'entrega' ? (body.street || '') : '',
       delivery_number: deliveryType === 'entrega' ? (body.number || '') : '',

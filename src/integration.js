@@ -1,0 +1,422 @@
+/**
+ * Camada de integração entre módulos:
+ * Estoque → Catálogo → Pedidos/Entrega → Caixa → Prestação de Contas
+ *
+ * Fonte única da verdade:
+ * - product ………… estoque / catálogo
+ * - sale …………… pedidos (PDV + catálogo + entrega)
+ * - cash_session … caixas abertos
+ * - cash_movement … sangrias/suprimentos/entrada de dinheiro (prestação)
+ * - courier_closing … fechamentos de prestação de contas
+ */
+import { Hono } from 'hono';
+import { admin } from './db.js';
+import { logOperation, requireUser, toBase44Row, toBase44Rows } from './helpers.js';
+
+const integration = new Hono();
+
+/** Retorna o caixa aberto mais recente (ou null). */
+export async function getOpenCashSession() {
+  if (!admin) return null;
+  const { data } = await admin
+    .from('cash_session')
+    .select('*')
+    .eq('status', 'aberto')
+    .order('created_at', { ascending: false })
+    .limit(1);
+  return data?.[0] || null;
+}
+
+/**
+ * Registra movimentação no caixa da loja (uma única fonte).
+ * Tipos: venda | sangria | suprimento | prestacao_entregador | taxa_entrega
+ */
+export async function registerCashMovement({
+  cash_session_id,
+  type,
+  amount,
+  reason = '',
+  sale_id = null,
+  operator_name = '',
+}) {
+  if (!admin || !cash_session_id || !amount) return null;
+  const payload = {
+    cash_session_id,
+    type,
+    amount: Number(amount) || 0,
+    reason: String(reason || '').slice(0, 500),
+  };
+  // Campos opcionais se existirem no schema
+  if (sale_id) payload.sale_id = sale_id;
+  if (operator_name) payload.operator_name = operator_name;
+
+  const { data, error } = await admin.from('cash_movement').insert(payload).select().single();
+  if (error) {
+    // Schema pode não ter sale_id/operator_name — tenta versão mínima
+    if (String(error.message || '').includes('column')) {
+      const { data: d2, error: e2 } = await admin
+        .from('cash_movement')
+        .insert({
+          cash_session_id,
+          type,
+          amount: Number(amount) || 0,
+          reason: String(reason || '').slice(0, 500),
+        })
+        .select()
+        .single();
+      if (e2) throw e2;
+      return d2;
+    }
+    throw error;
+  }
+  return data;
+}
+
+/**
+ * Atribui entregador a um pedido de entrega e avança status.
+ */
+integration.post('/delivery-assign', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    const body = await c.req.json().catch(() => ({}));
+    const { sale_id, delivery_person, courier_id } = body;
+    if (!sale_id) return c.json({ error: 'sale_id obrigatório' }, 400);
+    if (!delivery_person && !courier_id) {
+      return c.json({ error: 'Informe o entregador' }, 400);
+    }
+
+    const { data: sale } = await admin.from('sale').select('*').eq('id', sale_id).maybeSingle();
+    if (!sale) return c.json({ error: 'Pedido não encontrado' }, 404);
+    if (sale.delivery_type !== 'entrega') {
+      return c.json({ error: 'Pedido não é de entrega' }, 400);
+    }
+
+    let personName = delivery_person || '';
+    if (courier_id && !personName) {
+      const { data: courier } = await admin.from('courier').select('*').eq('id', courier_id).maybeSingle();
+      if (!courier) return c.json({ error: 'Entregador não encontrado' }, 404);
+      personName = courier.name;
+    }
+
+    const updates = {
+      delivery_person: personName,
+      delivery_status:
+        !sale.delivery_status || sale.delivery_status === 'aguardando'
+          ? 'em_rota'
+          : sale.delivery_status,
+    };
+
+    const { data: updated, error } = await admin
+      .from('sale')
+      .update(updates)
+      .eq('id', sale_id)
+      .select()
+      .single();
+    if (error) return c.json({ error: error.message }, 500);
+
+    await logOperation({
+      type: 'delivery_assign',
+      level: 'info',
+      description: `Pedido ${sale_id} atribuído a ${personName}`,
+      operator_name: user.full_name || user.email || '',
+      sale_id,
+    });
+
+    return c.json({ sale: toBase44Row(updated), success: true });
+  } catch (error) {
+    return c.json({ error: error.message }, 500);
+  }
+});
+
+/**
+ * Marca entrega como concluída.
+ * - Se pagamento em dinheiro e ainda não confirmado → aguarda prestação de contas
+ * - Caso contrário → conclui e vincula ao caixa aberto (se houver)
+ * Estoque já foi baixado no checkout do catálogo / finalize-sale do PDV.
+ */
+integration.post('/delivery-complete', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    const body = await c.req.json().catch(() => ({}));
+    const { sale_id, cash_received, change_amount } = body;
+    if (!sale_id) return c.json({ error: 'sale_id obrigatório' }, 400);
+
+    const { data: sale } = await admin.from('sale').select('*').eq('id', sale_id).maybeSingle();
+    if (!sale) return c.json({ error: 'Pedido não encontrado' }, 404);
+
+    const isCash =
+      sale.payment_method === 'dinheiro' ||
+      (Array.isArray(sale.payments) && sale.payments.some((p) => p.method === 'dinheiro'));
+
+    const updates = {
+      delivery_status: 'entregue',
+    };
+
+    if (cash_received != null) updates.cash_received = Number(cash_received) || 0;
+    if (change_amount != null) updates.change_amount = Number(change_amount) || 0;
+
+    // Dinheiro com entregador → prestação de contas
+    if (isCash && sale.cash_confirmed !== true) {
+      updates.delivery_status = 'aguardando_prestacao_contas';
+      updates.status = sale.status === 'orcamento' ? 'orcamento' : sale.status;
+    } else {
+      updates.status = 'concluida';
+      updates.cash_confirmed = true;
+      // Vincula ao caixa aberto se ainda não tiver
+      if (!sale.cash_session_id) {
+        const session = await getOpenCashSession();
+        if (session) updates.cash_session_id = session.id;
+      }
+    }
+
+    if (!sale.delivery_person && body.delivery_person) {
+      updates.delivery_person = body.delivery_person;
+    }
+
+    const { data: updated, error } = await admin
+      .from('sale')
+      .update(updates)
+      .eq('id', sale_id)
+      .select()
+      .single();
+    if (error) return c.json({ error: error.message }, 500);
+
+    // Se já concluiu (não dinheiro pendente), registra no caixa
+    if (updated.status === 'concluida' && updated.cash_session_id) {
+      try {
+        await registerCashMovement({
+          cash_session_id: updated.cash_session_id,
+          type: 'venda',
+          amount: Number(updated.total) || 0,
+          reason: `Pedido entrega #${String(sale_id).slice(-6).toUpperCase()} · ${updated.customer_name || ''}`,
+          sale_id,
+          operator_name: user.full_name || user.email || '',
+        });
+      } catch (e) {
+        console.warn('cash movement on delivery-complete', e.message);
+      }
+    }
+
+    await logOperation({
+      type: 'delivery_complete',
+      level: 'info',
+      description: `Entrega ${sale_id} → ${updated.delivery_status}`,
+      operator_name: user.full_name || user.email || '',
+      sale_id,
+      cash_session_id: updated.cash_session_id || '',
+    });
+
+    return c.json({ sale: toBase44Row(updated), success: true });
+  } catch (error) {
+    return c.json({ error: error.message }, 500);
+  }
+});
+
+/**
+ * Fecha prestação de contas de um entregador.
+ * - Marca vendas como settled + cash_confirmed
+ * - Cria courier_closing
+ * - Registra entrada de dinheiro no caixa aberto da loja
+ */
+integration.post('/settle-accountability', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    const body = await c.req.json().catch(() => ({}));
+    const { courier_name, sale_ids } = body;
+    if (!courier_name) return c.json({ error: 'courier_name obrigatório' }, 400);
+    if (!Array.isArray(sale_ids) || !sale_ids.length) {
+      return c.json({ error: 'sale_ids obrigatório' }, 400);
+    }
+
+    const { data: sales, error: sErr } = await admin
+      .from('sale')
+      .select('*')
+      .in('id', sale_ids);
+    if (sErr) return c.json({ error: sErr.message }, 500);
+    if (!sales?.length) return c.json({ error: 'Nenhuma venda encontrada' }, 404);
+
+    const now = new Date().toISOString();
+    const closedBy = user.full_name || user.email || 'Sistema';
+
+    // Totais
+    let totalCash = 0;
+    let totalChange = 0;
+    let totalFees = 0;
+    for (const s of sales) {
+      totalFees += Number(s.delivery_fee) || 0;
+      if (s.payment_method === 'dinheiro') {
+        const received = Number(s.cash_received || s.cash_change_for || s.total) || 0;
+        totalCash += received;
+        if (Number(s.change_amount) > 0) totalChange += Number(s.change_amount);
+        else if (received > 0) totalChange += Math.max(0, received - (Number(s.total) || 0));
+      } else if (s.payment_method === 'misto' && Array.isArray(s.payments)) {
+        totalCash += s.payments
+          .filter((p) => p.method === 'dinheiro')
+          .reduce((acc, p) => acc + (Number(p.amount) || 0), 0);
+      }
+    }
+    // Valor líquido que o entregador devolve à loja ≈ totalCash - totalChange
+    // (troco já ficou com o cliente). Taxa de entrega pode ou não estar no total.
+    const netToStore = Math.max(0, totalCash - totalChange);
+
+    const session = await getOpenCashSession();
+
+    // Atualiza cada venda
+    for (const s of sales) {
+      const updates = {
+        accountability_settled: true,
+        cash_confirmed: true,
+        cash_confirmed_at: now,
+        cash_confirmed_by: closedBy,
+        delivery_fee_paid: true,
+        delivery_fee_paid_at: now,
+        delivery_status: 'entregue',
+        status: 'concluida',
+      };
+      if (!s.cash_session_id && session) updates.cash_session_id = session.id;
+
+      await admin.from('sale').update(updates).eq('id', s.id);
+    }
+
+    // Histórico do entregador
+    const closingPayload = {
+      courier_name,
+      deliveries_count: sales.length,
+      total_cash_amount: totalCash,
+      total_received: totalCash,
+      total_change: totalChange,
+      total_delivery_fees: totalFees,
+      sale_ids,
+      closed_by: closedBy,
+      closed_at: now,
+    };
+    const { data: closing, error: cErr } = await admin
+      .from('courier_closing')
+      .insert(closingPayload)
+      .select()
+      .single();
+    if (cErr) {
+      console.error('courier_closing insert', cErr);
+      // Continua mesmo se tabela tiver schema diferente
+    }
+
+    // Entrada no caixa da loja (elimina lançamento manual duplicado)
+    let movement = null;
+    if (session && netToStore > 0) {
+      try {
+        movement = await registerCashMovement({
+          cash_session_id: session.id,
+          type: 'prestacao_entregador',
+          amount: netToStore,
+          reason: `Prestação de contas · ${courier_name} · ${sales.length} entrega(s) · R$ ${netToStore.toFixed(2)}`,
+          operator_name: closedBy,
+        });
+      } catch (e) {
+        // Fallback: tipo 'suprimento' se 'prestacao_entregador' não for aceito
+        try {
+          movement = await registerCashMovement({
+            cash_session_id: session.id,
+            type: 'suprimento',
+            amount: netToStore,
+            reason: `Prestação de contas · ${courier_name} · ${sales.length} entrega(s)`,
+            operator_name: closedBy,
+          });
+        } catch (e2) {
+          console.error('cash movement on settle', e2.message);
+        }
+      }
+    }
+
+    await logOperation({
+      type: 'accountability_settle',
+      level: 'info',
+      description: `Prestação ${courier_name}: R$ ${netToStore.toFixed(2)} · ${sales.length} pedidos`,
+      operator_name: closedBy,
+      cash_session_id: session?.id || '',
+    });
+
+    return c.json({
+      success: true,
+      closing: closing ? toBase44Row(closing) : null,
+      movement: movement ? toBase44Row(movement) : null,
+      totals: {
+        total_cash: totalCash,
+        total_change: totalChange,
+        total_fees: totalFees,
+        net_to_store: netToStore,
+        sales_count: sales.length,
+        cash_session_id: session?.id || null,
+      },
+    });
+  } catch (error) {
+    console.error('settle-accountability', error);
+    return c.json({ error: error.message }, 500);
+  }
+});
+
+/**
+ * Resumo integrado de um entregador (saldo em posse, já entregue, etc.)
+ */
+integration.post('/courier-balance', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    const body = await c.req.json().catch(() => ({}));
+    const courier_name = body.courier_name;
+    if (!courier_name) return c.json({ error: 'courier_name obrigatório' }, 400);
+
+    const { data: pending } = await admin
+      .from('sale')
+      .select('*')
+      .eq('delivery_person', courier_name)
+      .eq('accountability_settled', false)
+      .eq('delivery_type', 'entrega')
+      .limit(500);
+
+    const { data: closings } = await admin
+      .from('courier_closing')
+      .select('*')
+      .eq('courier_name', courier_name)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    let heldCash = 0;
+    for (const s of pending || []) {
+      if (s.payment_method === 'dinheiro') {
+        const received = Number(s.cash_received || s.total) || 0;
+        const change = Number(s.change_amount) || 0;
+        heldCash += Math.max(0, received - change);
+      }
+    }
+
+    const totalSettled = (closings || []).reduce(
+      (acc, cl) => acc + (Number(cl.total_received || cl.total_cash_amount) || 0),
+      0
+    );
+
+    return c.json({
+      courier_name,
+      pending_sales: toBase44Rows(pending || []),
+      pending_count: (pending || []).length,
+      cash_held_by_courier: heldCash,
+      closings: toBase44Rows(closings || []),
+      total_settled_historical: totalSettled,
+    });
+  } catch (error) {
+    return c.json({ error: error.message }, 500);
+  }
+});
+
+export default integration;
+export { integration };

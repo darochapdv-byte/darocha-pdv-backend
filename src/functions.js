@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { admin } from './db.js';
 import { logOperation, releaseSessionReservations, requireUser, stackOf, sanitizeDateFields, toBase44Row, toBase44Rows } from './helpers.js';
+import { registerCashMovement } from './integration.js';
 
 /**
  * Backend functions portadas da Base44.
@@ -372,6 +373,21 @@ functions.post("/finalize-sale", async (c) => {
     }
 
     if (session_id) await releaseSessionReservations(session_id);
+    // Registra venda no caixa (módulo Caixas Abertos integrado)
+    if (session_id) {
+      try {
+        await registerCashMovement({
+          cash_session_id: session_id,
+          type: 'venda',
+          amount: Number(createdSale.total) || 0,
+          reason: `Venda PDV #${String(createdSale.id).slice(-6).toUpperCase()}`,
+          sale_id: createdSale.id,
+          operator_name,
+        });
+      } catch (e) {
+        console.warn('cash movement on finalize-sale', e.message);
+      }
+    }
     // Frontend espera response.data.sale
     return c.json({ success: true, sale: toBase44Row(createdSale), sale_id: createdSale.id });
   } catch (error) {
@@ -389,7 +405,7 @@ functions.post("/finalize-sale", async (c) => {
 functions.post('/:name', async (c) => {
   const name = c.req.param('name');
   const implemented = [
-  'open-cash-session','takeover-cash-session','cash-session-heartbeat','list-open-cash-sessions','finalize-sale',
+  'open-cash-session','takeover-cash-session','cash-session-heartbeat','list-open-cash-sessions','finalize-sale','delivery-assign','delivery-complete','settle-accountability','courier-balance',
   'release-pdv-reservations','product-inquiry',
   'catalog-data','catalog-checkout','catalog-store-status','catalog-receipt','catalog-expire-pickups',
   'barcode-lookup','product-name-lookup','enrich-product','save-product','refresh-products-catalog',
