@@ -104,3 +104,21 @@ export function sanitizeDateFields(data) {
   }
   return sanitizedData;
 }
+
+/**
+ * Compatibilidade Base44: o frontend usa created_date / updated_date,
+ * enquanto o Postgres/Supabase grava created_at / updated_at.
+ */
+export function toBase44Row(row) {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return row;
+  const out = { ...row };
+  if (out.created_at != null && out.created_date == null) out.created_date = out.created_at;
+  if (out.updated_at != null && out.updated_date == null) out.updated_date = out.updated_at;
+  return out;
+}
+
+export function toBase44Rows(rows) {
+  if (rows == null) return rows;
+  if (!Array.isArray(rows)) return toBase44Row(rows);
+  return rows.map(toBase44Row);
+}

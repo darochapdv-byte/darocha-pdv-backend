@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin, userClient, tableFor } from './db.js';
-import { sanitizeDateFields } from './helpers.js';
+import { sanitizeDateFields, toBase44Row, toBase44Rows } from './helpers.js';
 
 const entities = new Hono();
 
@@ -17,7 +17,6 @@ function parseOrder(order) {
   const map = { created_date: 'created_at', updated_date: 'updated_at' };
   return { column: map[column] || column, ascending: !desc };
 }
-
 
 // SSE realtime (deve vir ANTES de /:entity/:id)
 entities.get('/:entity/subscribe', async (c) => {
@@ -42,13 +41,11 @@ entities.get('/:entity', async (c) => {
 
   console.log(`[GET /entities/${entity}] table=${table} query=${JSON.stringify(c.req.query())}`);
   let q = db.from(table).select('*');
-  
-  // Apply filters from query parameters
-  // Use c.req.queries() to handle multiple values for the same key
+
   const allQueries = c.req.queries();
   for (const [k, values] of Object.entries(allQueries)) {
     if (k === 'limit' || k === 'order') continue;
-    
+
     for (const v of values) {
       if (v === null || v === 'null') q = q.is(k, null);
       else if (String(v).startsWith('in:')) q = q.in(k, String(v).substring(3).split(','));
@@ -65,7 +62,7 @@ entities.get('/:entity', async (c) => {
   q = q.order(column, { ascending }).limit(limit);
   const { data, error } = await q;
   if (error) return c.json({ error: error.message }, 400);
-  return c.json(data);
+  return c.json(toBase44Rows(data));
 });
 
 entities.get('/:entity/:id', async (c) => {
@@ -75,7 +72,7 @@ entities.get('/:entity/:id', async (c) => {
   const { data, error } = await db.from(table).select('*').eq('id', c.req.param('id')).maybeSingle();
   if (error) return c.json({ error: error.message }, 400);
   if (!data) return c.json({ error: 'not_found' }, 404);
-  return c.json(data);
+  return c.json(toBase44Row(data));
 });
 
 entities.post('/:entity/query', async (c) => {
@@ -104,7 +101,7 @@ entities.post('/:entity/query', async (c) => {
   q = q.order(column, { ascending }).limit(limit);
   const { data, error } = await q;
   if (error) return c.json({ error: error.message }, 400);
-  return c.json(data);
+  return c.json(toBase44Rows(data));
 });
 
 entities.post('/:entity', async (c) => {
@@ -115,7 +112,7 @@ entities.post('/:entity', async (c) => {
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
   const { data, error } = await db.from(table).insert(body).select().single();
   if (error) return c.json({ error: error.message }, 400);
-  return c.json(data, 201);
+  return c.json(toBase44Row(data), 201);
 });
 
 entities.patch("/:entity/:id", async (c) => {
@@ -126,7 +123,7 @@ entities.patch("/:entity/:id", async (c) => {
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
   const { data, error } = await db.from(table).update(body).eq('id', c.req.param('id')).select().single();
   if (error) return c.json({ error: error.message }, 400);
-  return c.json(data);
+  return c.json(toBase44Row(data));
 });
 
 entities.delete('/:entity/:id', async (c) => {
@@ -152,7 +149,7 @@ entities.post("/:entity/bulk-update", async (c) => {
     if (!id) continue;
     const { data, error } = await db.from(table).update(rest).eq('id', id).select().single();
     if (error) return c.json({ error: error.message }, 400);
-    results.push(data);
+    results.push(toBase44Row(data));
   }
   return c.json(results);
 });
@@ -165,7 +162,7 @@ entities.post("/:entity/bulk-create", async (c) => {
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
   const { data, error } = await db.from(table).insert(items).select();
   if (error) return c.json({ error: error.message }, 400);
-  return c.json(data, 201);
+  return c.json(toBase44Rows(data), 201);
 });
 
 export default entities;

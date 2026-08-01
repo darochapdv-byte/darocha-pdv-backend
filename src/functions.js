@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin } from './db.js';
-import { logOperation, releaseSessionReservations, requireUser, stackOf, sanitizeDateFields } from './helpers.js';
+import { logOperation, releaseSessionReservations, requireUser, stackOf, sanitizeDateFields, toBase44Row, toBase44Rows } from './helpers.js';
 
 /**
  * Backend functions portadas da Base44.
@@ -102,7 +102,7 @@ functions.post('/open-cash-session', async (c) => {
         last_active_at: new Date().toISOString(),
         inactive: false,
       }).eq('id', session.id);
-      return c.json({ session, resumed: true });
+      return c.json({ session: toBase44Row(session), resumed: true });
     }
 
     const operatorIsVendedor = Array.isArray(body.operator_funcoes) && body.operator_funcoes.includes('vendedor');
@@ -122,7 +122,7 @@ functions.post('/open-cash-session', async (c) => {
 
     const { data: session, error } = await admin.from('cash_session').insert(payload).select().single();
     if (error) return c.json({ error: error.message }, 500);
-    return c.json({ session, resumed: false });
+    return c.json({ session: toBase44Row(session), resumed: false });
   } catch (error) {
     return c.json({ error: error.message }, 500);
   }
@@ -146,7 +146,7 @@ functions.post('/takeover-cash-session', async (c) => {
     if (session.status !== 'aberto') {
       return c.json({ error: 'Este caixa já foi fechado e não pode ser assumido.' }, 400);
     }
-    if (session.device_id === device_id) return c.json({ session, resumed: true });
+    if (session.device_id === device_id) return c.json({ session: toBase44Row(session), resumed: true });
 
     const existingHistory = Array.isArray(session.takeover_history) ? session.takeover_history : [];
     const entry = {
@@ -177,7 +177,7 @@ functions.post('/takeover-cash-session', async (c) => {
       operator_name: entry.operator_name, device_id, cash_session_id: session_id,
     });
 
-    return c.json({ session: updated, resumed: false });
+    return c.json({ session: toBase44Row(updated), resumed: false });
   } catch (error) {
     return c.json({ error: error.message }, 500);
   }
@@ -244,7 +244,7 @@ functions.post("/list-open-cash-sessions", async (c) => {
       .order('created_at', { ascending: false });
 
     if (error) return c.json({ error: error.message }, 500);
-    return c.json(openSessions);
+    return c.json(toBase44Rows(openSessions));
   } catch (error) {
     return c.json({ error: error.message }, 500);
   }
@@ -295,8 +295,8 @@ functions.post("/finalize-sale", async (c) => {
         return c.json(rpcResult, status);
       }
       // Frontend espera { sale: ... }
-      if (rpcResult.sale) return c.json(rpcResult);
-      return c.json({ sale: rpcResult, success: true });
+      if (rpcResult.sale) return c.json({ ...rpcResult, sale: toBase44Row(rpcResult.sale) });
+      return c.json({ sale: toBase44Row(rpcResult), success: true });
     }
 
     console.warn('finalize_sale RPC unavailable, JS fallback:', rpcError?.message);
@@ -307,7 +307,7 @@ functions.post("/finalize-sale", async (c) => {
         .order('created_at', { ascending: false }).limit(1);
       if (existing?.length) {
         if (session_id) await releaseSessionReservations(session_id);
-        return c.json({ sale: existing[0], success: true });
+        return c.json({ sale: toBase44Row(existing[0]), success: true });
       }
     }
 
@@ -373,7 +373,7 @@ functions.post("/finalize-sale", async (c) => {
 
     if (session_id) await releaseSessionReservations(session_id);
     // Frontend espera response.data.sale
-    return c.json({ success: true, sale: createdSale, sale_id: createdSale.id });
+    return c.json({ success: true, sale: toBase44Row(createdSale), sale_id: createdSale.id });
   } catch (error) {
     await logOperation({
       type: 'unexpected_error', level: 'error',
