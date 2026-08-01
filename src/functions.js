@@ -84,24 +84,6 @@ functions.post('/open-cash-session', async (c) => {
     if (!operator_id) return c.json({ error: 'Selecione o funcionário.' }, 400);
     if (!device_id) return c.json({ error: 'Dispositivo não identificado.' }, 400);
 
-    // Verifica se já existe um caixa aberto para este operador OU neste dispositivo
-    const { data: existingSessions } = await admin
-      .from('cash_session')
-      .select('*')
-      .or(`operator_id.eq.${operator_id},device_id.eq.${device_id}`)
-      .eq('status', 'aberto')
-      .order('created_at', { ascending: false });
-
-    // 1. Se houver um caixa no MESMO dispositivo, assume ele independente do operador (Requisito: Permitir assumir qualquer caixa)
-    const sessionOnDevice = (existingSessions || []).find(s => s.device_id === device_id);
-    if (sessionOnDevice) {
-      return c.json({ session: sessionOnDevice, resumed: true });
-    }
-
-    // 2. Se o operador tiver um caixa em outro dispositivo, o comportamento anterior bloqueava.
-    // Agora permitimos múltiplos caixas, então ignoramos e deixamos criar um novo abaixo.
-    // (A menos que queiramos retomar o caixa dele de outro lugar, mas o requisito pede múltiplos caixas).
-
     const operatorIsVendedor = Array.isArray(body.operator_funcoes) && body.operator_funcoes.includes('vendedor');
     const payload = {
       opening_amount: Number(body.opening_amount) || 0,
