@@ -85,6 +85,26 @@ functions.post('/open-cash-session', async (c) => {
     if (!operator_id) return c.json({ error: 'Selecione o funcionário.' }, 400);
     if (!device_id) return c.json({ error: 'Dispositivo não identificado.' }, 400);
 
+    // Se já existe caixa aberto do mesmo operador no mesmo dispositivo, retoma (evita duplicar).
+    // NÃO bloqueia: permite múltiplos caixas de operadores/dispositivos diferentes.
+    const { data: existingSame } = await admin
+      .from('cash_session')
+      .select('*')
+      .eq('operator_id', operator_id)
+      .eq('device_id', device_id)
+      .eq('status', 'aberto')
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    if (existingSame?.length) {
+      const session = existingSame[0];
+      await admin.from('cash_session').update({
+        last_active_at: new Date().toISOString(),
+        inactive: false,
+      }).eq('id', session.id);
+      return c.json({ session, resumed: true });
+    }
+
     const operatorIsVendedor = Array.isArray(body.operator_funcoes) && body.operator_funcoes.includes('vendedor');
     const payload = {
       opening_amount: Number(body.opening_amount) || 0,
@@ -274,7 +294,9 @@ functions.post("/finalize-sale", async (c) => {
         }
         return c.json(rpcResult, status);
       }
-      return c.json(rpcResult);
+      // Frontend espera { sale: ... }
+      if (rpcResult.sale) return c.json(rpcResult);
+      return c.json({ sale: rpcResult, success: true });
     }
 
     console.warn('finalize_sale RPC unavailable, JS fallback:', rpcError?.message);
@@ -285,7 +307,7 @@ functions.post("/finalize-sale", async (c) => {
         .order('created_at', { ascending: false }).limit(1);
       if (existing?.length) {
         if (session_id) await releaseSessionReservations(session_id);
-        return c.json(existing[0]);
+        return c.json({ sale: existing[0], success: true });
       }
     }
 
@@ -350,7 +372,8 @@ functions.post("/finalize-sale", async (c) => {
     }
 
     if (session_id) await releaseSessionReservations(session_id);
-    return c.json({ success: true, sale_id: createdSale.id });
+    // Frontend espera response.data.sale
+    return c.json({ success: true, sale: createdSale, sale_id: createdSale.id });
   } catch (error) {
     await logOperation({
       type: 'unexpected_error', level: 'error',
