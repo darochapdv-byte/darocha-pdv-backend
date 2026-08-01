@@ -8,6 +8,8 @@ import { logOperation, releaseSessionReservations, requireUser, stackOf, sanitiz
  */
 
 const functions = new Hono();
+
+functions.get('/test-route', (c) => c.json({ message: 'Test route works!' }));
 const INACTIVE_THRESHOLD_MS = 5 * 60 * 1000;
 
 // ─── product-inquiry ───────────────────────────────────────────────────────
