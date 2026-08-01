@@ -350,7 +350,7 @@ functions.post("/finalize-sale", async (c) => {
     }
 
     if (session_id) await releaseSessionReservations(session_id);
-    return c.json(createdSale);
+    return c.json({ success: true, sale_id: createdSale.id });
   } catch (error) {
     await logOperation({
       type: 'unexpected_error', level: 'error',
