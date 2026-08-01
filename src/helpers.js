@@ -90,3 +90,17 @@ export function computeCatalogAvailable(stock, reserve, reservedQty) {
   const rq = Math.max(0, Number(reservedQty) || 0);
   return Math.max(0, s - res - rq);
 }
+
+export function sanitizeDateFields(data) {
+  if (!data || typeof data !== 'object') return data;
+
+  const sanitizedData = { ...data };
+  for (const key in sanitizedData) {
+    if (key.includes('date') || key.includes('at')) { // Heuristic for date fields
+      if (sanitizedData[key] === '' || sanitizedData[key] === undefined) {
+        sanitizedData[key] = null;
+      }
+    }
+  }
+  return sanitizedData;
+}

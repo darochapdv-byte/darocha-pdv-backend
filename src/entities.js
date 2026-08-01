@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { admin, userClient, tableFor } from './db.js';
+import { sanitizeDateFields } from './helpers.js';
 
 const entities = new Hono();
 
@@ -77,7 +78,8 @@ entities.post('/:entity/query', async (c) => {
 
 entities.post('/:entity', async (c) => {
   const table = tableFor(c.req.param('entity'));
-  const body = await c.req.json();
+  let body = await c.req.json();
+  body = sanitizeDateFields(body);
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
   const { data, error } = await db.from(table).insert(body).select().single();
@@ -85,9 +87,10 @@ entities.post('/:entity', async (c) => {
   return c.json(data, 201);
 });
 
-entities.patch('/:entity/:id', async (c) => {
-  const table = tableFor(c.req.param('entity'));
-  const body = await c.req.json();
+entities.patch("/:entity/:id", async (c) => {
+  const table = tableFor(c.req.param("entity"));
+  let body = await c.req.json();
+  body = sanitizeDateFields(body);
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
   const { data, error } = await db.from(table).update(body).eq('id', c.req.param('id')).select().single();
@@ -104,9 +107,10 @@ entities.delete('/:entity/:id', async (c) => {
   return c.json({ ok: true });
 });
 
-entities.post('/:entity/bulk-update', async (c) => {
-  const table = tableFor(c.req.param('entity'));
-  const { items } = await c.req.json();
+entities.post("/:entity/bulk-update", async (c) => {
+  const table = tableFor(c.req.param("entity"));
+  let { items } = await c.req.json();
+  items = items.map(item => sanitizeDateFields(item));
   const db = clientFrom(c) || admin;
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
   if (!Array.isArray(items) || items.length === 0) return c.json([]);
@@ -122,9 +126,10 @@ entities.post('/:entity/bulk-update', async (c) => {
   return c.json(results);
 });
 
-entities.post('/:entity/bulk-create', async (c) => {
-  const table = tableFor(c.req.param('entity'));
-  const { items } = await c.req.json();
+entities.post("/:entity/bulk-create", async (c) => {
+  const table = tableFor(c.req.param("entity"));
+  let { items } = await c.req.json();
+  items = items.map(item => sanitizeDateFields(item));
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
   const { data, error } = await db.from(table).insert(items).select();
