@@ -1,8 +1,49 @@
 import { Hono } from 'hono';
-import { admin } from './db.js';
+import { admin, restQuery } from './db.js';
+import { toBase44Row } from './helpers.js';
 import { requireUser, buildReservationMap } from './helpers.js';
 
 const stock = new Hono();
+
+stock.post('/start-stock-count', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+    const body = await c.req.json().catch(() => ({}));
+    const now = new Date().toISOString();
+    const payload = {
+      status: 'em_andamento',
+      started_at: now,
+      started_by: body.started_by || user.id || null,
+      started_by_name: body.started_by_name || user.full_name || user.email || '',
+    };
+
+    // 1) tenta via supabase-js
+    if (admin) {
+      const { data, error } = await admin.from('stock_count').insert(payload).select().maybeSingle();
+      if (!error && data) return c.json(toBase44Row(data), 201);
+      console.warn('start-stock-count admin insert failed', error?.message);
+    }
+
+    // 2) fallback REST com service role (contorna RLS)
+    try {
+      const rows = await restQuery('stock_count', { method: 'POST', body: payload });
+      const row = Array.isArray(rows) ? rows[0] : rows;
+      return c.json(toBase44Row(row), 201);
+    } catch (e) {
+      console.error('start-stock-count rest failed', e.message);
+      return c.json({
+        error: e.message || 'Não foi possível iniciar o balanço.',
+        user_friendly: true,
+        hint: 'Verifique as policies RLS da tabela stock_count no Supabase (allow insert/select para service role ou policy allow_all).',
+      }, 400);
+    }
+  } catch (error) {
+    return c.json({ error: error.message || 'Erro ao iniciar balanço.' }, 500);
+  }
+});
+
 
 stock.post('/stock-count-search', async (c) => {
   try {

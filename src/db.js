@@ -85,3 +85,42 @@ export async function query(text, params = []) {
   if (!pool) throw new Error('no_local_pool');
   return pool.query(text, params);
 }
+
+/**
+ * PostgREST direto com a service role key.
+ * Necessário porque alguns formatos de chave (sb_secret_*) nem sempre
+ * fazem o supabase-js contornar RLS em todas as tabelas.
+ */
+export async function restQuery(path, { method = 'GET', body, prefer = 'return=representation' } = {}) {
+  const base = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+  if (!base || !key) throw new Error('supabase_not_configured');
+
+  const headers = {
+    apikey: key,
+    Authorization: `Bearer ${key}`,
+    'Content-Type': 'application/json',
+  };
+  if (prefer) headers.Prefer = prefer;
+
+  const res = await fetch(`${base}/rest/v1/${path}`, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+  if (!res.ok) {
+    const msg = (data && (data.message || data.error_description || data.error)) || text || res.statusText;
+    const err = new Error(msg);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}

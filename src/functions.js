@@ -409,7 +409,7 @@ functions.post('/:name', async (c) => {
   'release-pdv-reservations','product-inquiry',
   'catalog-data','catalog-checkout','catalog-store-status','catalog-receipt','catalog-expire-pickups',
   'barcode-lookup','product-name-lookup','enrich-product','save-product','refresh-products-catalog',
-  'stock-count-search','stock-count-apply','sync-pdv-reservations',
+  'start-stock-count','stock-count-search','stock-count-apply','sync-pdv-reservations',
   'admin-stats','cleanup-cash-sessions','purge-account','init-help-content',
   'create-checkout','stripe-webhook','init-subscription','link-referral',
   'fetch-nfe-xml','import-nfe','address-search',
