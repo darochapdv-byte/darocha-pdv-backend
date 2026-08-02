@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin } from './db.js';
-import { buildReservationMap, computeCatalogAvailable } from './helpers.js';
+import { buildReservationMap, computeCatalogAvailable, getAllowZeroStock } from './helpers.js';
 
 const catalog = new Hono();
 
@@ -22,6 +22,7 @@ catalog.post('/catalog-data', async (c) => {
 
     const reserve = Math.max(0, Number(cfg?.catalog_stock_reserve ?? 0) || 0);
     const reservationMap = await buildReservationMap();
+    const allowZeroStock = await getAllowZeroStock();
 
     const { data: products } = await admin
       .from('product').select('*').order('updated_at', { ascending: false }).limit(500);
@@ -31,6 +32,9 @@ catalog.post('/catalog-data', async (c) => {
       .map((p) => {
         const reserved = reservationMap[p.id] || 0;
         const catalogStock = computeCatalogAvailable(p.stock, reserve, reserved);
+        const maxQty = allowZeroStock
+          ? Math.max(maxQtyLimit, catalogStock)
+          : Math.max(0, Math.min(catalogStock, maxQtyLimit));
         return {
           id: p.id,
           name: p.name,
@@ -41,8 +45,8 @@ catalog.post('/catalog-data', async (c) => {
           image_url: p.image_url || '',
           barcode: p.barcode || '',
           code: p.code || '',
-          available: catalogStock > 0,
-          max_qty: Math.max(0, Math.min(catalogStock, maxQtyLimit)),
+          available: allowZeroStock || catalogStock > 0,
+          max_qty: maxQty,
         };
       });
 
@@ -144,6 +148,7 @@ catalog.post('/catalog-checkout', async (c) => {
     const maxQtyLimit = Number(settings?.catalog_max_qty_per_product ?? 10) || 10;
     const reserve = Math.max(0, Number(settings?.catalog_stock_reserve ?? 0) || 0);
     const reservationMap = await buildReservationMap();
+    const allowZeroStock = await getAllowZeroStock();
 
     const ids = items.map((i) => i.product_id).filter(Boolean);
     const { data: products } = await admin.from('product').select('*').in('id', ids);
@@ -162,7 +167,9 @@ catalog.post('/catalog-checkout', async (c) => {
       }
       const reserved = reservationMap[p.id] || 0;
       const catalogStock = computeCatalogAvailable(p.stock, reserve, reserved);
-      if (qty > catalogStock) return c.json({ error: `Estoque insuficiente para ${p.name}` }, 409);
+      if (qty > catalogStock && !allowZeroStock) {
+        return c.json({ error: `Estoque insuficiente para ${p.name}` }, 409);
+      }
       const total = Math.round((p.sale_price || 0) * qty * 100) / 100;
       subtotal = Math.round((subtotal + total) * 100) / 100;
       saleItems.push({ product_id: p.id, name: p.name, qty, unit_price: p.sale_price || 0, total });

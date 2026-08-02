@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin, userClient, tableFor } from './db.js';
-import { sanitizeDateFields, sanitizeEntityBody, toBase44Row, toBase44Rows, requireUser } from './helpers.js';
+import { sanitizeDateFields, sanitizeEntityBody, toBase44Row, toBase44Rows, requireUser, getAllowZeroStock, setAllowZeroStock } from './helpers.js';
 
 const entities = new Hono();
 
@@ -89,7 +89,12 @@ entities.get('/:entity', async (c) => {
   q = q.order(column, { ascending }).limit(limit);
   const { data, error } = await q;
   if (error) return c.json({ error: error.message }, 400);
-  return c.json(toBase44Rows(data));
+  let rows = toBase44Rows(data);
+  if (entity === 'AppSettings' && Array.isArray(rows)) {
+    const allow = await getAllowZeroStock();
+    rows = rows.map((r) => ({ ...r, allow_zero_stock: allow }));
+  }
+  return c.json(rows);
 });
 
 entities.get('/:entity/:id', async (c) => {
@@ -172,6 +177,14 @@ entities.patch("/:entity/:id", async (c) => {
   delete body.created_by;
   delete body.id;
 
+  // Política global "vender sem estoque" (pode não existir como coluna)
+  let allowZeroStockSaved = null;
+  if (entity === 'AppSettings' && Object.prototype.hasOwnProperty.call(body, 'allow_zero_stock')) {
+    allowZeroStockSaved = body.allow_zero_stock === true;
+    await setAllowZeroStock(allowZeroStockSaved);
+    delete body.allow_zero_stock;
+  }
+
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
@@ -181,7 +194,11 @@ entities.patch("/:entity/:id", async (c) => {
 
   const { data, error } = await q.select().single();
   if (error) return c.json({ error: error.message }, 400);
-  return c.json(toBase44Row(data));
+  const row = toBase44Row(data);
+  if (entity === 'AppSettings') {
+    row.allow_zero_stock = allowZeroStockSaved ?? (await getAllowZeroStock());
+  }
+  return c.json(row);
 });
 
 entities.delete('/:entity/:id', async (c) => {

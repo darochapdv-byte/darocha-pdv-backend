@@ -1,8 +1,35 @@
 import { Hono } from 'hono';
 import { admin, useLocal, query } from './db.js';
-import { requireUser } from './helpers.js';
+import { requireUser, getAllowZeroStock, setAllowZeroStock } from './helpers.js';
 
 const adminOps = new Hono();
+
+/** Política global: vender sem estoque (PDV + catálogo) */
+adminOps.post('/stock-policy', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    const body = await c.req.json().catch(() => ({}));
+    if (typeof body.allow_zero_stock === 'boolean') {
+      if (user.role !== 'admin') return c.json({ error: 'Forbidden' }, 403);
+      const ok = await setAllowZeroStock(body.allow_zero_stock);
+      if (!ok) return c.json({ error: 'Falha ao salvar configuração' }, 500);
+    }
+    const allow_zero_stock = await getAllowZeroStock();
+    return c.json({ allow_zero_stock });
+  } catch (error) {
+    return c.json({ error: error.message }, 500);
+  }
+});
+
+adminOps.get('/stock-policy', async (c) => {
+  try {
+    const allow_zero_stock = await getAllowZeroStock();
+    return c.json({ allow_zero_stock });
+  } catch (error) {
+    return c.json({ error: error.message }, 500);
+  }
+});
 
 adminOps.post('/admin-stats', async (c) => {
   try {

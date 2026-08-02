@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin } from './db.js';
-import { logOperation, releaseSessionReservations, requireUser, stackOf, sanitizeDateFields, toBase44Row, toBase44Rows } from './helpers.js';
+import { logOperation, releaseSessionReservations, requireUser, stackOf, sanitizeDateFields, toBase44Row, toBase44Rows, getAllowZeroStock } from './helpers.js';
 import { registerCashMovement } from './integration.js';
 
 /**
@@ -324,7 +324,8 @@ functions.post("/finalize-sale", async (c) => {
     session_id = body.session_id || sale.cash_session_id || '';
     device_id = body.device_id || '';
     client_ref = sale.client_ref || '';
-    const allowZeroStock = body.allow_zero_stock === true;
+    // Política global em Configurações (body.allow_zero_stock só como override legado)
+    const allowZeroStock = (await getAllowZeroStock()) || body.allow_zero_stock === true;
     const items = Array.isArray(sale.items) ? sale.items : [];
     const operator_name = sale.operator_name || user.full_name || user.email || '';
 

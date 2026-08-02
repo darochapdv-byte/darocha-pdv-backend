@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { admin, restQuery } from './db.js';
 import { toBase44Row } from './helpers.js';
-import { requireUser, buildReservationMap } from './helpers.js';
+import { requireUser, buildReservationMap, getAllowZeroStock } from './helpers.js';
 
 const stock = new Hono();
 
@@ -224,7 +224,7 @@ stock.post('/sync-pdv-reservations', async (c) => {
     const items = Array.isArray(body.items) ? body.items : [];
     const operatorName = body.operator_name || user.email || 'PDV';
     const expiryMinutes = Number(body.expiry_minutes) || 30;
-    const allowZeroStock = body.allow_zero_stock === true;
+    const allowZeroStock = (await getAllowZeroStock()) || body.allow_zero_stock === true;
 
     if (!sessionId) return c.json({ error: 'session_id obrigatório' }, 400);
 

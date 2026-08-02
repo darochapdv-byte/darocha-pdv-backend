@@ -148,3 +148,74 @@ export function toBase44Rows(rows) {
   if (!Array.isArray(rows)) return toBase44Row(rows);
   return rows.map(toBase44Row);
 }
+
+const ZERO_STOCK_SETTING_TYPE = 'system_setting_allow_zero_stock';
+
+/** Lê a política global "vender sem estoque" (PDV + catálogo). */
+export async function getAllowZeroStock() {
+  if (!admin) return false;
+  try {
+    const { data: settingsList } = await admin
+      .from('app_settings')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(1);
+    const s = settingsList?.[0];
+    if (s && Object.prototype.hasOwnProperty.call(s, 'allow_zero_stock')) {
+      return s.allow_zero_stock === true;
+    }
+    const { data: logs } = await admin
+      .from('operational_log')
+      .select('description')
+      .eq('type', ZERO_STOCK_SETTING_TYPE)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (logs?.[0]?.description) {
+      try {
+        const parsed = JSON.parse(logs[0].description);
+        return parsed?.allow_zero_stock === true;
+      } catch {
+        return logs[0].description === 'true';
+      }
+    }
+  } catch (e) {
+    console.error('getAllowZeroStock', e.message || e);
+  }
+  return false;
+}
+
+/** Persiste a política global "vender sem estoque". */
+export async function setAllowZeroStock(value) {
+  if (!admin) return false;
+  const enabled = value === true;
+  try {
+    const { data: settingsList } = await admin
+      .from('app_settings')
+      .select('id')
+      .order('created_at', { ascending: false })
+      .limit(1);
+    const id = settingsList?.[0]?.id;
+    if (id) {
+      const { error } = await admin
+        .from('app_settings')
+        .update({ allow_zero_stock: enabled })
+        .eq('id', id);
+      if (!error) return true;
+      console.warn('setAllowZeroStock app_settings', error.message);
+    }
+  } catch (e) {
+    console.warn('setAllowZeroStock app_settings', e.message || e);
+  }
+  try {
+    await admin.from('operational_log').insert({
+      type: ZERO_STOCK_SETTING_TYPE,
+      level: 'info',
+      description: JSON.stringify({ allow_zero_stock: enabled }),
+      operator_name: 'system',
+    });
+    return true;
+  } catch (e) {
+    console.error('setAllowZeroStock fallback', e.message || e);
+    return false;
+  }
+}
