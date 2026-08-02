@@ -253,17 +253,52 @@ catalog.post('/catalog-checkout', async (c) => {
       }
     }
 
-    // Upsert cliente por telefone
-    const phoneDigits = String(customer.phone || '').replace(/\D/g, '');
+    // Upsert cliente por telefone (evita cadastro duplicado)
+    // Normaliza: só dígitos. Aceita com ou sem DDI 55.
+    const rawPhone = String(customer.phone || '').replace(/\D/g, '');
+    let phoneDigits = rawPhone;
+    if (phoneDigits.startsWith('55') && phoneDigits.length >= 12) {
+      phoneDigits = phoneDigits.slice(2); // remove DDI Brasil
+    }
+    // Remove zero à esquerda residual
+    if (phoneDigits.startsWith('0') && phoneDigits.length > 10) {
+      phoneDigits = phoneDigits.replace(/^0+/, '');
+    }
+
     let customerId = null;
-    if (customer.name && phoneDigits) {
+    if (customer.name && phoneDigits && phoneDigits.length >= 8) {
       try {
-        const { data: all } = await admin.from('customer').select('*').limit(500);
-        const match = (all || []).find(
-          (cu) => String(cu.phone || '').replace(/\D/g, '') === phoneDigits
-        );
+        // Busca candidatos pelo telefone (exato e variações comuns)
+        const variants = [
+          phoneDigits,
+          '55' + phoneDigits,
+          phoneDigits.length === 11 ? phoneDigits.slice(2) : null, // sem DDD
+        ].filter(Boolean);
+
+        const { data: candidates } = await admin
+          .from('customer')
+          .select('*')
+          .or(variants.map((v) => `phone.eq.${v}`).join(','))
+          .limit(20);
+
+        // Confirma match comparando só dígitos (mais seguro)
+        const match = (candidates || []).find((cu) => {
+          let p = String(cu.phone || '').replace(/\D/g, '');
+          if (p.startsWith('55') && p.length >= 12) p = p.slice(2);
+          return p === phoneDigits || p.endsWith(phoneDigits) || phoneDigits.endsWith(p);
+        });
+
         if (match) {
+          // Cliente já existe → atualiza dados faltantes (não duplica)
           const updates = {};
+          if (customer.name && (!match.name || match.name.length < 3)) {
+            updates.name = customer.name;
+          }
+          if (!match.whatsapp) updates.whatsapp = phoneDigits;
+          // Normaliza o telefone salvo
+          if (String(match.phone || '').replace(/\D/g, '') !== phoneDigits) {
+            updates.phone = phoneDigits;
+          }
           if (deliveryType === 'entrega') {
             if (body.street && !match.street) updates.street = body.street;
             if (body.number && !match.number) updates.number = body.number;
@@ -271,15 +306,17 @@ catalog.post('/catalog-checkout', async (c) => {
             if (body.neighborhood && !match.neighborhood) updates.neighborhood = body.neighborhood;
             if (body.city && !match.city) updates.city = body.city;
             if (body.state && !match.state) updates.state = body.state;
+            if (body.cep && !match.cep) updates.cep = String(body.cep || '').replace(/\D/g, '');
           }
           if (Object.keys(updates).length) {
             await admin.from('customer').update(updates).eq('id', match.id);
           }
           customerId = match.id;
         } else {
+          // Cliente novo → cadastra uma vez
           const row = {
             person_type: 'fisica',
-            name: customer.name,
+            name: customer.name.trim(),
             phone: phoneDigits,
             whatsapp: phoneDigits,
             active: true,
@@ -292,15 +329,25 @@ catalog.post('/catalog-checkout', async (c) => {
               neighborhood: body.neighborhood || '',
               city: body.city || '',
               state: body.state || '',
+              cep: String(body.cep || '').replace(/\D/g, ''),
             });
           }
-          const { data: created } = await admin.from('customer').insert(row).select().single();
-          customerId = created?.id || null;
+          const { data: created, error: custErr } = await admin
+            .from('customer')
+            .insert(row)
+            .select()
+            .single();
+          if (custErr) {
+            console.error('customer insert error', custErr.message);
+          } else {
+            customerId = created?.id || null;
+          }
         }
       } catch (e) {
         console.error('customer auto-upsert error', e);
       }
     }
+
 
     // Vincula ao caixa aberto (mesmo fluxo da loja — um único caixa)
     const openSession = openSessions[0];
