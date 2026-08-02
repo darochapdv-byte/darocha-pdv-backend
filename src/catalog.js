@@ -44,8 +44,17 @@ async function loadStoreConfig(storeOwnerId) {
       .select('*')
       .eq('created_by', storeOwnerId)
       .order('created_at', { ascending: false })
-      .limit(1);
+      .limit(20);
     cfg = settingsList?.[0] || null;
+    // card_installment_rates pode estar em outra linha de settings da mesma loja
+    if (cfg && (!cfg.card_installment_rates || !cfg.card_installment_rates.length)) {
+      const withRates = (settingsList || []).find(
+        (s) => Array.isArray(s.card_installment_rates) && s.card_installment_rates.length
+      );
+      if (withRates) {
+        cfg = { ...cfg, card_installment_rates: withRates.card_installment_rates };
+      }
+    }
   }
   const { data: profile } = storeOwnerId
     ? await admin.from('profiles').select('*').eq('id', storeOwnerId).maybeSingle()
