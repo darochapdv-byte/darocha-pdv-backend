@@ -33,11 +33,12 @@ function isTenantEntity(entityName) {
   return TENANT_ENTITIES.has(entityName);
 }
 
-/** Aplica filtro de dono (created_by) quando a entidade é multi-tenant */
-function applyTenantFilter(q, entityName, user) {
-  if (user && isTenantEntity(entityName)) {
-    q = q.eq('created_by', user.id);
-  }
+/** Aplica filtro de dono (created_by) quando a entidade é multi-tenant.
+ *  DESATIVADO: este PDV é single-tenant. Pedidos do catálogo (e notificações)
+ *  são inseridos sem created_by; filtrar por user.id escondia tudo no sininho,
+ *  em "Pedidos para entrega" e no histórico de vendas.
+ */
+function applyTenantFilter(q, _entityName, _user) {
   return q;
 }
 
