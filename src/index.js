@@ -45,15 +45,34 @@ app.get('/uploads/:file', async (c) => {
   return new Response(buf, { headers: { 'Content-Type': types[ext] || 'application/octet-stream' } });
 });
 
-app.get('/health', (c) =>
-  c.json({
-    ok: true,
+app.get('/health', async (c) => {
+  const started = Date.now();
+  let dbOk = !!admin;
+  let dbError = null;
+  if (admin && !useLocal) {
+    try {
+      // Ping leve no banco — confirma que Supabase responde
+      const { error } = await admin.from('app_settings').select('id').limit(1);
+      if (error) {
+        dbOk = false;
+        dbError = error.message;
+      }
+    } catch (e) {
+      dbOk = false;
+      dbError = e.message || String(e);
+    }
+  }
+  const body = {
+    ok: dbOk,
     service: 'darocha-pdv-backend',
-    db: !!admin,
+    db: dbOk,
     mode: useLocal ? 'local' : 'supabase',
     time: new Date().toISOString(),
-  })
-);
+    latency_ms: Date.now() - started,
+  };
+  if (dbError) body.db_error = dbError;
+  return c.json(body, dbOk ? 200 : 503);
+});
 
 app.route('/auth', auth);
 app.route('/entities', entities);
