@@ -13,6 +13,27 @@ import {
 
 const catalog = new Hono();
 
+/** Extrai slug da loja do body, query ou Referer (app antigo não envia loja no body). */
+function extractSlugFromRequest(c, body = {}) {
+  let slug = String(body?.slug || body?.loja || body?.store || '').trim();
+  if (!slug) {
+    try {
+      const url = new URL(c.req.url);
+      slug = url.searchParams.get('loja') || url.searchParams.get('slug') || '';
+    } catch { /* ignore */ }
+  }
+  if (!slug) {
+    const ref = c.req.header('Referer') || c.req.header('Referrer') || '';
+    const m =
+      ref.match(/[?&]loja=([a-zA-Z0-9]+)/) ||
+      ref.match(/[?&]slug=([a-zA-Z0-9]+)/) ||
+      ref.match(/\/catalogo\/([a-zA-Z0-9]+)/);
+    if (m) slug = m[1];
+  }
+  return String(slug || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+
 /** Carrega app_settings + profile de um dono de loja específico. */
 async function loadStoreConfig(storeOwnerId) {
   let cfg = null;
@@ -36,7 +57,7 @@ catalog.post('/catalog-data', async (c) => {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
     const body = await c.req.json().catch(() => ({}));
-    const slugParam = String(body.slug || body.loja || body.store || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    const slugParam = extractSlugFromRequest(c, body);
 
     let storeOwnerId = null;
     let catalogSlug = null;
@@ -230,7 +251,7 @@ catalog.post('/catalog-store-status', async (c) => {
   try {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const body = await c.req.json().catch(() => ({}));
-    const slugParam = String(body.slug || body.loja || body.store || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    const slugParam = extractSlugFromRequest(c, body);
     let storeOwnerId = null;
     if (slugParam) {
       const resolved = await resolveStoreBySlug(slugParam);
@@ -283,7 +304,7 @@ catalog.post('/catalog-checkout', async (c) => {
     }
     if (!body.seller_id) return c.json({ error: 'Selecione o vendedor' }, 400);
 
-    const slugParam = String(body.slug || body.loja || body.store || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    const slugParam = extractSlugFromRequest(c, body);
     let storeOwnerId = null;
     let settings = null;
     if (slugParam) {
