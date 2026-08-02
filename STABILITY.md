@@ -80,3 +80,25 @@ Frequência sugerida: **1x por semana**.
 - `/health` com `"ok": false` ou status 503
 - Upload de foto falhando de novo
 - Pedido do catálogo não aparece no sininho
+
+## Backup automático (endpoint)
+
+`POST /functions/create-backup`
+
+- Com usuário admin logado, ou
+- Header `x-backup-secret` igual a `BACKUP_SECRET` (ou `JWT_SECRET` no Render)
+
+Arquivos ficam no bucket **privado** `backups` no Supabase Storage.
+
+Backup manual já gerado: `darocha-backup-2026-08-02.tar.gz` nesse bucket.
+
+## Keep-alive e checklist no GitHub Actions
+
+Os workflows estão prontos, mas o token atual do GitHub **não tem permissão `workflow`**.
+Para ativar de vez:
+
+1. GitHub → Settings → Developer settings → Personal access tokens
+2. Gere um token com escopos `repo` + `workflow`
+3. Atualize o remote e peça para reenviar os workflows
+
+Enquanto isso, use **UptimeRobot** (grátis) no `/health` a cada 5 min.
