@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { admin, userClient, tableFor } from './db.js';
 import { sanitizeDateFields, sanitizeEntityBody, toBase44Row, toBase44Rows, requireUser, getAllowZeroStock, setAllowZeroStock } from './helpers.js';
+import { getAccessStatus } from './stripe_ops.js';
 
 const entities = new Hono();
 
@@ -35,6 +36,25 @@ function parseOrder(order) {
 function isTenantEntity(entityName) {
   return TENANT_ENTITIES.has(entityName);
 }
+
+async function assertSubscription(c) {
+  const user = await requireUser(c);
+  if (!user) return { error: c.json({ error: 'Unauthorized' }, 401) };
+  const access = await getAccessStatus(user.id);
+  if (!access.allowed) {
+    return {
+      error: c.json({
+        error: 'subscription_required',
+        message: access.status === 'trial_expired'
+          ? 'Seu período de teste acabou. Assine o plano de R$ 100/mês para continuar.'
+          : 'Assinatura inativa. Regularize para continuar usando o sistema.',
+        access,
+      }, 402),
+    };
+  }
+  return { user, access };
+}
+
 
 /** Aplica filtro de dono (created_by) — cada usuário só vê os próprios dados. */
 function applyTenantFilter(q, entityName, user) {
@@ -154,6 +174,12 @@ entities.post('/:entity', async (c) => {
   body = sanitizeEntityBody(body);
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
+
+  // Bloqueia escrita se trial acabou / sem assinatura
+  if (isTenantEntity(entity) && entity !== 'AppSettings') {
+    const gate = await assertSubscription(c);
+    if (gate.error) return gate.error;
+  }
 
   let allowZeroStockSaved = null;
   if (entity === 'AppSettings' && Object.prototype.hasOwnProperty.call(body, 'allow_zero_stock')) {

@@ -192,6 +192,15 @@ auth.post('/register', async (c) => {
     console.warn('app_settings seed on register', e.message || e);
   }
 
+  // Trial 30 dias + código de indicação + vínculo de referral
+  try {
+    const { bootstrapNewUserSubscription } = await import('./stripe_ops.js');
+    const referralUsed = extra.referral_code || extra.referralCode || body.referral_code || null;
+    await bootstrapNewUserSubscription(data.user.id, email, referralUsed);
+  } catch (e) {
+    console.warn('subscription bootstrap on register', e.message || e);
+  }
+
   const login = await admin.auth.signInWithPassword({ email, password });
   return c.json({ token: login.data.session?.access_token, user: data.user }, 201);
 });
@@ -204,7 +213,7 @@ auth.patch('/me', async (c) => {
   if (!user) return c.json({ error: 'unauthorized' }, 401);
   const body = await c.req.json().catch(() => ({}));
   // company_address pode não existir na tabela — tentamos e removemos se falhar
-  const allowed = ['company_name', 'company_cnpj', 'company_phone', 'company_instagram', 'company_address', 'referral_code', 'role'];
+  const allowed = ['company_name', 'company_cnpj', 'company_phone', 'company_instagram', 'company_address', 'role']; // referral_code é imutável
   const patch = {};
   for (const k of allowed) {
     if (k in body) patch[k] = body[k] === '' ? null : body[k];
