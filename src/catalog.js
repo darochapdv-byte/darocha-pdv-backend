@@ -58,15 +58,27 @@ catalog.post('/catalog-data', async (c) => {
       storeOwnerId = resolved.userId;
       catalogSlug = resolved.slug;
     } else {
-      return c.json({
-        enabled: false,
-        products: [],
-        fees: [],
-        categories: [],
-        brands: [],
-        sellers: [],
-        error: 'Informe o link da loja (parâmetro slug/loja). Cada loja tem um catálogo exclusivo.',
-      }, 400);
+      // Sem slug: se logado, usa a loja do usuário (prévia dentro do PDV)
+      const user = await requireUser(c);
+      if (user?.id) {
+        storeOwnerId = user.id;
+        try {
+          const { data: profile } = await admin.from('profiles').select('company_name').eq('id', user.id).maybeSingle();
+          catalogSlug = await ensureCatalogSlug(user.id, profile?.company_name || null);
+        } catch {
+          catalogSlug = null;
+        }
+      } else {
+        return c.json({
+          enabled: false,
+          products: [],
+          fees: [],
+          categories: [],
+          brands: [],
+          sellers: [],
+          error: 'Informe o link da loja (ex: /catalogo?loja=nomedaloja). Cada loja tem um catálogo exclusivo.',
+        }, 400);
+      }
     }
 
     const { cfg, profile } = await loadStoreConfig(storeOwnerId);
@@ -223,6 +235,9 @@ catalog.post('/catalog-store-status', async (c) => {
       const resolved = await resolveStoreBySlug(slugParam);
       if (!resolved) return c.json({ error: 'Loja não encontrada', open: false }, 404);
       storeOwnerId = resolved.userId;
+    } else {
+      const user = await requireUser(c);
+      if (user?.id) storeOwnerId = user.id;
     }
     let sessionsQuery = admin.from('cash_session').select('id').eq('status', 'aberto').limit(1);
     if (storeOwnerId) sessionsQuery = sessionsQuery.eq('created_by', storeOwnerId);
