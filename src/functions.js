@@ -86,8 +86,8 @@ functions.post('/open-cash-session', async (c) => {
     if (!operator_id) return c.json({ error: 'Selecione o funcionário.' }, 400);
     if (!device_id) return c.json({ error: 'Dispositivo não identificado.' }, 400);
 
-    // 1) Mesmo operador + mesmo dispositivo → retoma
-    let sameDeviceQuery = admin
+    // 1) Mesmo operador + mesmo dispositivo → retoma (evita duplicar no mesmo aparelho)
+    const { data: existingSame } = await admin
       .from('cash_session')
       .select('*')
       .eq('operator_id', operator_id)
@@ -95,9 +95,6 @@ functions.post('/open-cash-session', async (c) => {
       .eq('status', 'aberto')
       .order('created_at', { ascending: false })
       .limit(1);
-    if (user?.id) sameDeviceQuery = sameDeviceQuery.eq('created_by', user.id);
-
-    const { data: existingSame } = await sameDeviceQuery;
 
     if (existingSame?.length) {
       const session = existingSame[0];
@@ -108,27 +105,9 @@ functions.post('/open-cash-session', async (c) => {
       return c.json({ session: toBase44Row(session), resumed: true });
     }
 
-    // 2) Mesmo operador com caixa aberto em OUTRO dispositivo → não cria outro;
-    //    devolve o existente para o frontend fazer takeover (1 dispositivo por caixa)
-    let otherDeviceQuery = admin
-      .from('cash_session')
-      .select('*')
-      .eq('operator_id', operator_id)
-      .eq('status', 'aberto')
-      .order('created_at', { ascending: false })
-      .limit(1);
-    if (user?.id) otherDeviceQuery = otherDeviceQuery.eq('created_by', user.id);
-
-    const { data: existingOther } = await otherDeviceQuery;
-    if (existingOther?.length) {
-      const session = existingOther[0];
-      return c.json({
-        error: 'Este operador já possui um caixa aberto em outro dispositivo. Assuma o caixa para continuar neste aparelho.',
-        requires_takeover: true,
-        session: toBase44Row(session),
-        current_device_id: session.device_id,
-      }, 409);
-    }
+    // 2) Permite MÚLTIPLOS caixas abertos ao mesmo tempo.
+    //    Qualquer operador pode abrir um novo caixa em qualquer dispositivo.
+    //    (Não bloqueia mais por "terminal já ocupado" nem por "operador em outro device")
 
     const operatorIsVendedor = Array.isArray(body.operator_funcoes) && body.operator_funcoes.includes('vendedor');
     const payload = {
@@ -154,6 +133,7 @@ functions.post('/open-cash-session', async (c) => {
   }
 });
 
+
 // ─── takeover-cash-session ─────────────────────────────────────────────────
 
 functions.post('/takeover-cash-session', async (c) => {
@@ -169,14 +149,12 @@ functions.post('/takeover-cash-session', async (c) => {
 
     const { data: session } = await admin.from('cash_session').select('*').eq('id', session_id).maybeSingle();
     if (!session) return c.json({ error: 'Caixa não encontrado.' }, 404);
-    // Só permite assumir caixa do próprio usuário
-    if (user?.id && session.created_by && session.created_by !== user.id) {
-      return c.json({ error: 'Caixa não pertence a este usuário.' }, 403);
-    }
+    // Qualquer usuário autenticado pode assumir qualquer caixa aberto
     if (session.status !== 'aberto') {
       return c.json({ error: 'Este caixa já foi fechado e não pode ser assumido.' }, 400);
     }
     if (session.device_id === device_id) return c.json({ session: toBase44Row(session), resumed: true });
+
 
     const existingHistory = Array.isArray(session.takeover_history) ? session.takeover_history : [];
     const entry = {
@@ -291,15 +269,13 @@ functions.post("/list-open-cash-sessions", async (c) => {
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
-    // Só lista caixas abertos DO usuário logado (multi-tenant)
-    let q = admin
+    // Lista todos os caixas abertos (PDV single-tenant — qualquer um pode ver/assumir)
+    const { data: openSessions, error } = await admin
       .from('cash_session')
       .select('*')
       .eq('status', 'aberto')
       .order('created_at', { ascending: false });
-    if (user?.id) q = q.eq('created_by', user.id);
 
-    const { data: openSessions, error } = await q;
 
     if (error) return c.json({ error: error.message }, 500);
     return c.json(toBase44Rows(openSessions));
@@ -333,11 +309,11 @@ functions.post("/finalize-sale", async (c) => {
       return c.json({ error: 'Carrinho vazio. Nenhuma alteração foi realizada.' }, 400);
     }
 
-    // Garante exclusividade do dispositivo no caixa
+    // Valida apenas se o caixa está aberto (permite múltiplos caixas e takeover livre)
     if (session_id) {
       const { data: cashSession } = await admin
         .from('cash_session')
-        .select('id,status,device_id,created_by')
+        .select('id,status,device_id')
         .eq('id', session_id)
         .maybeSingle();
       if (!cashSession || cashSession.status !== 'aberto') {
@@ -347,18 +323,12 @@ functions.post("/finalize-sale", async (c) => {
           reason: 'closed',
         }, 409);
       }
-      if (user?.id && cashSession.created_by && cashSession.created_by !== user.id) {
-        return c.json({ error: 'Caixa não pertence a este usuário.', force_exit: true }, 403);
-      }
+      // Aviso se o device mudou, mas NÃO bloqueia a venda (apenas informa)
       if (device_id && cashSession.device_id && cashSession.device_id !== device_id) {
-        return c.json({
-          error: 'Este caixa foi assumido em outro dispositivo. Apenas um aparelho pode usá-lo por vez.',
-          force_exit: true,
-          foreign: true,
-          reason: 'taken_over',
-        }, 409);
+        console.warn(`finalize-sale: device mismatch session=${session_id} expected=${cashSession.device_id} got=${device_id}`);
       }
     }
+
 
     // RPC atômica (se 002_finalize_sale_rpc.sql foi aplicado)
     const { data: rpcResult, error: rpcError } = await admin.rpc('finalize_sale', {
