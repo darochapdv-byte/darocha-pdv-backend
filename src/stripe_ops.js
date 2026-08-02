@@ -48,7 +48,7 @@ export async function ensureUniqueReferralCode() {
  */
 export async function getAccessStatus(userId) {
   if (!admin || !userId) {
-    return { allowed: false, status: 'unknown', reason: 'no_user' };
+    return { allowed: false, status: 'unknown', description: 'no_user' };
   }
 
   const { data: subs } = await admin
@@ -60,27 +60,27 @@ export async function getAccessStatus(userId) {
 
   const sub = subs?.[0];
   if (!sub) {
-    return { allowed: false, status: 'none', reason: 'no_subscription' };
+    return { allowed: false, status: 'none', description: 'no_subscription' };
   }
 
-  if (sub.is_lifetime === true || sub.plan === 'lifetime' || sub.plan === 'dev_lifetime') {
+  if (sub.permanent_free_access === true || sub.plan === 'lifetime' || sub.plan === 'dev_lifetime') {
     return { allowed: true, status: 'lifetime', subscription: sub, price_brl: 0 };
   }
 
   if (sub.status === 'active') {
-    const price = sub.discount_50 === true ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL;
+    const price = sub.permanent_discount_active === true ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL;
     return { allowed: true, status: 'active', subscription: sub, price_brl: price };
   }
 
   if (sub.status === 'trialing') {
-    const ends = sub.trial_ends_at ? new Date(sub.trial_ends_at) : null;
+    const ends = sub.trial_end ? new Date(sub.trial_end) : null;
     if (ends && ends.getTime() > Date.now()) {
       const daysLeft = Math.ceil((ends.getTime() - Date.now()) / 86400000);
       return {
         allowed: true,
         status: 'trialing',
         subscription: sub,
-        trial_ends_at: sub.trial_ends_at,
+        trial_end: sub.trial_end,
         days_left: daysLeft,
         price_brl: MONTHLY_PRICE_BRL,
       };
@@ -90,20 +90,20 @@ export async function getAccessStatus(userId) {
       allowed: false,
       status: 'trial_expired',
       subscription: sub,
-      trial_ends_at: sub.trial_ends_at,
-      reason: 'trial_expired',
+      trial_end: sub.trial_end,
+      description: 'trial_expired',
       price_brl: MONTHLY_PRICE_BRL,
     };
   }
 
   // free months credit (recompensa de indicação)
-  if (sub.free_months_remaining > 0) {
+  if (sub.reward_free_months > 0) {
     return {
       allowed: true,
       status: 'free_credit',
       subscription: sub,
-      free_months_remaining: sub.free_months_remaining,
-      price_brl: sub.discount_50 ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL,
+      reward_free_months: sub.reward_free_months,
+      price_brl: sub.permanent_discount_active ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL,
     };
   }
 
@@ -111,7 +111,7 @@ export async function getAccessStatus(userId) {
     allowed: false,
     status: sub.status || 'expired',
     subscription: sub,
-    reason: 'subscription_inactive',
+    description: 'subscription_inactive',
     price_brl: MONTHLY_PRICE_BRL,
   };
 }
@@ -133,24 +133,24 @@ export async function bootstrapNewUserSubscription(userId, email, referralCodeUs
   // Código coringa da equipe
   const usedCode = String(referralCodeUsed || '').trim().toUpperCase();
   if (usedCode === MASTER_CODE) {
+    // Conta usos via subscription_log (sem tabela extra)
     const { data: usages } = await admin
-      .from('master_code_usage')
+      .from('subscription_log')
       .select('id')
-      .eq('code', MASTER_CODE);
+      .eq('action', 'master_code_used');
     const count = usages?.length || 0;
     if (count >= MASTER_CODE_MAX_USES) {
       // código esgotado — segue como trial normal
     } else {
-      await admin.from('master_code_usage').insert({
-        code: MASTER_CODE,
-        user_id: userId,
-        user_email: email || null,
-        used_at: new Date().toISOString(),
-      });
       plan = 'dev_lifetime';
       status = 'active';
       isLifetime = true;
       masterUsed = true;
+      await admin.from('subscription_log').insert({
+        user_id: userId,
+        action: 'master_code_used',
+        description: JSON.stringify({ code: MASTER_CODE, user_email: email || null, used_at: new Date().toISOString() }),
+      });
     }
   }
 
@@ -158,13 +158,15 @@ export async function bootstrapNewUserSubscription(userId, email, referralCodeUs
     .from('subscription')
     .insert({
       user_id: userId,
+      user_email: email || null,
       status,
-      plan,
-      trial_ends_at: isLifetime ? null : trialEnd,
-      is_lifetime: isLifetime,
-      free_months_remaining: 0,
-      discount_50: false,
-      months_paid: 0,
+      plan: isLifetime ? 'lifetime' : 'trial',
+      amount: 100,
+      trial_start: isLifetime ? null : new Date().toISOString(),
+      trial_end: isLifetime ? null : trialEnd,
+      permanent_free_access: isLifetime,
+      reward_free_months: 0,
+      permanent_discount_active: false,
     })
     .select()
     .single();
@@ -175,13 +177,13 @@ export async function bootstrapNewUserSubscription(userId, email, referralCodeUs
 
   await admin.from('subscription_log').insert({
     user_id: userId,
-    event: masterUsed ? 'dev_lifetime_granted' : 'trial_started',
-    details: {
+    action: masterUsed ? 'dev_lifetime_granted' : 'trial_started',
+    description: JSON.stringify({
       trial_days: TRIAL_DAYS,
-      trial_ends_at: trialEnd,
+      trial_end: trialEnd,
       referral_code_used: usedCode || null,
       master_used: masterUsed,
-    },
+    }),
   });
 
   // Vincular indicação normal (não master)
@@ -236,7 +238,7 @@ async function linkReferralInternal(userId, email, code) {
     status: 'pending',
     months_subscribed: 0,
     longterm_granted: false,
-    validated_at: null,
+    validated_date: null,
   });
 
   return { ok: true, message: 'Indicação vinculada com sucesso!' };
@@ -259,7 +261,7 @@ async function processReferralOnFirstPayment(userId) {
     .from('referral')
     .update({
       status: 'validated',
-      validated_at: now,
+      validated_date: now,
       months_subscribed: 1,
     })
     .eq('id', ref.id);
@@ -274,18 +276,18 @@ async function processReferralOnFirstPayment(userId) {
 
   const rSub = referrerSubs?.[0];
   if (rSub) {
-    const current = Number(rSub.free_months_remaining) || 0;
+    const current = Number(rSub.reward_free_months) || 0;
     await admin
       .from('subscription')
-      .update({ free_months_remaining: current + 1 })
+      .update({ reward_free_months: current + 1 })
       .eq('id', rSub.id);
   } else {
     await admin.from('subscription').insert({
       user_id: ref.referrer_user_id,
       status: 'active',
       plan: 'referral_credit',
-      free_months_remaining: 1,
-      is_lifetime: false,
+      reward_free_months: 1,
+      permanent_free_access: false,
     });
   }
 
@@ -293,15 +295,15 @@ async function processReferralOnFirstPayment(userId) {
     user_id: ref.referrer_user_id,
     type: 'free_month',
     amount: 1,
-    reason: 'indicação validada',
-    referral_id: ref.id,
+    description: 'indicação validada',
+    related_referral_id: ref.id,
     referred_user_id: userId,
   });
 
   await admin.from('subscription_log').insert({
     user_id: ref.referrer_user_id,
-    event: 'referral_reward_free_month',
-    details: { referral_id: ref.id, referred_user_id: userId },
+    action: 'referral_reward_free_month',
+    description: JSON.stringify({ related_referral_id: ref.id, referred_user_id: userId }),
   });
 
   // Recalcula desconto 50%
@@ -363,17 +365,17 @@ async function recomputeDiscount50(userId) {
     // Indicado ainda ativo?
     const { data: subRows } = await admin
       .from('subscription')
-      .select('status,is_lifetime')
+      .select('status,permanent_free_access')
       .eq('user_id', ref.referred_user_id)
       .order('created_at', { ascending: false })
       .limit(1);
     const s = subRows?.[0];
     const active =
       s &&
-      (s.is_lifetime === true ||
+      (s.permanent_free_access === true ||
         s.status === 'active' ||
         s.status === 'trialing' ||
-        (Number(s.free_months_remaining) || 0) > 0);
+        (Number(s.reward_free_months) || 0) > 0);
     if (active) qualifying.push(ref);
   }
 
@@ -389,16 +391,16 @@ async function recomputeDiscount50(userId) {
   const sub = subs?.[0];
   if (!sub) return;
 
-  const currently = sub.discount_50 === true;
+  const currently = sub.permanent_discount_active === true;
   if (eligible !== currently) {
-    await admin.from('subscription').update({ discount_50: eligible }).eq('id', sub.id);
+    await admin.from('subscription').update({ permanent_discount_active: eligible }).eq('id', sub.id);
     await admin.from('subscription_log').insert({
       user_id: userId,
-      event: eligible ? 'discount_50_granted' : 'discount_50_revoked',
-      details: {
+      action: eligible ? 'permanent_discount_active_granted' : 'permanent_discount_active_revoked',
+      description: JSON.stringify({
         qualifying_count: qualifying.length,
         required: DISCOUNT_MIN_REFERRALS,
-      },
+      }),
     });
   }
 }
@@ -419,7 +421,7 @@ stripeOps.post('/create-checkout', async (c) => {
 
     const body = await c.req.json().catch(() => ({}));
     const access = await getAccessStatus(user.id);
-    const wantsDiscount = access.subscription?.discount_50 === true;
+    const wantsDiscount = access.subscription?.permanent_discount_active === true;
 
     // Price IDs: normal e com desconto (configuráveis no env)
     const priceId =
@@ -454,7 +456,7 @@ stripeOps.post('/create-checkout', async (c) => {
       url: session.url,
       session_id: session.id,
       price_brl: wantsDiscount ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL,
-      discount_50: wantsDiscount,
+      permanent_discount_active: wantsDiscount,
     });
   } catch (error) {
     return c.json({ error: error.message }, 500);
@@ -491,27 +493,34 @@ stripeOps.post('/stripe-webhook', async (c) => {
           .order('created_at', { ascending: false })
           .limit(1);
         const prev = existing?.[0];
-        const isFirstPayment = !prev || prev.months_paid === 0 || prev.status === 'trialing' || prev.status === 'trial_expired';
+        const { count: paidCount } = await admin
+          .from('subscription_log')
+          .select('id', { count: 'exact', head: true })
+          .eq('user_id', userId)
+          .eq('action', 'checkout_completed');
+        const isFirstPayment = !prev || (paidCount || 0) === 0 || prev.status === 'trialing' || prev.status === 'trial_expired';
 
-        await admin.from('subscription').upsert(
-          {
-            user_id: userId,
-            status: 'active',
-            stripe_customer_id: obj.customer,
-            stripe_subscription_id: obj.subscription,
-            plan: 'pro',
-            months_paid: (Number(prev?.months_paid) || 0) + 1,
-            is_lifetime: prev?.is_lifetime === true ? true : false,
-            discount_50: prev?.discount_50 === true,
-            free_months_remaining: Number(prev?.free_months_remaining) || 0,
-          },
-          { onConflict: 'user_id' }
-        );
+        const upsertPayload = {
+          user_id: userId,
+          status: 'active',
+          stripe_customer_id: obj.customer,
+          stripe_subscription_id: obj.subscription,
+          plan: 'pro',
+          amount: prev?.permanent_discount_active ? 50 : 100,
+          permanent_free_access: prev?.permanent_free_access === true,
+          permanent_discount_active: prev?.permanent_discount_active === true,
+          reward_free_months: Number(prev?.reward_free_months) || 0,
+        };
+        if (prev?.id) {
+          await admin.from('subscription').update(upsertPayload).eq('id', prev.id);
+        } else {
+          await admin.from('subscription').insert(upsertPayload);
+        }
 
         await admin.from('subscription_log').insert({
           user_id: userId,
-          event: 'checkout_completed',
-          details: { session_id: obj.id, first_payment: isFirstPayment },
+          action: 'checkout_completed',
+          description: JSON.stringify({ session_id: obj.id, first_payment: isFirstPayment }),
         });
 
         if (isFirstPayment) {
@@ -527,17 +536,14 @@ stripeOps.post('/stripe-webhook', async (c) => {
       if (!uid && obj.subscription) {
         const { data: rows } = await admin
           .from('subscription')
-          .select('user_id,months_paid')
+          .select('user_id')
           .eq('stripe_subscription_id', obj.subscription)
           .limit(1);
         if (rows?.[0]) {
           uid = rows[0].user_id;
           await admin
             .from('subscription')
-            .update({
-              status: 'active',
-              months_paid: (Number(rows[0].months_paid) || 0) + 1,
-            })
+            .update({ status: 'active' })
             .eq('user_id', uid);
           await onSubscriptionRenewal(uid);
         }
@@ -677,7 +683,7 @@ stripeOps.post('/referral-panel', async (c) => {
       .reduce((s, r) => s + (Number(r.amount) || 0), 0);
 
     const access = await getAccessStatus(user.id);
-    const freeRemaining = Number(access.subscription?.free_months_remaining) || 0;
+    const freeRemaining = Number(access.subscription?.reward_free_months) || 0;
 
     // Progresso para desconto 50%
     let longtermCount = 0;
@@ -692,20 +698,20 @@ stripeOps.post('/referral-panel', async (c) => {
       pending_count: pending.length,
       active_indicated: validatedActive.length,
       free_months_earned: freeMonthsEarned,
-      free_months_remaining: freeRemaining,
-      discount_50: access.subscription?.discount_50 === true,
+      reward_free_months: freeRemaining,
+      permanent_discount_active: access.subscription?.permanent_discount_active === true,
       discount_progress: {
         current: longtermCount,
         required: DISCOUNT_MIN_REFERRALS,
         min_months_each: DISCOUNT_MIN_MONTHS_EACH,
       },
-      price_brl: access.subscription?.discount_50 ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL,
+      price_brl: access.subscription?.permanent_discount_active ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL,
       referrals: list.map((r) => ({
         id: r.id,
         referred_email: r.referred_email,
         status: r.status,
         months_subscribed: r.months_subscribed || 0,
-        validated_at: r.validated_at,
+        validated_date: r.validated_date,
         created_at: r.created_at,
       })),
       rewards: rewards || [],
@@ -729,10 +735,10 @@ stripeOps.post('/master-code-status', async (c) => {
       return c.json({ error: 'Forbidden' }, 403);
     }
     const { data: usages } = await admin
-      .from('master_code_usage')
+      .from('subscription_log')
       .select('*')
-      .eq('code', MASTER_CODE)
-      .order('used_at', { ascending: false });
+      .eq('action', 'master_code_used')
+      .order('created_at', { ascending: false });
     return c.json({
       code: MASTER_CODE,
       used: usages?.length || 0,
