@@ -69,6 +69,7 @@ catalog.post('/catalog-data', async (c) => {
           catalogSlug = null;
         }
       } else {
+        // HTTP 200 para o frontend antigo não quebrar (ele trata enabled:false)
         return c.json({
           enabled: false,
           products: [],
@@ -77,7 +78,7 @@ catalog.post('/catalog-data', async (c) => {
           brands: [],
           sellers: [],
           error: 'Informe o link da loja (ex: /catalogo?loja=nomedaloja). Cada loja tem um catálogo exclusivo.',
-        }, 400);
+        });
       }
     }
 
