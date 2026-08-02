@@ -1,52 +1,95 @@
 import { Hono } from 'hono';
 import { admin } from './db.js';
-import { buildReservationMap, computeCatalogAvailable, getAllowZeroStock, getDeliveryPauseStatus } from './helpers.js';
+import {
+  buildReservationMap,
+  computeCatalogAvailable,
+  getDeliveryPauseStatus,
+  resolveStoreBySlug,
+  ensureCatalogSlug,
+  generateUniqueCatalogSlug,
+  setCatalogSlug,
+  requireUser,
+} from './helpers.js';
 
 const catalog = new Hono();
+
+/** Carrega app_settings + profile de um dono de loja específico. */
+async function loadStoreConfig(storeOwnerId) {
+  let cfg = null;
+  if (storeOwnerId) {
+    const { data: settingsList } = await admin
+      .from('app_settings')
+      .select('*')
+      .eq('created_by', storeOwnerId)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    cfg = settingsList?.[0] || null;
+  }
+  const { data: profile } = storeOwnerId
+    ? await admin.from('profiles').select('*').eq('id', storeOwnerId).maybeSingle()
+    : { data: null };
+  return { cfg, profile };
+}
 
 catalog.post('/catalog-data', async (c) => {
   try {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
-    const { data: settingsList } = await admin
-      .from('app_settings').select('*').order('created_at', { ascending: false }).limit(1);
-    const cfg = settingsList?.[0];
+    const body = await c.req.json().catch(() => ({}));
+    const slugParam = String(body.slug || body.loja || body.store || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+
+    let storeOwnerId = null;
+    let catalogSlug = null;
+
+    if (slugParam) {
+      const resolved = await resolveStoreBySlug(slugParam);
+      if (!resolved) {
+        return c.json({
+          enabled: false,
+          products: [],
+          fees: [],
+          categories: [],
+          brands: [],
+          sellers: [],
+          error: 'Loja não encontrada. Verifique o link do catálogo.',
+          slug: slugParam,
+        }, 404);
+      }
+      storeOwnerId = resolved.userId;
+      catalogSlug = resolved.slug;
+    } else {
+      return c.json({
+        enabled: false,
+        products: [],
+        fees: [],
+        categories: [],
+        brands: [],
+        sellers: [],
+        error: 'Informe o link da loja (parâmetro slug/loja). Cada loja tem um catálogo exclusivo.',
+      }, 400);
+    }
+
+    const { cfg, profile } = await loadStoreConfig(storeOwnerId);
     const maxQtyLimit = Number(cfg?.catalog_max_qty_per_product ?? 10) || 10;
 
     if (cfg && cfg.catalog_enabled === false) {
       return c.json({
         enabled: false, products: [], fees: [], categories: [], brands: [], sellers: [],
         whatsapp: cfg?.catalog_whatsapp || '',
+        slug: catalogSlug,
       });
     }
 
     const reserve = Math.max(0, Number(cfg?.catalog_stock_reserve ?? 0) || 0);
     const reservationMap = await buildReservationMap();
-    const allowZeroStock = await getAllowZeroStock();
+    const allowZeroStock = cfg?.allow_zero_stock === true;
 
-    // Isola o catálogo pela loja dona das configurações
-    const storeOwnerId = cfg?.created_by || null;
-
-    let productsQuery = admin
+    const { data: products } = await admin
       .from('product')
       .select('*')
+      .eq('created_by', storeOwnerId)
       .order('updated_at', { ascending: false })
       .limit(500);
-    if (storeOwnerId) {
-      productsQuery = productsQuery.eq('created_by', storeOwnerId);
-    }
-    let { data: products } = await productsQuery;
-
-    // Fallback: se a loja dona das settings não tem produtos, mostra todos
-    // (evita catálogo vazio quando created_by dos produtos difere do app_settings)
-    if (storeOwnerId && (!products || products.length === 0)) {
-      const { data: allProducts } = await admin
-        .from('product')
-        .select('*')
-        .order('updated_at', { ascending: false })
-        .limit(500);
-      products = allProducts;
-    }
 
     const available = (products || [])
       .filter((p) => p.active !== false && p.show_in_catalog === true)
@@ -74,22 +117,14 @@ catalog.post('/catalog-data', async (c) => {
     const categories = [...new Set(available.map((p) => p.category).filter(Boolean))].sort();
     const brands = [...new Set(available.map((p) => p.brand).filter(Boolean))].sort();
 
-    let feesQuery = admin.from('delivery_fee').select('*').eq('active', true);
-    if (storeOwnerId) feesQuery = feesQuery.eq('created_by', storeOwnerId);
-    const { data: fees } = await feesQuery;
+    const { data: fees } = await admin.from('delivery_fee').select('*').eq('active', true).eq('created_by', storeOwnerId);
 
-    let sellersQuery = admin
-      .from('seller').select('id,name').eq('status', 'ativo').order('created_at', { ascending: false }).limit(200);
-    if (storeOwnerId) sellersQuery = sellersQuery.eq('created_by', storeOwnerId);
-    const { data: sellers } = await sellersQuery;
+    const { data: sellers } = await admin
+      .from('seller').select('id,name').eq('status', 'ativo').eq('created_by', storeOwnerId)
+      .order('created_at', { ascending: false }).limit(200);
 
-    const { data: admins } = await admin.from('profiles').select('*').eq('role', 'admin').limit(1);
-    const adminUser = admins?.[0];
-
-    let sessionsQuery = admin.from('cash_session').select('id,created_by').eq('status', 'aberto').limit(5);
-    if (storeOwnerId) sessionsQuery = sessionsQuery.eq('created_by', storeOwnerId);
-    const { data: openSessions } = await sessionsQuery;
-
+    const { data: openSessions } = await admin.from('cash_session').select('id,created_by').eq('status', 'aberto')
+      .eq('created_by', storeOwnerId).limit(5);
 
     const pauseStatus = getDeliveryPauseStatus(cfg);
 
@@ -108,14 +143,15 @@ catalog.post('/catalog-data', async (c) => {
       store_open: (openSessions || []).length > 0,
       delivery_paused: pauseStatus.paused,
       delivery_pause_message: pauseStatus.message,
+      slug: catalogSlug,
       company: {
-        company_name: cfg?.company_name || adminUser?.company_name || '',
+        company_name: cfg?.company_name || profile?.company_name || '',
         company_logo_url: cfg?.company_logo_url || '',
         brand_color: cfg?.brand_color || '#4f46e5',
         catalog_slogan: cfg?.catalog_slogan || 'Compre online com praticidade e segurança',
-        company_cnpj: adminUser?.company_cnpj || '',
-        company_phone: adminUser?.company_phone || '',
-        referral_code: adminUser?.referral_code || '',
+        company_cnpj: profile?.company_cnpj || '',
+        company_phone: profile?.company_phone || '',
+        referral_code: profile?.referral_code || '',
       },
     });
 
@@ -128,21 +164,85 @@ catalog.post('/catalog-data', async (c) => {
   }
 });
 
+/** Retorna o link único do catálogo da loja logada (cria slug se ainda não existir). */
+catalog.post('/my-catalog-link', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    const { data: profile } = await admin.from('profiles').select('company_name,referral_code').eq('id', user.id).maybeSingle();
+    const slug = await ensureCatalogSlug(user.id, profile?.company_name || null);
+
+    const frontendBase = process.env.FRONTEND_URL || 'https://dist-ten-mu-12.vercel.app';
+    const catalogUrl = `${frontendBase.replace(/\/$/, '')}/catalogo?loja=${encodeURIComponent(slug)}`;
+
+    return c.json({
+      slug,
+      catalog_url: catalogUrl,
+      company_name: profile?.company_name || null,
+    });
+  } catch (error) {
+    console.error('my-catalog-link', error);
+    return c.json({ error: error.message || 'error' }, 500);
+  }
+});
+
+/** Redefine o slug da loja (deve ser único entre todas as contas). */
+catalog.post('/set-catalog-slug', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'unauthorized' }, 401);
+    const body = await c.req.json().catch(() => ({}));
+    let desired = String(body.slug || body.loja || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 48);
+
+    if (!desired) {
+      const { data: profile } = await admin.from('profiles').select('company_name').eq('id', user.id).maybeSingle();
+      desired = await generateUniqueCatalogSlug(profile?.company_name, user.id);
+    }
+
+    await setCatalogSlug(user.id, desired);
+    const frontendBase = process.env.FRONTEND_URL || 'https://dist-ten-mu-12.vercel.app';
+    const catalogUrl = `${frontendBase.replace(/\/$/, '')}/catalogo?loja=${encodeURIComponent(desired)}`;
+
+    return c.json({ slug: desired, catalog_url: catalogUrl });
+  } catch (error) {
+    const msg = error.message || 'error';
+    const status = msg.includes('já está em uso') ? 409 : 500;
+    return c.json({ error: msg }, status);
+  }
+});
+
 catalog.post('/catalog-store-status', async (c) => {
   try {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
-    const { data: openSessions } = await admin
-      .from('cash_session').select('id').eq('status', 'aberto').limit(1);
-    const { data: settingsList } = await admin
-      .from('app_settings').select('*').order('created_at', { ascending: false }).limit(1);
-    const cfg = settingsList?.[0];
+    const body = await c.req.json().catch(() => ({}));
+    const slugParam = String(body.slug || body.loja || body.store || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    let storeOwnerId = null;
+    if (slugParam) {
+      const resolved = await resolveStoreBySlug(slugParam);
+      if (!resolved) return c.json({ error: 'Loja não encontrada', open: false }, 404);
+      storeOwnerId = resolved.userId;
+    }
+    let sessionsQuery = admin.from('cash_session').select('id').eq('status', 'aberto').limit(1);
+    if (storeOwnerId) sessionsQuery = sessionsQuery.eq('created_by', storeOwnerId);
+    const { data: openSessions } = await sessionsQuery;
+    let cfg = null;
+    if (storeOwnerId) {
+      const { data: settingsList } = await admin
+        .from('app_settings').select('*').eq('created_by', storeOwnerId)
+        .order('created_at', { ascending: false }).limit(1);
+      cfg = settingsList?.[0];
+    }
     const pauseStatus = getDeliveryPauseStatus(cfg);
     return c.json({
       store_open: (openSessions || []).length > 0,
+      open: (openSessions || []).length > 0,
       catalog_enabled: cfg?.catalog_enabled !== false,
       whatsapp: cfg?.catalog_whatsapp || '',
       delivery_paused: pauseStatus.paused,
       delivery_pause_message: pauseStatus.message,
+      slug: slugParam || null,
     });
   } catch (error) {
     return c.json({ error: error.message }, 500);
@@ -167,10 +267,18 @@ catalog.post('/catalog-checkout', async (c) => {
     }
     if (!body.seller_id) return c.json({ error: 'Selecione o vendedor' }, 400);
 
-    const { data: settingsList } = await admin
-      .from('app_settings').select('*').order('created_at', { ascending: false }).limit(1);
-    const settings = settingsList?.[0] || null;
-    const storeOwnerId = settings?.created_by || null;
+    const slugParam = String(body.slug || body.loja || body.store || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    let storeOwnerId = null;
+    let settings = null;
+    if (slugParam) {
+      const resolved = await resolveStoreBySlug(slugParam);
+      if (!resolved) return c.json({ error: 'Loja não encontrada. Verifique o link do catálogo.' }, 404);
+      storeOwnerId = resolved.userId;
+      const loaded = await loadStoreConfig(storeOwnerId);
+      settings = loaded.cfg;
+    } else {
+      return c.json({ error: 'Informe o link da loja (slug) para finalizar a compra.' }, 400);
+    }
 
     const { data: seller } = await admin.from('seller').select('*').eq('id', body.seller_id).maybeSingle();
     if (!seller || seller.status !== 'ativo') {
@@ -206,10 +314,12 @@ catalog.post('/catalog-checkout', async (c) => {
     const maxQtyLimit = Number(settings?.catalog_max_qty_per_product ?? 10) || 10;
     const reserve = Math.max(0, Number(settings?.catalog_stock_reserve ?? 0) || 0);
     const reservationMap = await buildReservationMap();
-    const allowZeroStock = await getAllowZeroStock();
+    const allowZeroStock = settings?.allow_zero_stock === true;
 
     const ids = items.map((i) => i.product_id).filter(Boolean);
-    const { data: products } = await admin.from('product').select('*').in('id', ids);
+    let prodQuery = admin.from('product').select('*').in('id', ids);
+    if (storeOwnerId) prodQuery = prodQuery.eq('created_by', storeOwnerId);
+    const { data: products } = await prodQuery;
     const prodById = Object.fromEntries((products || []).map((p) => [p.id, p]));
 
     let subtotal = 0;

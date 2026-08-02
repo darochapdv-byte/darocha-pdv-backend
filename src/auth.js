@@ -192,6 +192,14 @@ auth.post('/register', async (c) => {
     console.warn('app_settings seed on register', e.message || e);
   }
 
+  // Slug único do catálogo público (baseado no nome da loja)
+  try {
+    const { ensureCatalogSlug } = await import('./helpers.js');
+    await ensureCatalogSlug(data.user.id, extra.company_name || null);
+  } catch (e) {
+    console.warn('catalog slug on register', e.message || e);
+  }
+
   // Trial 30 dias + código de indicação + vínculo de referral
   try {
     const { bootstrapNewUserSubscription } = await import('./stripe_ops.js');
@@ -294,6 +302,7 @@ auth.patch('/me', async (c) => {
       const { data: settings } = await admin
         .from('app_settings')
         .select('id')
+        .eq('created_by', user.id)
         .order('created_at', { ascending: false })
         .limit(1);
       if (settings?.[0]?.id) {
@@ -301,6 +310,14 @@ auth.patch('/me', async (c) => {
       }
     } catch (e) {
       console.warn('sync app_settings company_name', e.message);
+    }
+    // Atualiza slug do catálogo se o nome da loja mudou (mantém unicidade)
+    try {
+      const { generateUniqueCatalogSlug, setCatalogSlug } = await import('./helpers.js');
+      const newSlug = await generateUniqueCatalogSlug(patch.company_name, user.id);
+      await setCatalogSlug(user.id, newSlug);
+    } catch (e) {
+      console.warn('catalog slug on company_name change', e.message || e);
     }
   }
 

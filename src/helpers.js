@@ -150,6 +150,147 @@ export function toBase44Rows(rows) {
 }
 
 const ZERO_STOCK_SETTING_TYPE = 'system_setting_allow_zero_stock';
+const CATALOG_SLUG_TYPE = 'catalog_slug';
+
+/** Gera slug a partir do nome da loja (minúsculo, sem acento, só a-z0-9). */
+export function slugifyStoreName(name) {
+  if (!name || typeof name !== 'string') return '';
+  return name
+    .toString()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+}
+
+/** Lista todos os slugs já registrados (operational_log). */
+async function listCatalogSlugs() {
+  if (!admin) return [];
+  try {
+    const { data } = await admin
+      .from('operational_log')
+      .select('description')
+      .eq('type', CATALOG_SLUG_TYPE)
+      .order('created_at', { ascending: false })
+      .limit(2000);
+    const out = [];
+    for (const row of data || []) {
+      try {
+        const p = JSON.parse(row.description || '{}');
+        if (p?.slug && p?.user_id) out.push({ slug: String(p.slug).toLowerCase(), user_id: p.user_id });
+      } catch { /* ignore */ }
+    }
+    return out;
+  } catch (e) {
+    console.error('listCatalogSlugs', e.message || e);
+    return [];
+  }
+}
+
+/**
+ * Gera um slug único baseado no nome da loja.
+ * Se já existir, acrescenta sufixo numérico (ex: loja, loja2, loja3).
+ * Proíbe dois usuários com o mesmo slug.
+ */
+export async function generateUniqueCatalogSlug(companyName, userId) {
+  const base = slugifyStoreName(companyName) || `loja${String(userId || '').replace(/-/g, '').slice(0, 8)}`;
+  const existing = await listCatalogSlugs();
+  const taken = new Set(existing.filter((e) => e.user_id !== userId).map((e) => e.slug));
+
+  // Se este usuário já tem um slug, reutiliza se ainda casar com o nome
+  const mine = existing.find((e) => e.user_id === userId);
+  if (mine && !taken.has(mine.slug) && (mine.slug === base || mine.slug.startsWith(base))) {
+    return mine.slug;
+  }
+
+  let candidate = base;
+  let n = 2;
+  while (taken.has(candidate)) {
+    candidate = `${base}${n}`.slice(0, 48);
+    n += 1;
+    if (n > 9999) {
+      candidate = `${base}${String(userId || '').replace(/-/g, '').slice(0, 6)}`.slice(0, 48);
+      break;
+    }
+  }
+  return candidate;
+}
+
+/** Persiste o slug da loja (único). */
+export async function setCatalogSlug(userId, slug) {
+  if (!admin || !userId || !slug) return false;
+  const normalized = String(slug).toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 48);
+  if (!normalized) return false;
+
+  const existing = await listCatalogSlugs();
+  const conflict = existing.find((e) => e.slug === normalized && e.user_id !== userId);
+  if (conflict) {
+    throw new Error('Este link de catálogo já está em uso por outra loja');
+  }
+
+  try {
+    // Remove registros antigos deste usuário
+    const { data: old } = await admin
+      .from('operational_log')
+      .select('id,description')
+      .eq('type', CATALOG_SLUG_TYPE)
+      .limit(2000);
+    const toDelete = (old || []).filter((row) => {
+      try {
+        const p = JSON.parse(row.description || '{}');
+        return p?.user_id === userId;
+      } catch {
+        return false;
+      }
+    });
+    if (toDelete.length) {
+      await admin.from('operational_log').delete().in('id', toDelete.map((r) => r.id));
+    }
+
+    await admin.from('operational_log').insert({
+      type: CATALOG_SLUG_TYPE,
+      level: 'info',
+      description: JSON.stringify({ user_id: userId, slug: normalized }),
+      operator_name: 'system',
+    });
+    return true;
+  } catch (e) {
+    console.error('setCatalogSlug', e.message || e);
+    throw e;
+  }
+}
+
+/** Retorna o slug da loja do usuário (cria se ainda não existir). */
+export async function ensureCatalogSlug(userId, companyName) {
+  if (!userId) return null;
+  const existing = await listCatalogSlugs();
+  const mine = existing.find((e) => e.user_id === userId);
+  if (mine?.slug) return mine.slug;
+
+  let name = companyName;
+  if (!name && admin) {
+    try {
+      const { data: p } = await admin.from('profiles').select('company_name').eq('id', userId).maybeSingle();
+      name = p?.company_name || null;
+    } catch { /* ignore */ }
+  }
+  const slug = await generateUniqueCatalogSlug(name, userId);
+  await setCatalogSlug(userId, slug);
+  return slug;
+}
+
+/** Resolve loja a partir do slug do catálogo. Retorna { userId, slug } ou null. */
+export async function resolveStoreBySlug(slug) {
+  if (!slug) return null;
+  const normalized = String(slug).toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!normalized) return null;
+  const existing = await listCatalogSlugs();
+  const hit = existing.find((e) => e.slug === normalized);
+  if (!hit) return null;
+  return { userId: hit.user_id, slug: hit.slug };
+}
 
 /** Lê a política global "vender sem estoque" (PDV + catálogo). */
 export async function getAllowZeroStock() {
