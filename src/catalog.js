@@ -35,7 +35,18 @@ catalog.post('/catalog-data', async (c) => {
     if (storeOwnerId) {
       productsQuery = productsQuery.eq('created_by', storeOwnerId);
     }
-    const { data: products } = await productsQuery;
+    let { data: products } = await productsQuery;
+
+    // Fallback: se a loja dona das settings não tem produtos, mostra todos
+    // (evita catálogo vazio quando created_by dos produtos difere do app_settings)
+    if (storeOwnerId && (!products || products.length === 0)) {
+      const { data: allProducts } = await admin
+        .from('product')
+        .select('*')
+        .order('updated_at', { ascending: false })
+        .limit(500);
+      products = allProducts;
+    }
 
     const available = (products || [])
       .filter((p) => p.active !== false && p.show_in_catalog === true)
