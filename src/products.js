@@ -238,30 +238,40 @@ products.post('/save-product', async (c) => {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const body = await c.req.json().catch(() => ({}));
 
+    // Frontend envia { product: {...}, editing_id } — também aceita payload flat
+    const src = body.product && typeof body.product === 'object' ? body.product : body;
+    const editingId = body.editing_id || body.id || src.id || null;
+
     const payload = {
-      name: body.name,
-      barcode: body.barcode || '',
-      code: body.code || '',
-      brand: body.brand || '',
-      category: body.category || '',
-      sale_price: Number(body.sale_price) || 0,
+      name: src.name,
+      barcode: src.barcode || '',
+      code: src.code || src.barcode || '',
+      brand: src.brand || '',
+      category: src.category || '',
+      sale_price: Number(src.sale_price) || 0,
       // coluna real no Supabase é "cost" (não cost_price)
-      cost: Number(body.cost ?? body.cost_price) || 0,
-      stock: Number(body.stock) || 0,
-      image_url: body.image_url || body.image || body.photo || body.photo_url || '',
-      description: body.description || '',
-      active: body.active !== false,
-      show_in_catalog: body.show_in_catalog === true,
-      unit: body.unit || 'un',
+      cost: Number(src.cost ?? src.cost_price) || 0,
+      stock: Number(src.stock) || 0,
+      min_stock: Number(src.min_stock) || 0,
+      image_url: src.image_url || src.image || src.photo || src.photo_url || '',
+      description: src.description || '',
+      active: src.active !== false,
+      show_in_catalog: src.show_in_catalog === true,
+      unit: src.unit || 'un',
     };
 
-    if (body.id) {
-      const { data, error } = await admin.from('product').update(payload).eq('id', body.id).select().single();
+    if (editingId) {
+      const { data, error } = await admin
+        .from('product')
+        .update(payload)
+        .eq('id', editingId)
+        .select()
+        .single();
       if (error) return c.json({ error: error.message }, 400);
       if (payload.barcode && payload.name) {
         await persistKnowledge(payload.barcode, { ...payload, source: 'manual' });
       }
-      return c.json({ product: data });
+      return c.json({ product: data, success: true, updated: true, id: editingId });
     }
 
     const { data, error } = await admin.from('product').insert(payload).select().single();
@@ -269,7 +279,7 @@ products.post('/save-product', async (c) => {
     if (payload.barcode && payload.name) {
       await persistKnowledge(payload.barcode, { ...payload, source: 'manual' });
     }
-    return c.json({ product: data }, 201);
+    return c.json({ product: data, success: true, created: true }, 201);
   } catch (error) {
     return c.json({ error: error.message }, 500);
   }
