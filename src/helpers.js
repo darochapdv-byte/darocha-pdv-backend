@@ -105,6 +105,32 @@ export function sanitizeDateFields(data) {
   return sanitizedData;
 }
 
+/** Campos virtuais / aliases do frontend Base44 que não existem no Postgres */
+const FIELD_ALIASES = {
+  cost_price: 'cost',
+  created_date: null, // virtual — não gravar
+  updated_date: null,
+  image: 'image_url',
+  photo: 'image_url',
+  photo_url: 'image_url',
+};
+
+/** Limpa body antes de insert/update: aliases + remove vazios problemáticos */
+export function sanitizeEntityBody(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
+  let out = sanitizeDateFields({ ...data });
+
+  for (const [from, to] of Object.entries(FIELD_ALIASES)) {
+    if (!(from in out)) continue;
+    if (to && (out[to] === undefined || out[to] === null || out[to] === '')) {
+      out[to] = out[from];
+    }
+    delete out[from];
+  }
+
+  return out;
+}
+
 /**
  * Compatibilidade Base44: o frontend usa created_date / updated_date,
  * enquanto o Postgres/Supabase grava created_at / updated_at.

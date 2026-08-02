@@ -70,28 +70,50 @@ app.route('/functions', functions);
 app.post('/integrations/upload', async (c) => {
   try {
     const form = await c.req.parseBody();
-    const file = form.file;
-    if (!file || typeof file === 'string') return c.json({ error: 'file_required' }, 400);
+    // Frontend pode enviar como file, image, photo ou arquivo
+    const file = form.file || form.image || form.photo || form.arquivo;
+    if (!file || typeof file === 'string') {
+      return c.json({ error: 'file_required', message: 'Envie o arquivo no campo file/image/photo' }, 400);
+    }
     const buf = Buffer.from(await file.arrayBuffer());
-    const ext = (file.name || 'bin').split('.').pop() || 'bin';
+    if (!buf.length) return c.json({ error: 'empty_file' }, 400);
+
+    const originalName = file.name || 'upload.bin';
+    const ext = (originalName.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
     const safe = `${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+    const contentType =
+      file.type ||
+      (ext === 'png'
+        ? 'image/png'
+        : ext === 'jpg' || ext === 'jpeg'
+          ? 'image/jpeg'
+          : ext === 'webp'
+            ? 'image/webp'
+            : 'application/octet-stream');
 
     if (useLocal || !admin?.storage) {
       const dest = path.join(UPLOAD_DIR, safe);
       fs.writeFileSync(dest, buf);
       const base = process.env.APP_URL || `http://localhost:${process.env.PORT || 8787}`;
-      return c.json({ file_url: `${base}/uploads/${safe}` });
+      const file_url = `${base}/uploads/${safe}`;
+      return c.json({ file_url, url: file_url, image_url: file_url });
     }
 
     const storagePath = `uploads/${safe}`;
     const { error } = await admin.storage.from('public').upload(storagePath, buf, {
-      contentType: file.type || 'application/octet-stream',
+      contentType,
       upsert: false,
     });
-    if (error) return c.json({ error: error.message }, 400);
+    if (error) {
+      console.error('storage upload error', error);
+      return c.json({ error: error.message }, 400);
+    }
     const { data } = admin.storage.from('public').getPublicUrl(storagePath);
-    return c.json({ file_url: data.publicUrl });
+    const file_url = data.publicUrl;
+    // Resposta compatível com vários frontends
+    return c.json({ file_url, url: file_url, image_url: file_url });
   } catch (e) {
+    console.error('upload error', e);
     return c.json({ error: e.message }, 500);
   }
 });

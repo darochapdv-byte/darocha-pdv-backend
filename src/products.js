@@ -245,9 +245,10 @@ products.post('/save-product', async (c) => {
       brand: body.brand || '',
       category: body.category || '',
       sale_price: Number(body.sale_price) || 0,
-      cost_price: Number(body.cost_price) || 0,
+      // coluna real no Supabase é "cost" (não cost_price)
+      cost: Number(body.cost ?? body.cost_price) || 0,
       stock: Number(body.stock) || 0,
-      image_url: body.image_url || '',
+      image_url: body.image_url || body.image || body.photo || body.photo_url || '',
       description: body.description || '',
       active: body.active !== false,
       show_in_catalog: body.show_in_catalog === true,

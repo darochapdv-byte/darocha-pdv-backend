@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin, userClient, tableFor } from './db.js';
-import { sanitizeDateFields, toBase44Row, toBase44Rows, requireUser } from './helpers.js';
+import { sanitizeDateFields, sanitizeEntityBody, toBase44Row, toBase44Rows, requireUser } from './helpers.js';
 
 const entities = new Hono();
 
@@ -145,7 +145,7 @@ entities.post('/:entity', async (c) => {
   const entity = c.req.param('entity');
   const table = tableFor(entity);
   let body = await c.req.json();
-  body = sanitizeDateFields(body);
+  body = sanitizeEntityBody(body);
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
@@ -154,6 +154,9 @@ entities.post('/:entity', async (c) => {
   if (user && isTenantEntity(entity)) {
     body.created_by = user.id;
   }
+
+  // Em insert, deixa o banco gerar o id
+  delete body.id;
 
   const { data, error } = await db.from(table).insert(body).select().single();
   if (error) return c.json({ error: error.message }, 400);
@@ -164,9 +167,10 @@ entities.patch("/:entity/:id", async (c) => {
   const entity = c.req.param("entity");
   const table = tableFor(entity);
   let body = await c.req.json();
-  body = sanitizeDateFields(body);
+  body = sanitizeEntityBody(body);
   // Impede troca de dono pelo cliente
   delete body.created_by;
+  delete body.id;
 
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
@@ -199,7 +203,7 @@ entities.post("/:entity/bulk-update", async (c) => {
   const entity = c.req.param("entity");
   const table = tableFor(entity);
   let { items } = await c.req.json();
-  items = items.map(item => sanitizeDateFields(item));
+  items = (items || []).map((item) => sanitizeEntityBody(item));
   const db = clientFrom(c) || admin;
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
   if (!Array.isArray(items) || items.length === 0) return c.json([]);
@@ -223,7 +227,11 @@ entities.post("/:entity/bulk-create", async (c) => {
   const entity = c.req.param("entity");
   const table = tableFor(entity);
   let { items } = await c.req.json();
-  items = items.map(item => sanitizeDateFields(item));
+  items = (items || []).map((item) => {
+    const row = sanitizeEntityBody(item);
+    delete row.id;
+    return row;
+  });
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
