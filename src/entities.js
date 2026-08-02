@@ -22,8 +22,11 @@ function clientFrom(c) {
 
 function parseOrder(order) {
   if (!order) return { column: 'created_at', ascending: false };
-  const desc = String(order).startsWith('-');
-  const column = String(order).replace(/^-/, '') || 'created_at';
+  const raw = String(order);
+  const desc = raw.startsWith('-');
+  let column = raw.replace(/^-/, '') || 'created_at';
+  // Frontend às vezes chama list(1, 1) — order numérico não é coluna
+  if (/^\d+$/.test(column)) column = 'created_at';
   // map Base44 virtual fields
   const map = { created_date: 'created_at', updated_date: 'updated_at' };
   return { column: map[column] || column, ascending: !desc };
@@ -154,6 +157,13 @@ entities.post('/:entity', async (c) => {
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
+  let allowZeroStockSaved = null;
+  if (entity === 'AppSettings' && Object.prototype.hasOwnProperty.call(body, 'allow_zero_stock')) {
+    allowZeroStockSaved = body.allow_zero_stock === true;
+    await setAllowZeroStock(allowZeroStockSaved);
+    delete body.allow_zero_stock;
+  }
+
   // Garante ownership no cadastro
   const user = await requireUser(c);
   if (user && isTenantEntity(entity)) {
@@ -165,7 +175,11 @@ entities.post('/:entity', async (c) => {
 
   const { data, error } = await db.from(table).insert(body).select().single();
   if (error) return c.json({ error: error.message }, 400);
-  return c.json(toBase44Row(data), 201);
+  const row = toBase44Row(data);
+  if (entity === 'AppSettings') {
+    row.allow_zero_stock = allowZeroStockSaved ?? (await getAllowZeroStock());
+  }
+  return c.json(row, 201);
 });
 
 entities.patch("/:entity/:id", async (c) => {
