@@ -178,11 +178,26 @@ auth.post('/register', async (c) => {
     company_cnpj: extra.company_cnpj || null,
     company_phone: extra.company_phone || null,
   });
+
+  // Conta nova começa zerada: cria AppSettings próprio
+  try {
+    await admin.from('app_settings').insert({
+      created_by: data.user.id,
+      company_name: extra.company_name || null,
+      catalog_enabled: true,
+      catalog_max_qty_per_product: 10,
+      catalog_stock_reserve: 0,
+    });
+  } catch (e) {
+    console.warn('app_settings seed on register', e.message || e);
+  }
+
   const login = await admin.auth.signInWithPassword({ email, password });
   return c.json({ token: login.data.session?.access_token, user: data.user }, 201);
 });
 
 auth.post('/logout', async (c) => c.json({ ok: true }));
+
 
 auth.patch('/me', async (c) => {
   const user = await getUserFromRequest(c);

@@ -24,8 +24,18 @@ catalog.post('/catalog-data', async (c) => {
     const reservationMap = await buildReservationMap();
     const allowZeroStock = await getAllowZeroStock();
 
-    const { data: products } = await admin
-      .from('product').select('*').order('updated_at', { ascending: false }).limit(500);
+    // Isola o catálogo pela loja dona das configurações
+    const storeOwnerId = cfg?.created_by || null;
+
+    let productsQuery = admin
+      .from('product')
+      .select('*')
+      .order('updated_at', { ascending: false })
+      .limit(500);
+    if (storeOwnerId) {
+      productsQuery = productsQuery.eq('created_by', storeOwnerId);
+    }
+    const { data: products } = await productsQuery;
 
     const available = (products || [])
       .filter((p) => p.active !== false && p.show_in_catalog === true)
@@ -53,13 +63,22 @@ catalog.post('/catalog-data', async (c) => {
     const categories = [...new Set(available.map((p) => p.category).filter(Boolean))].sort();
     const brands = [...new Set(available.map((p) => p.brand).filter(Boolean))].sort();
 
-    const { data: fees } = await admin.from('delivery_fee').select('*').eq('active', true);
-    const { data: sellers } = await admin
+    let feesQuery = admin.from('delivery_fee').select('*').eq('active', true);
+    if (storeOwnerId) feesQuery = feesQuery.eq('created_by', storeOwnerId);
+    const { data: fees } = await feesQuery;
+
+    let sellersQuery = admin
       .from('seller').select('id,name').eq('status', 'ativo').order('created_at', { ascending: false }).limit(200);
+    if (storeOwnerId) sellersQuery = sellersQuery.eq('created_by', storeOwnerId);
+    const { data: sellers } = await sellersQuery;
+
     const { data: admins } = await admin.from('profiles').select('*').eq('role', 'admin').limit(1);
     const adminUser = admins?.[0];
-    const { data: openSessions } = await admin
-      .from('cash_session').select('id').eq('status', 'aberto').limit(1);
+
+    let sessionsQuery = admin.from('cash_session').select('id,created_by').eq('status', 'aberto').limit(5);
+    if (storeOwnerId) sessionsQuery = sessionsQuery.eq('created_by', storeOwnerId);
+    const { data: openSessions } = await sessionsQuery;
+
 
     const pauseStatus = getDeliveryPauseStatus(cfg);
 
@@ -137,13 +156,23 @@ catalog.post('/catalog-checkout', async (c) => {
     }
     if (!body.seller_id) return c.json({ error: 'Selecione o vendedor' }, 400);
 
+    const { data: settingsList } = await admin
+      .from('app_settings').select('*').order('created_at', { ascending: false }).limit(1);
+    const settings = settingsList?.[0] || null;
+    const storeOwnerId = settings?.created_by || null;
+
     const { data: seller } = await admin.from('seller').select('*').eq('id', body.seller_id).maybeSingle();
     if (!seller || seller.status !== 'ativo') {
       return c.json({ error: 'Vendedor inválido ou inativo' }, 400);
     }
+    // Vendedor deve pertencer à mesma loja
+    if (storeOwnerId && seller.created_by && seller.created_by !== storeOwnerId) {
+      return c.json({ error: 'Vendedor inválido ou inativo' }, 400);
+    }
 
-    const { data: openSessions } = await admin
-      .from('cash_session').select('id').eq('status', 'aberto').limit(1);
+    let sessionsQuery = admin.from('cash_session').select('id,created_by').eq('status', 'aberto').limit(5);
+    if (storeOwnerId) sessionsQuery = sessionsQuery.eq('created_by', storeOwnerId);
+    const { data: openSessions } = await sessionsQuery;
     if (!openSessions?.length) {
       return c.json({
         error: 'Nossa loja está fechada no momento. Você pode montar seu carrinho normalmente e finalizar seu pedido assim que houver um caixa aberto. Agradecemos sua compreensão!',
@@ -151,9 +180,6 @@ catalog.post('/catalog-checkout', async (c) => {
       }, 409);
     }
 
-    const { data: settingsList } = await admin
-      .from('app_settings').select('*').order('created_at', { ascending: false }).limit(1);
-    const settings = settingsList?.[0] || null;
 
     // Bloqueio de entrega no intervalo do entregador
     if (deliveryType === 'entrega') {
@@ -275,11 +301,13 @@ catalog.post('/catalog-checkout', async (c) => {
           phoneDigits.length === 11 ? phoneDigits.slice(2) : null, // sem DDD
         ].filter(Boolean);
 
-        const { data: candidates } = await admin
+        let custQuery = admin
           .from('customer')
           .select('*')
           .or(variants.map((v) => `phone.eq.${v}`).join(','))
           .limit(20);
+        if (storeOwnerId) custQuery = custQuery.eq('created_by', storeOwnerId);
+        const { data: candidates } = await custQuery;
 
         // Confirma match comparando só dígitos (mais seguro)
         const match = (candidates || []).find((cu) => {
@@ -289,13 +317,12 @@ catalog.post('/catalog-checkout', async (c) => {
         });
 
         if (match) {
-          // Cliente já existe → atualiza dados faltantes (não duplica)
+          // Cliente já existe nesta loja → atualiza dados faltantes (não duplica)
           const updates = {};
           if (customer.name && (!match.name || match.name.length < 3)) {
             updates.name = customer.name;
           }
           if (!match.whatsapp) updates.whatsapp = phoneDigits;
-          // Normaliza o telefone salvo
           if (String(match.phone || '').replace(/\D/g, '') !== phoneDigits) {
             updates.phone = phoneDigits;
           }
@@ -313,13 +340,14 @@ catalog.post('/catalog-checkout', async (c) => {
           }
           customerId = match.id;
         } else {
-          // Cliente novo → cadastra uma vez
+          // Cliente novo desta loja → cadastra uma vez
           const row = {
             person_type: 'fisica',
             name: customer.name.trim(),
             phone: phoneDigits,
             whatsapp: phoneDigits,
             active: true,
+            created_by: storeOwnerId || null,
           };
           if (deliveryType === 'entrega') {
             Object.assign(row, {
@@ -343,6 +371,7 @@ catalog.post('/catalog-checkout', async (c) => {
             customerId = created?.id || null;
           }
         }
+
       } catch (e) {
         console.error('customer auto-upsert error', e);
       }
@@ -351,6 +380,8 @@ catalog.post('/catalog-checkout', async (c) => {
 
     // Vincula ao caixa aberto (mesmo fluxo da loja — um único caixa)
     const openSession = openSessions[0];
+
+    const saleOwnerId = storeOwnerId || openSession?.created_by || null;
 
     const salePayload = {
       customer_name: customer.name,
@@ -368,7 +399,9 @@ catalog.post('/catalog-checkout', async (c) => {
       status: deliveryType === 'retirada' ? 'orcamento' : 'orcamento',
       source: 'catalog',
       cash_session_id: openSession?.id || null,
+      created_by: saleOwnerId,
       notes: customer.notes || '',
+
       delivery_address: deliveryType === 'entrega' ? (body.street || '') : '',
       delivery_number: deliveryType === 'entrega' ? (body.number || '') : '',
       delivery_complement: deliveryType === 'entrega' ? (body.complement || '') : '',
@@ -411,7 +444,9 @@ catalog.post('/catalog-checkout', async (c) => {
         type: 'novo_pedido',
         delivery_type: sale.delivery_type || 'retirada',
         read: false,
+        created_by: saleOwnerId,
       });
+
     } catch (e) {
       console.error('notification create error', e);
     }

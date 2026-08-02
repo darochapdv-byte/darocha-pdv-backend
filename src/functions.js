@@ -276,16 +276,18 @@ functions.post("/list-open-cash-sessions", async (c) => {
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
-    // Lista todos os caixas abertos (PDV single-tenant — qualquer um pode ver/assumir)
-    const { data: openSessions, error } = await admin
+    // Lista caixas abertos da própria loja (isolamento multi-tenant)
+    let q = admin
       .from('cash_session')
       .select('*')
       .eq('status', 'aberto')
       .order('created_at', { ascending: false });
-
+    if (user?.id) q = q.eq('created_by', user.id);
+    const { data: openSessions, error } = await q;
 
     if (error) return c.json({ error: error.message }, 500);
     return c.json(toBase44Rows(openSessions));
+
   } catch (error) {
     return c.json({ error: error.message }, 500);
   }
