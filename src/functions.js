@@ -166,12 +166,17 @@ functions.post('/takeover-cash-session', async (c) => {
 
     const previousDeviceId = session.device_id || null;
 
+    const takeoverCount = (Number(session.takeover_count) || 0) + 1;
+
     const { data: updated, error } = await admin
       .from('cash_session')
       .update({
         device_id,
         terminal: body.terminal || session.terminal || '',
         takeover_history: [...existingHistory, entry],
+        takeover_count: takeoverCount,
+        taken_over_at: entry.at,
+        previous_device_id: previousDeviceId,
         inactive: false,
         last_active_at: entry.at,
       })
@@ -183,18 +188,24 @@ functions.post('/takeover-cash-session', async (c) => {
 
     await logOperation({
       type: 'cash_recovery', level: 'warn',
-      description: `Caixa ${session_id} assumido por ${entry.operator_name} no dispositivo ${device_id} (antes: ${previousDeviceId || 'nenhum'}).`,
+      description: `Caixa ${session_id} assumido por ${entry.operator_name} no dispositivo ${device_id} (antes: ${previousDeviceId || 'nenhum'}). Contagem: ${takeoverCount}`,
       operator_name: entry.operator_name, device_id, cash_session_id: session_id,
     });
 
-    // O dispositivo anterior deixa de ser válido: no próximo heartbeat receberá force_exit
+    // O dispositivo anterior deixa de ser válido imediatamente:
+    // - heartbeat → force_exit
+    // - finalize-sale → bloqueado
+    // - qualquer nova ação no aparelho antigo falha
     return c.json({
       session: toBase44Row(updated),
       resumed: false,
       exclusive: true,
+      force_exit_previous: true,
       previous_device_id: previousDeviceId,
-      message: 'Caixa assumido neste dispositivo. O outro aparelho será desconectado automaticamente.',
+      takeover_count: takeoverCount,
+      message: 'Caixa assumido neste dispositivo. O outro aparelho será desconectado na próxima verificação.',
     });
+
   } catch (error) {
     return c.json({ error: error.message }, 500);
   }
@@ -224,17 +235,21 @@ functions.post('/cash-session-heartbeat', async (c) => {
       }, 409);
     }
 
-    // Caixa foi assumido em outro dispositivo → força saída neste
+    // Caixa foi assumido em outro dispositivo → força saída IMEDIATA neste aparelho
     if (session.device_id && device_id && session.device_id !== device_id) {
       return c.json({
         ok: false,
         foreign: true,
         force_exit: true,
         reason: 'taken_over',
-        message: 'Este caixa foi assumido em outro dispositivo. Apenas um dispositivo pode usar o caixa por vez.',
+        message: 'Este caixa foi assumido em outro dispositivo. Você foi desconectado.',
         current_device_id: session.device_id,
+        previous_device_id: session.previous_device_id || device_id,
+        taken_over_at: session.taken_over_at || null,
+        takeover_count: session.takeover_count || 0,
       }, 409);
     }
+
 
     const now = new Date().toISOString();
     const updates = { last_active_at: now };
