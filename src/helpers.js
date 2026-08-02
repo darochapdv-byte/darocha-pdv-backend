@@ -292,18 +292,16 @@ export async function resolveStoreBySlug(slug) {
   return { userId: hit.user_id, slug: hit.slug };
 }
 
-/** Lê a política global "vender sem estoque" (PDV + catálogo). */
-export async function getAllowZeroStock() {
+/** Lê a política "vender sem estoque" (PDV + catálogo). Opcionalmente por loja (userId). */
+export async function getAllowZeroStock(userId = null) {
   if (!admin) return false;
   try {
-    const { data: settingsList } = await admin
-      .from('app_settings')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(1);
+    let q = admin.from('app_settings').select('*').order('created_at', { ascending: false }).limit(1);
+    if (userId) q = admin.from('app_settings').select('*').eq('created_by', userId).order('created_at', { ascending: false }).limit(1);
+    const { data: settingsList } = await q;
     const s = settingsList?.[0];
-    if (s && Object.prototype.hasOwnProperty.call(s, 'allow_zero_stock')) {
-      return s.allow_zero_stock === true;
+    if (s && Object.prototype.hasOwnProperty.call(s, 'allow_zero_stock') && s.allow_zero_stock != null) {
+      return s.allow_zero_stock === true || s.allow_zero_stock === 'true' || s.allow_zero_stock === 1;
     }
     const { data: logs } = await admin
       .from('operational_log')

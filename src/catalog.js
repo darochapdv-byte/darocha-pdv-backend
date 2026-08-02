@@ -9,6 +9,7 @@ import {
   generateUniqueCatalogSlug,
   setCatalogSlug,
   requireUser,
+  getAllowZeroStock,
 } from './helpers.js';
 
 const catalog = new Hono();
@@ -116,7 +117,18 @@ catalog.post('/catalog-data', async (c) => {
 
     const reserve = Math.max(0, Number(cfg?.catalog_stock_reserve ?? 0) || 0);
     const reservationMap = await buildReservationMap();
-    const allowZeroStock = cfg?.allow_zero_stock === true;
+    // allow_zero_stock: usa o valor da loja; se vier null/undefined (coluna antiga),
+    // consulta a política salva (getAllowZeroStock). Assim o catálogo respeita
+    // "Autorizar venda sem estoque" das Configurações.
+    let allowZeroStock = false;
+    try {
+      allowZeroStock = await getAllowZeroStock(storeOwnerId);
+    } catch {
+      allowZeroStock =
+        cfg?.allow_zero_stock === true ||
+        cfg?.allow_zero_stock === 'true' ||
+        cfg?.allow_zero_stock === 1;
+    }
 
     const { data: products } = await admin
       .from('product')
@@ -351,7 +363,15 @@ catalog.post('/catalog-checkout', async (c) => {
     const maxQtyLimit = Number(settings?.catalog_max_qty_per_product ?? 10) || 10;
     const reserve = Math.max(0, Number(settings?.catalog_stock_reserve ?? 0) || 0);
     const reservationMap = await buildReservationMap();
-    const allowZeroStock = settings?.allow_zero_stock === true;
+    let allowZeroStock = false;
+    try {
+      allowZeroStock = await getAllowZeroStock(storeOwnerId);
+    } catch {
+      allowZeroStock =
+        settings?.allow_zero_stock === true ||
+        settings?.allow_zero_stock === 'true' ||
+        settings?.allow_zero_stock === 1;
+    }
 
     const ids = items.map((i) => i.product_id).filter(Boolean);
     let prodQuery = admin.from('product').select('*').in('id', ids);
