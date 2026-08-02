@@ -81,7 +81,7 @@ export async function getUserFromRequest(c) {
     }
   }
 
-  return {
+  const base = {
     id: user.id,
     email: user.email,
     role: profile?.role || 'admin',
@@ -94,6 +94,20 @@ export async function getUserFromRequest(c) {
     full_name: profile?.company_name || user.email,
     data: profile || {},
   };
+  try {
+    const { ensureCatalogSlug } = await import('./helpers.js');
+    const slug = await ensureCatalogSlug(user.id, profile?.company_name || null);
+    base.catalog_slug = slug;
+    const frontendBase = process.env.FRONTEND_URL || 'https://dist-ten-mu-12.vercel.app';
+    base.catalog_url = slug
+      ? `${frontendBase.replace(/\/$/, '')}/catalogo?loja=${encodeURIComponent(slug)}`
+      : null;
+  } catch (e) {
+    console.warn('catalog slug on me', e.message || e);
+    base.catalog_slug = null;
+    base.catalog_url = null;
+  }
+  return base;
 }
 
 auth.get('/me', async (c) => {
