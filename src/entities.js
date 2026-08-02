@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin, userClient, tableFor } from './db.js';
-import { sanitizeDateFields, sanitizeEntityBody, toBase44Row, toBase44Rows, requireUser, getAllowZeroStock, setAllowZeroStock } from './helpers.js';
+import { sanitizeDateFields, sanitizeEntityBody, toBase44Row, toBase44Rows, requireUser, getAllowZeroStock, setAllowZeroStock, ensureCatalogSlug } from './helpers.js';
 import { getAccessStatus } from './stripe_ops.js';
 
 const entities = new Hono();
@@ -113,7 +113,24 @@ entities.get('/:entity', async (c) => {
   let rows = toBase44Rows(data);
   if (entity === 'AppSettings' && Array.isArray(rows)) {
     const allow = await getAllowZeroStock();
-    rows = rows.map((r) => ({ ...r, allow_zero_stock: allow }));
+    const enriched = [];
+    for (const r of rows) {
+      const ownerId = r.created_by || user?.id || null;
+      let catalog_slug = null;
+      if (ownerId) {
+        try {
+          catalog_slug = await ensureCatalogSlug(ownerId, r.company_name || user?.company_name || null);
+        } catch (e) {
+          console.warn('catalog_slug enrich', e.message || e);
+        }
+      }
+      const frontendBase = process.env.FRONTEND_URL || 'https://dist-ten-mu-12.vercel.app';
+      const catalog_url = catalog_slug
+        ? `${frontendBase.replace(/\/$/, '')}/catalogo?loja=${encodeURIComponent(catalog_slug)}`
+        : null;
+      enriched.push({ ...r, allow_zero_stock: allow, catalog_slug, catalog_url });
+    }
+    rows = enriched;
   }
   return c.json(rows);
 });
