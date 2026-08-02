@@ -309,7 +309,7 @@ functions.post("/finalize-sale", async (c) => {
       return c.json({ error: 'Carrinho vazio. Nenhuma alteração foi realizada.' }, 400);
     }
 
-    // Valida apenas se o caixa está aberto (permite múltiplos caixas e takeover livre)
+    // Cada caixa específico só pode ser usado por UM dispositivo por vez
     if (session_id) {
       const { data: cashSession } = await admin
         .from('cash_session')
@@ -323,11 +323,17 @@ functions.post("/finalize-sale", async (c) => {
           reason: 'closed',
         }, 409);
       }
-      // Aviso se o device mudou, mas NÃO bloqueia a venda (apenas informa)
+      // Se outro aparelho assumiu este caixa → bloqueia venda e força saída
       if (device_id && cashSession.device_id && cashSession.device_id !== device_id) {
-        console.warn(`finalize-sale: device mismatch session=${session_id} expected=${cashSession.device_id} got=${device_id}`);
+        return c.json({
+          error: 'Este caixa foi assumido em outro dispositivo. Apenas um aparelho pode usá-lo por vez.',
+          force_exit: true,
+          foreign: true,
+          reason: 'taken_over',
+        }, 409);
       }
     }
+
 
 
     // RPC atômica (se 002_finalize_sale_rpc.sql foi aplicado)
