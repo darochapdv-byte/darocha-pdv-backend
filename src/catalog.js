@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin } from './db.js';
-import { buildReservationMap, computeCatalogAvailable, getAllowZeroStock } from './helpers.js';
+import { buildReservationMap, computeCatalogAvailable, getAllowZeroStock, getDeliveryPauseStatus } from './helpers.js';
 
 const catalog = new Hono();
 
@@ -61,6 +61,8 @@ catalog.post('/catalog-data', async (c) => {
     const { data: openSessions } = await admin
       .from('cash_session').select('id').eq('status', 'aberto').limit(1);
 
+    const pauseStatus = getDeliveryPauseStatus(cfg);
+
     return c.json({
       enabled: true,
       products: available,
@@ -74,6 +76,8 @@ catalog.post('/catalog-data', async (c) => {
       card_rates: cfg?.card_installment_rates || [],
       max_qty_per_product: maxQtyLimit,
       store_open: (openSessions || []).length > 0,
+      delivery_paused: pauseStatus.paused,
+      delivery_pause_message: pauseStatus.message,
       company: {
         company_name: cfg?.company_name || adminUser?.company_name || '',
         company_logo_url: cfg?.company_logo_url || '',
@@ -84,6 +88,7 @@ catalog.post('/catalog-data', async (c) => {
         referral_code: adminUser?.referral_code || '',
       },
     });
+
   } catch (error) {
     console.error('catalog-data error', error);
     return c.json({
@@ -99,17 +104,21 @@ catalog.post('/catalog-store-status', async (c) => {
     const { data: openSessions } = await admin
       .from('cash_session').select('id').eq('status', 'aberto').limit(1);
     const { data: settingsList } = await admin
-      .from('app_settings').select('catalog_enabled,catalog_whatsapp').order('created_at', { ascending: false }).limit(1);
+      .from('app_settings').select('*').order('created_at', { ascending: false }).limit(1);
     const cfg = settingsList?.[0];
+    const pauseStatus = getDeliveryPauseStatus(cfg);
     return c.json({
       store_open: (openSessions || []).length > 0,
       catalog_enabled: cfg?.catalog_enabled !== false,
       whatsapp: cfg?.catalog_whatsapp || '',
+      delivery_paused: pauseStatus.paused,
+      delivery_pause_message: pauseStatus.message,
     });
   } catch (error) {
     return c.json({ error: error.message }, 500);
   }
 });
+
 
 catalog.post('/catalog-checkout', async (c) => {
   try {
@@ -145,6 +154,18 @@ catalog.post('/catalog-checkout', async (c) => {
     const { data: settingsList } = await admin
       .from('app_settings').select('*').order('created_at', { ascending: false }).limit(1);
     const settings = settingsList?.[0] || null;
+
+    // Bloqueio de entrega no intervalo do entregador
+    if (deliveryType === 'entrega') {
+      const pauseStatus = getDeliveryPauseStatus(settings);
+      if (pauseStatus.paused) {
+        return c.json({
+          error: pauseStatus.message || 'Neste horário não realizamos entrega. Escolha retirada ou volte mais tarde.',
+          delivery_paused: true,
+        }, 409);
+      }
+    }
+
     const maxQtyLimit = Number(settings?.catalog_max_qty_per_product ?? 10) || 10;
     const reserve = Math.max(0, Number(settings?.catalog_stock_reserve ?? 0) || 0);
     const reservationMap = await buildReservationMap();

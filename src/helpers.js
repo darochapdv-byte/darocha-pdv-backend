@@ -219,3 +219,62 @@ export async function setAllowZeroStock(value) {
     return false;
   }
 }
+
+/**
+ * Verifica se a entrega está pausada no momento (intervalo do entregador).
+ * cfg: objeto de app_settings
+ * Retorna { paused: boolean, message: string }
+ */
+export function getDeliveryPauseStatus(cfg) {
+  const enabled = cfg?.delivery_pause_enabled === true;
+  if (!enabled) {
+    return { paused: false, message: '' };
+  }
+
+  const startStr = String(cfg?.delivery_pause_start || '12:00').trim();
+  const endStr = String(cfg?.delivery_pause_end || '13:30').trim();
+  const message =
+    cfg?.delivery_pause_message ||
+    'Entregas pausadas neste horário (intervalo do entregador). Retirada na loja disponível.';
+
+  // Parse HH:MM
+  const parseHM = (s) => {
+    const m = s.match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return null;
+    const h = Number(m[1]);
+    const min = Number(m[2]);
+    if (h < 0 || h > 23 || min < 0 || min > 59) return null;
+    return h * 60 + min;
+  };
+
+  const startMin = parseHM(startStr);
+  const endMin = parseHM(endStr);
+  if (startMin == null || endMin == null) {
+    return { paused: false, message: '' };
+  }
+
+  // Hora atual em America/Sao_Paulo
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Sao_Paulo',
+    hour: 'numeric',
+    minute: 'numeric',
+    hour12: false,
+  });
+  const parts = formatter.formatToParts(now);
+  const hour = Number(parts.find((p) => p.type === 'hour')?.value || 0);
+  const minute = Number(parts.find((p) => p.type === 'minute')?.value || 0);
+  const nowMin = hour * 60 + minute;
+
+  let paused = false;
+  if (startMin <= endMin) {
+    // Intervalo normal (ex: 12:00-13:30)
+    paused = nowMin >= startMin && nowMin < endMin;
+  } else {
+    // Intervalo que cruza meia-noite (ex: 23:00-01:00)
+    paused = nowMin >= startMin || nowMin < endMin;
+  }
+
+  return { paused, message: paused ? message : '' };
+}
+
