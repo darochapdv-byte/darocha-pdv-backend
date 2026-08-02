@@ -91,7 +91,7 @@ app.post('/integrations/upload', async (c) => {
             ? 'image/webp'
             : 'application/octet-stream');
 
-    if (useLocal || !admin?.storage) {
+    if (useLocal || !process.env.SUPABASE_URL) {
       const dest = path.join(UPLOAD_DIR, safe);
       fs.writeFileSync(dest, buf);
       const base = process.env.APP_URL || `http://localhost:${process.env.PORT || 8787}`;
@@ -99,17 +99,37 @@ app.post('/integrations/upload', async (c) => {
       return c.json({ file_url, url: file_url, image_url: file_url });
     }
 
+    // Upload via Storage REST API (supabase-js + sb_secret_* esbarra em RLS no storage)
     const storagePath = `uploads/${safe}`;
-    const { error } = await admin.storage.from('public').upload(storagePath, buf, {
-      contentType,
-      upsert: false,
-    });
-    if (error) {
-      console.error('storage upload error', error);
-      return c.json({ error: error.message }, 400);
+    const supabaseUrl = process.env.SUPABASE_URL.replace(/\/$/, '');
+    const serviceKey =
+      process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+    const uploadRes = await fetch(
+      `${supabaseUrl}/storage/v1/object/public/${storagePath}`,
+      {
+        method: 'POST',
+        headers: {
+          apikey: serviceKey,
+          Authorization: `Bearer ${serviceKey}`,
+          'Content-Type': contentType,
+          'x-upsert': 'true',
+        },
+        body: buf,
+      }
+    );
+    if (!uploadRes.ok) {
+      const errText = await uploadRes.text();
+      console.error('storage upload error', uploadRes.status, errText);
+      let msg = errText;
+      try {
+        const j = JSON.parse(errText);
+        msg = j.message || j.error || errText;
+      } catch {
+        /* keep text */
+      }
+      return c.json({ error: msg }, 400);
     }
-    const { data } = admin.storage.from('public').getPublicUrl(storagePath);
-    const file_url = data.publicUrl;
+    const file_url = `${supabaseUrl}/storage/v1/object/public/public/${storagePath}`;
     // Resposta compatível com vários frontends
     return c.json({ file_url, url: file_url, image_url: file_url });
   } catch (e) {
