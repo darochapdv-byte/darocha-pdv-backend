@@ -33,13 +33,18 @@ functions.post('/product-inquiry', async (c) => {
     return c.json({ error: 'assistant_disabled' }, 403);
   }
 
+  // Isola produtos da loja dona das settings do assistente
+  const storeOwnerId = settings?.created_by || null;
+
   const fields = settings?.assistant_exposed_fields || [
     'name', 'sale_price', 'stock', 'category', 'description', 'barcode',
   ];
   const selectCols = ['id', ...fields].join(',');
 
   if (action === 'categories') {
-    const { data } = await admin.from('product').select('category').eq('active', true);
+    let cq = admin.from('product').select('category').eq('active', true);
+    if (storeOwnerId) cq = cq.eq('created_by', storeOwnerId);
+    const { data } = await cq;
     const counts = {};
     for (const p of data || []) {
       const cat = p.category || 'Sem categoria';
@@ -49,21 +54,27 @@ functions.post('/product-inquiry', async (c) => {
   }
 
   if (action === 'get' && barcode) {
-    const { data } = await admin.from('product').select(selectCols).eq('barcode', barcode).maybeSingle();
+    let gq = admin.from('product').select(selectCols).eq('barcode', barcode);
+    if (storeOwnerId) gq = gq.eq('created_by', storeOwnerId);
+    const { data } = await gq.maybeSingle();
     if (!data) return c.json({ found: false });
     return c.json({ found: true, product: data });
   }
 
   if (action === 'similar' && barcode) {
-    const { data: origin } = await admin.from('product').select('*').eq('barcode', barcode).maybeSingle();
+    let oq = admin.from('product').select('*').eq('barcode', barcode);
+    if (storeOwnerId) oq = oq.eq('created_by', storeOwnerId);
+    const { data: origin } = await oq.maybeSingle();
     if (!origin) return c.json({ found: false });
     let q = admin.from('product').select(selectCols).neq('id', origin.id).limit(10);
+    if (storeOwnerId) q = q.eq('created_by', storeOwnerId);
     if (origin.category) q = q.eq('category', origin.category);
     const { data: similar } = await q;
     return c.json({ found: true, product: origin, similar: similar || [] });
   }
 
   let q = admin.from('product').select(selectCols);
+  if (storeOwnerId) q = q.eq('created_by', storeOwnerId);
   if (active_only) q = q.eq('active', true);
   if (category) q = q.eq('category', category);
   if (query) q = q.or(`name.ilike.%${query}%,barcode.ilike.%${query}%,brand.ilike.%${query}%`);
@@ -86,13 +97,14 @@ functions.post('/open-cash-session', async (c) => {
     if (!operator_id) return c.json({ error: 'Selecione o funcionário.' }, 400);
     if (!device_id) return c.json({ error: 'Dispositivo não identificado.' }, 400);
 
-    // 1) Mesmo operador + mesmo dispositivo → retoma (evita duplicar no mesmo aparelho)
+    // 1) Mesmo operador + mesmo dispositivo + mesma loja → retoma
     const { data: existingSame } = await admin
       .from('cash_session')
       .select('*')
       .eq('operator_id', operator_id)
       .eq('device_id', device_id)
       .eq('status', 'aberto')
+      .eq('created_by', user.id)
       .order('created_at', { ascending: false })
       .limit(1);
 
@@ -149,7 +161,10 @@ functions.post('/takeover-cash-session', async (c) => {
 
     const { data: session } = await admin.from('cash_session').select('*').eq('id', session_id).maybeSingle();
     if (!session) return c.json({ error: 'Caixa não encontrado.' }, 404);
-    // Qualquer usuário autenticado pode assumir qualquer caixa aberto
+    // Só a própria loja pode assumir o caixa
+    if (session.created_by && session.created_by !== user.id) {
+      return c.json({ error: 'Caixa não pertence a esta loja.' }, 403);
+    }
     if (session.status !== 'aberto') {
       return c.json({ error: 'Este caixa já foi fechado e não pode ser assumido.' }, 400);
     }
@@ -309,8 +324,18 @@ functions.post("/finalize-sale", async (c) => {
     session_id = body.session_id || sale.cash_session_id || '';
     device_id = body.device_id || '';
     client_ref = sale.client_ref || '';
-    // Política global em Configurações (body.allow_zero_stock só como override legado)
-    const allowZeroStock = (await getAllowZeroStock()) || body.allow_zero_stock === true;
+    // Política "vender sem estoque" da própria loja
+    let allowZeroStock = body.allow_zero_stock === true;
+    try {
+      const { data: ownSettings } = await admin
+        .from('app_settings').select('allow_zero_stock')
+        .eq('created_by', user.id)
+        .order('created_at', { ascending: false }).limit(1);
+      if (ownSettings?.[0]?.allow_zero_stock === true) allowZeroStock = true;
+      else if (!allowZeroStock) allowZeroStock = await getAllowZeroStock();
+    } catch {
+      allowZeroStock = (await getAllowZeroStock()) || allowZeroStock;
+    }
     const items = Array.isArray(sale.items) ? sale.items : [];
     const operator_name = sale.operator_name || user.full_name || user.email || '';
 
@@ -318,11 +343,11 @@ functions.post("/finalize-sale", async (c) => {
       return c.json({ error: 'Carrinho vazio. Nenhuma alteração foi realizada.' }, 400);
     }
 
-    // Cada caixa específico só pode ser usado por UM dispositivo por vez
+    // Cada caixa específico só pode ser usado por UM dispositivo por vez (e só da própria loja)
     if (session_id) {
       const { data: cashSession } = await admin
         .from('cash_session')
-        .select('id,status,device_id')
+        .select('id,status,device_id,created_by')
         .eq('id', session_id)
         .maybeSingle();
       if (!cashSession || cashSession.status !== 'aberto') {
@@ -331,6 +356,13 @@ functions.post("/finalize-sale", async (c) => {
           force_exit: true,
           reason: 'closed',
         }, 409);
+      }
+      if (cashSession.created_by && cashSession.created_by !== user.id) {
+        return c.json({
+          error: 'Caixa não pertence a esta loja.',
+          force_exit: true,
+          reason: 'wrong_store',
+        }, 403);
       }
       // Se outro aparelho assumiu este caixa → bloqueia venda e força saída
       if (device_id && cashSession.device_id && cashSession.device_id !== device_id) {
@@ -383,7 +415,9 @@ functions.post("/finalize-sale", async (c) => {
     }
 
     const ids = items.map((i) => i.product_id).filter(Boolean);
-    const { data: products } = await admin.from('product').select('id,name,stock').in('id', ids);
+    let prodQ = admin.from('product').select('id,name,stock,created_by').in('id', ids);
+    if (user?.id) prodQ = prodQ.eq('created_by', user.id);
+    const { data: products } = await prodQ;
     const stockMap = Object.fromEntries((products || []).map((p) => [p.id, p]));
 
     const insufficient = [];
@@ -413,7 +447,9 @@ functions.post("/finalize-sale", async (c) => {
     for (const it of items) {
       const current = Number(stockMap[it.product_id]?.stock) || 0;
       const next = Math.max(0, current - Number(it.qty));
-      const { error } = await admin.from('product').update({ stock: next }).eq('id', it.product_id);
+      let uq = admin.from('product').update({ stock: next }).eq('id', it.product_id);
+      if (user?.id) uq = uq.eq('created_by', user.id);
+      const { error } = await uq;
       if (error) {
         for (const prev of items) {
           if (stockMap[prev.product_id]) {
@@ -430,6 +466,7 @@ functions.post("/finalize-sale", async (c) => {
       client_ref: client_ref || sale.client_ref,
       operator_name,
       status: sale.status || 'concluida',
+      created_by: user.id,
     };
 
     const { data: createdSale, error: sErr } = await admin.from('sale').insert(salePayload).select().single();

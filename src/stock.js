@@ -17,6 +17,7 @@ stock.post('/start-stock-count', async (c) => {
       started_at: now,
       started_by: body.started_by || user.id || null,
       started_by_name: body.started_by_name || user.full_name || user.email || '',
+      created_by: user.id,
     };
 
     // 1) tenta via supabase-js
@@ -54,11 +55,13 @@ stock.post('/stock-count-search', async (c) => {
     const q = String(body.query || body.q || '').trim();
     if (q.length < 1) return c.json({ products: [] });
 
-    const { data } = await admin
+    let pq = admin
       .from('product')
       .select('id,name,barcode,code,brand,category,stock,sale_price,cost_price,image_url,active')
       .or(`name.ilike.%${q}%,barcode.ilike.%${q}%,code.ilike.%${q}%`)
       .limit(50);
+    if (user?.id) pq = pq.eq('created_by', user.id);
+    const { data } = await pq;
 
     return c.json({ products: data || [] });
   } catch (error) {
@@ -78,6 +81,9 @@ stock.post('/stock-count-apply', async (c) => {
 
     const { data: session } = await admin.from('stock_count').select('*').eq('id', sessionId).maybeSingle();
     if (!session) return c.json({ error: 'Balanço não encontrado.', user_friendly: true }, 404);
+    if (session.created_by && user?.id && session.created_by !== user.id) {
+      return c.json({ error: 'Balanço não pertence a esta loja.', user_friendly: true }, 403);
+    }
     if (session.status === 'aplicado') {
       return c.json({ error: 'Este balanço já foi aplicado e não pode ser reaplicado.', user_friendly: true }, 400);
     }
@@ -91,7 +97,9 @@ stock.post('/stock-count-apply', async (c) => {
       .eq('stock_count_id', sessionId)
       .limit(5000);
 
-    const { data: allProducts } = await admin.from('product').select('id,name,code,barcode,stock').limit(10000);
+    let allProdQ = admin.from('product').select('id,name,code,barcode,stock').limit(10000);
+    if (user?.id) allProdQ = allProdQ.eq('created_by', user.id);
+    const { data: allProducts } = await allProdQ;
     const byId = Object.fromEntries((allProducts || []).map((p) => [p.id, p]));
     const byCode = {};
     const byBarcode = {};
@@ -153,12 +161,12 @@ stock.post('/stock-count-apply', async (c) => {
     // Apply updates
     try {
       for (const u of productUpdates) {
-        await admin.from('product').update({ stock: u.stock }).eq('id', u.id);
+        await admin.from('product').update({ stock: u.stock }).eq('id', u.id).eq('created_by', user.id);
       }
     } catch (e) {
       // rollback
       for (const s of stockSnapshot) {
-        await admin.from('product').update({ stock: s.stock }).eq('id', s.id);
+        await admin.from('product').update({ stock: s.stock }).eq('id', s.id).eq('created_by', user.id);
       }
       return c.json({ error: 'Falha ao atualizar estoque. Nenhuma alteração foi mantida.', user_friendly: true }, 500);
     }
@@ -234,7 +242,9 @@ stock.post('/sync-pdv-reservations', async (c) => {
       .from('app_settings').select('*').order('created_at', { ascending: false }).limit(1);
     const reserve = Math.max(0, Number(settingsList?.[0]?.catalog_stock_reserve ?? 0) || 0);
 
-    const { data: products } = await admin.from('product').select('*').limit(2000);
+    let resProdQ = admin.from('product').select('*').limit(2000);
+    if (user?.id) resProdQ = resProdQ.eq('created_by', user.id);
+    const { data: products } = await resProdQ;
     const prodMap = Object.fromEntries((products || []).map((p) => [p.id, p]));
 
     const { data: own } = await admin

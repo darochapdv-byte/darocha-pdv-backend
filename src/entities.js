@@ -85,6 +85,10 @@ entities.get('/:entity', async (c) => {
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
   const user = await requireUser(c);
+  // Multiempresa: entidades de negócio exigem autenticação (sem user = vazamento entre lojas)
+  if (isTenantEntity(entity) && !user?.id) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
 
   console.log(`[GET /entities/${entity}] table=${table} user=${user?.id || 'anon'} query=${JSON.stringify(c.req.query())}`);
   let q = db.from(table).select('*');
@@ -142,6 +146,9 @@ entities.get('/:entity/:id', async (c) => {
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
   const user = await requireUser(c);
+  if (isTenantEntity(entity) && !user?.id) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
   let q = db.from(table).select('*').eq('id', c.req.param('id'));
   q = applyTenantFilter(q, entity, user);
 
@@ -162,6 +169,9 @@ entities.post('/:entity/query', async (c) => {
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
   const user = await requireUser(c);
+  if (isTenantEntity(entity) && !user?.id) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
   let q = db.from(table).select('*');
   q = applyTenantFilter(q, entity, user);
 
@@ -207,6 +217,9 @@ entities.post('/:entity', async (c) => {
 
   // Garante ownership no cadastro
   const user = await requireUser(c);
+  if (isTenantEntity(entity) && !user?.id) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
   if (user && isTenantEntity(entity)) {
     body.created_by = user.id;
   }
@@ -244,6 +257,9 @@ entities.patch("/:entity/:id", async (c) => {
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
   const user = await requireUser(c);
+  if (isTenantEntity(entity) && !user?.id) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
   let q = db.from(table).update(body).eq('id', c.req.param('id'));
   q = applyTenantFilter(q, entity, user);
 
@@ -263,6 +279,9 @@ entities.delete('/:entity/:id', async (c) => {
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
   const user = await requireUser(c);
+  if (isTenantEntity(entity) && !user?.id) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
   let q = db.from(table).delete().eq('id', c.req.param('id'));
   q = applyTenantFilter(q, entity, user);
 
@@ -281,6 +300,9 @@ entities.post("/:entity/bulk-update", async (c) => {
   if (!Array.isArray(items) || items.length === 0) return c.json([]);
 
   const user = await requireUser(c);
+  if (isTenantEntity(entity) && !user?.id) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
   const results = [];
   for (const item of items) {
     const { id, ...rest } = item;
@@ -308,6 +330,9 @@ entities.post("/:entity/bulk-create", async (c) => {
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
   const user = await requireUser(c);
+  if (isTenantEntity(entity) && !user?.id) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
   if (user && isTenantEntity(entity)) {
     items = items.map((item) => ({ ...item, created_by: user.id }));
   }
