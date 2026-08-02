@@ -33,8 +33,18 @@ function parseOrder(order) {
   return { column: map[column] || column, ascending: !desc };
 }
 
+function normalizeEntityName(entityName) {
+  if (!entityName) return entityName;
+  // Aceita Product, product, PRODUCT
+  const raw = String(entityName);
+  if (TENANT_ENTITIES.has(raw)) return raw;
+  const lowerMap = Object.fromEntries([...TENANT_ENTITIES].map((n) => [n.toLowerCase(), n]));
+  return lowerMap[raw.toLowerCase()] || raw;
+}
+
 function isTenantEntity(entityName) {
-  return TENANT_ENTITIES.has(entityName);
+  const n = normalizeEntityName(entityName);
+  return TENANT_ENTITIES.has(n) || TENANT_ENTITIES.has(entityName);
 }
 
 async function assertSubscription(c) {
