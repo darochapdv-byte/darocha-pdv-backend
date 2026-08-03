@@ -399,8 +399,8 @@ functions.post("/finalize-sale", async (c) => {
         return c.json(rpcResult, status);
       }
       // Frontend espera { sale: ... }
-      if (rpcResult.sale) return c.json({ ...rpcResult, sale: toBase44Row(rpcResult.sale) });
-      return c.json({ sale: toBase44Row(rpcResult), success: true });
+      if (rpcResult.sale) return c.json({ ok: true, success: true, sale: toBase44Row(rpcResult.sale), sale_id: rpcResult.sale.id || rpcResult.sale_id });
+      return c.json({ ok: true, success: true, sale: toBase44Row(rpcResult), sale_id: rpcResult.id || rpcResult.sale_id });
     }
 
     console.warn('finalize_sale RPC unavailable, JS fallback:', rpcError?.message);
@@ -411,7 +411,7 @@ functions.post("/finalize-sale", async (c) => {
         .order('created_at', { ascending: false }).limit(1);
       if (existing?.length) {
         if (session_id) await releaseSessionReservations(session_id);
-        return c.json({ sale: toBase44Row(existing[0]), success: true });
+        return c.json({ ok: true, success: true, sale: toBase44Row(existing[0]), sale_id: existing[0].id });
       }
     }
 
@@ -497,7 +497,7 @@ functions.post("/finalize-sale", async (c) => {
       }
     }
     // Frontend espera response.data.sale
-    return c.json({ success: true, sale: toBase44Row(createdSale), sale_id: createdSale.id });
+    return c.json({ ok: true, success: true, sale: toBase44Row(createdSale), sale_id: createdSale.id });
   } catch (error) {
     await logOperation({
       type: 'unexpected_error', level: 'error',
