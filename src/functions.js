@@ -381,7 +381,7 @@ functions.post("/finalize-sale", async (c) => {
     // RPC atômica (se 002_finalize_sale_rpc.sql foi aplicado)
     const { data: rpcResult, error: rpcError } = await admin.rpc('finalize_sale', {
       p_items: items,
-      p_sale: { ...sale, operator_name },
+      p_sale: { ...sale, operator_name, created_by: user.id, source: sale.source || 'pdv' },
       p_session_id: session_id || null,
       p_allow_zero_stock: allowZeroStock,
     });
@@ -399,8 +399,25 @@ functions.post("/finalize-sale", async (c) => {
         return c.json(rpcResult, status);
       }
       // Frontend espera { sale: ... }
-      if (rpcResult.sale) return c.json({ ok: true, success: true, sale: toBase44Row(rpcResult.sale), sale_id: rpcResult.sale.id || rpcResult.sale_id });
-      return c.json({ ok: true, success: true, sale: toBase44Row(rpcResult), sale_id: rpcResult.id || rpcResult.sale_id });
+      // A RPC às vezes grava a venda sem created_by — corrige ownership multi-tenant
+      let saleRow = rpcResult.sale || rpcResult;
+      const saleId = saleRow && (saleRow.id || rpcResult.sale_id);
+      if (saleId && user?.id && (!saleRow.created_by || saleRow.created_by !== user.id)) {
+        try {
+          const { data: fixed } = await admin
+            .from('sale')
+            .update({ created_by: user.id, source: saleRow.source || sale.source || 'pdv' })
+            .eq('id', saleId)
+            .select()
+            .maybeSingle();
+          if (fixed) saleRow = fixed;
+          else saleRow = { ...saleRow, created_by: user.id, id: saleId };
+        } catch (e) {
+          console.warn('fix created_by after finalize_sale RPC', e?.message || e);
+          saleRow = { ...saleRow, created_by: user.id, id: saleId };
+        }
+      }
+      return c.json({ ok: true, success: true, sale: toBase44Row(saleRow), sale_id: saleId || saleRow.id });
     }
 
     console.warn('finalize_sale RPC unavailable, JS fallback:', rpcError?.message);
@@ -467,6 +484,7 @@ functions.post("/finalize-sale", async (c) => {
       client_ref: client_ref || sale.client_ref,
       operator_name,
       status: sale.status || 'concluida',
+      source: sale.source || 'pdv',
       created_by: user.id,
     };
 
