@@ -330,11 +330,12 @@ functions.post("/finalize-sale", async (c) => {
       const { data: ownSettings } = await admin
         .from('app_settings').select('allow_zero_stock')
         .eq('created_by', user.id)
-        .order('created_at', { ascending: false }).limit(1);
-      if (ownSettings?.[0]?.allow_zero_stock === true) allowZeroStock = true;
-      else if (!allowZeroStock) allowZeroStock = await getAllowZeroStock();
+        .order('created_at', { ascending: false }).limit(20);
+      if ((ownSettings || []).some((s) => s && s.allow_zero_stock === true)) allowZeroStock = true;
+      else if (!allowZeroStock) allowZeroStock = await getAllowZeroStock(user.id);
     } catch {
-      allowZeroStock = (await getAllowZeroStock()) || allowZeroStock;
+      try { allowZeroStock = (await getAllowZeroStock(user.id)) || allowZeroStock; }
+      catch { allowZeroStock = (await getAllowZeroStock()) || allowZeroStock; }
     }
     const items = Array.isArray(sale.items) ? sale.items : [];
     const operator_name = sale.operator_name || user.full_name || user.email || '';
