@@ -578,7 +578,7 @@ functions.post('/:name', async (c) => {
   'open-cash-session','takeover-cash-session','cash-session-heartbeat','list-open-cash-sessions','finalize-sale','delivery-assign','delivery-complete','settle-accountability','courier-balance',
   'release-pdv-reservations','product-inquiry',
   'catalog-data','catalog-checkout','catalog-store-status','catalog-receipt','catalog-expire-pickups',
-  'barcode-lookup','product-name-lookup','enrich-product','save-product','refresh-products-catalog',
+  'barcode-lookup','product-name-lookup','enrich-product','save-product','repair-product-ownership','refresh-products-catalog',
   'start-stock-count','stock-count-search','stock-count-apply','sync-pdv-reservations',
   'admin-stats','cleanup-cash-sessions','purge-account','init-help-content',
   'create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','referral-panel','master-code-status',

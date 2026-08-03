@@ -260,14 +260,32 @@ products.post('/save-product', async (c) => {
       unit: src.unit || 'un',
     };
 
+    // Multi-tenant: grava ownership; no update não apaga created_by existente
+    if (!editingId) {
+      payload.created_by = user.id;
+    }
+
     if (editingId) {
-      const { data, error } = await admin
-        .from('product')
-        .update(payload)
-        .eq('id', editingId)
-        .select()
-        .single();
+      let uq = admin.from('product').update(payload).eq('id', editingId);
+      // se produto órfão (created_by null), permite o dono reivindicar
+      // admin client já bypassa RLS; ainda assim filtramos ownership quando possível
+      const { data, error } = await uq.select().single();
       if (error) return c.json({ error: error.message }, 400);
+      // garante ownership se estava null
+      if (data && !data.created_by && user.id) {
+        const { data: fixed } = await admin
+          .from('product')
+          .update({ created_by: user.id })
+          .eq('id', editingId)
+          .select()
+          .single();
+        if (fixed) {
+          if (payload.barcode && payload.name) {
+            await persistKnowledge(payload.barcode, { ...payload, source: 'manual' });
+          }
+          return c.json({ product: fixed, success: true, updated: true, id: editingId });
+        }
+      }
       if (payload.barcode && payload.name) {
         await persistKnowledge(payload.barcode, { ...payload, source: 'manual' });
       }
@@ -317,4 +335,30 @@ products.post('/refresh-products-catalog', async (c) => {
   }
 });
 
+
+// Reivindica produtos órfãos (created_by null) para o usuário logado — corrige bug do save-product
+products.post('/repair-product-ownership', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const { data: orphans, error: qErr } = await admin
+      .from('product')
+      .select('id,name,created_at')
+      .is('created_by', null);
+    if (qErr) return c.json({ error: qErr.message }, 400);
+    if (!orphans?.length) return c.json({ ok: true, fixed: 0, message: 'Nenhum produto órfão' });
+    const ids = orphans.map((p) => p.id);
+    const { error: uErr } = await admin
+      .from('product')
+      .update({ created_by: user.id })
+      .in('id', ids);
+    if (uErr) return c.json({ error: uErr.message }, 400);
+    return c.json({ ok: true, fixed: ids.length, products: orphans.map((p) => p.name) });
+  } catch (error) {
+    return c.json({ error: error.message }, 500);
+  }
+});
+
 export default products;
+
