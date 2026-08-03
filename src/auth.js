@@ -234,14 +234,19 @@ auth.patch('/me', async (c) => {
   const user = await getUserFromRequest(c);
   if (!user) return c.json({ error: 'unauthorized' }, 401);
   const body = await c.req.json().catch(() => ({}));
-  // company_address pode não existir na tabela — tentamos e removemos se falhar
-  const allowed = ['company_name', 'company_cnpj', 'company_phone', 'company_instagram', 'company_address', 'role']; // referral_code é imutável
+
+  // Colunas reais da tabela profiles (company_address NÃO existe no schema atual)
+  const allowed = ['company_name', 'company_cnpj', 'company_phone', 'company_instagram', 'role'];
   const patch = {};
   for (const k of allowed) {
     if (k in body) patch[k] = body[k] === '' ? null : body[k];
   }
+  // Endereço: aceita no payload para não quebrar o frontend, mas só persiste se a coluna existir
+  const requestedAddress = Object.prototype.hasOwnProperty.call(body, 'company_address')
+    ? (body.company_address === '' ? null : body.company_address)
+    : undefined;
 
-  const shape = (p) => ({
+  const shape = (p, addressOverride) => ({
     id: user.id,
     email: user.email,
     role: p?.role || user.role || 'admin',
@@ -249,7 +254,7 @@ auth.patch('/me', async (c) => {
     company_cnpj: p?.company_cnpj ?? null,
     company_phone: p?.company_phone ?? null,
     company_instagram: p?.company_instagram ?? null,
-    company_address: p?.company_address ?? null,
+    company_address: addressOverride !== undefined ? addressOverride : (p?.company_address ?? null),
     referral_code: p?.referral_code ?? null,
     full_name: p?.company_name || user.email,
     data: p || {},
@@ -257,75 +262,100 @@ auth.patch('/me', async (c) => {
 
   if (useLocal) {
     const keys = Object.keys(patch);
-    if (!keys.length) return c.json(shape(user.data || user));
-    const sets = keys.map((k, i) => `${k} = $${i + 2}`).join(', ');
-    const vals = keys.map((k) => patch[k]);
-    const { rows } = await query(
-      `update profiles set ${sets}, updated_at = now() where id = $1 returning *`,
-      [user.id, ...vals]
-    );
-    return c.json(shape(rows[0] || {}));
+    if (!keys.length && requestedAddress === undefined) return c.json(shape(user.data || user));
+    try {
+      if (keys.length) {
+        const sets = keys.map((k, i) => `${k} = $${i + 2}`).join(', ');
+        const vals = keys.map((k) => patch[k]);
+        const { rows } = await query(
+          `update profiles set ${sets}, updated_at = now() where id = $1 returning *`,
+          [user.id, ...vals]
+        );
+        return c.json(shape(rows[0] || {}, requestedAddress !== undefined ? requestedAddress : undefined));
+      }
+      return c.json(shape(user.data || user, requestedAddress));
+    } catch (e) {
+      return c.json({ error: e.message || 'Falha ao salvar perfil' }, 400);
+    }
   }
 
-  if (!Object.keys(patch).length) return c.json(shape(user.data || {}));
+  if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
-  // Remove company_address se a coluna não existir (detectado em runtime)
+  if (!Object.keys(patch).length && requestedAddress === undefined) {
+    return c.json(shape(user.data || {}));
+  }
+
   const tryUpdate = async (fields) => {
     const { data, error } = await admin
       .from('profiles')
       .update(fields)
       .eq('id', user.id)
-      .select()
+      .select('*')
       .maybeSingle();
     return { data, error };
   };
 
   let fields = { ...patch };
-  let { data, error } = await tryUpdate(fields);
-
-  if (error && String(error.message || '').includes('company_address')) {
-    delete fields.company_address;
-    ({ data, error } = await tryUpdate(fields));
+  // Tenta incluir endereço; se a coluna não existir, remove e segue
+  if (requestedAddress !== undefined) {
+    fields.company_address = requestedAddress;
   }
 
-  // Perfil inexistente → tenta INSERT
-  if (!error && !data) {
-    const insertPayload = {
-      id: user.id,
-      email: user.email,
-      role: user.role || 'admin',
-      ...fields,
-    };
-    ({ data, error } = await admin.from('profiles').insert(insertPayload).select().maybeSingle());
-    if (error && String(error.message || '').includes('company_address')) {
-      delete insertPayload.company_address;
-      ({ data, error } = await admin.from('profiles').insert(insertPayload).select().maybeSingle());
+  let data = null;
+  let error = null;
+
+  if (Object.keys(fields).length) {
+    ({ data, error } = await tryUpdate(fields));
+    const msg = String(error?.message || error?.details || error?.hint || '');
+    if (error && (msg.includes('company_address') || msg.includes('schema cache') || msg.includes('column'))) {
+      delete fields.company_address;
+      if (Object.keys(fields).length) {
+        ({ data, error } = await tryUpdate(fields));
+      } else {
+        error = null;
+      }
     }
   }
 
-  if (error) return c.json({ error: error.message }, 400);
-  if (!data) {
-    // Fallback: re-lê o que existir
-    const { data: again } = await admin.from('profiles').select('*').eq('id', user.id).maybeSingle();
-    data = again || { ...user.data, ...fields };
+  // NUNCA faz INSERT se o perfil já existe — só relê (evita erro de RLS)
+  if (!error && !data) {
+    const { data: again, error: readErr } = await admin
+      .from('profiles')
+      .select('*')
+      .eq('id', user.id)
+      .maybeSingle();
+    if (readErr) {
+      return c.json({ error: readErr.message }, 400);
+    }
+    data = again || { ...(user.data || {}), ...fields, id: user.id, email: user.email };
   }
 
-  // Espelha nome da empresa no AppSettings (catálogo / recibos)
-  if (patch.company_name) {
-    try {
+  if (error) {
+    console.error('auth.patch /me', error);
+    return c.json({ error: error.message || 'Falha ao salvar dados da empresa' }, 400);
+  }
+
+  // Espelha dados no AppSettings (catálogo / recibos)
+  try {
+    const settingsPatch = {};
+    if (patch.company_name !== undefined) settingsPatch.company_name = patch.company_name;
+    if (Object.keys(settingsPatch).length) {
       const { data: settings } = await admin
         .from('app_settings')
         .select('id')
         .eq('created_by', user.id)
         .order('created_at', { ascending: false })
-        .limit(1);
-      if (settings?.[0]?.id) {
-        await admin.from('app_settings').update({ company_name: patch.company_name }).eq('id', settings[0].id);
+        .limit(5);
+      for (const row of settings || []) {
+        await admin.from('app_settings').update(settingsPatch).eq('id', row.id);
       }
-    } catch (e) {
-      console.warn('sync app_settings company_name', e.message);
     }
-    // Atualiza slug do catálogo se o nome da loja mudou (mantém unicidade)
+  } catch (e) {
+    console.warn('sync app_settings company', e.message);
+  }
+
+  // Atualiza slug do catálogo se o nome mudou (não bloqueia o save)
+  if (patch.company_name) {
     try {
       const { generateUniqueCatalogSlug, setCatalogSlug } = await import('./helpers.js');
       const newSlug = await generateUniqueCatalogSlug(patch.company_name, user.id);
@@ -335,7 +365,7 @@ auth.patch('/me', async (c) => {
     }
   }
 
-  return c.json(shape(data || payload));
+  return c.json(shape(data, requestedAddress !== undefined ? requestedAddress : undefined));
 });
 
 auth.post('/oauth', async (c) => {
