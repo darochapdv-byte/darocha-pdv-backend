@@ -89,7 +89,7 @@ entities.get('/:entity/subscribe', async (c) => {
 entities.get('/:entity', async (c) => {
   const entity = c.req.param('entity');
   const table = tableFor(entity);
-  const limit = Math.min(Number(c.req.query('limit') || 100), 1000);
+  const limit = Math.min(Number(c.req.query('limit') || 100), 10000);
   const { column, ascending } = parseOrder(c.req.query('order'));
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
@@ -173,7 +173,7 @@ entities.post('/:entity/query', async (c) => {
   const table = tableFor(entity);
   const body = await c.req.json().catch(() => ({}));
   const query = body.query || {};
-  const limit = Math.min(Number(body.limit || 100), 1000);
+  const limit = Math.min(Number(body.limit || 100), 10000);
   const { column, ascending } = parseOrder(body.order);
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
