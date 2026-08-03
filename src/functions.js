@@ -320,6 +320,16 @@ functions.post("/finalize-sale", async (c) => {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
     const body = await c.req.json().catch(() => ({}));
+    // Recupera vendas PDV órfãs (created_by null) ligadas a caixas desta loja
+    try {
+      const { data: sessions } = await admin.from('cash_session').select('id').eq('created_by', user.id).limit(100);
+      const sids = (sessions || []).map((x) => x.id).filter(Boolean);
+      if (sids.length) {
+        await admin.from('sale').update({ created_by: user.id }).is('created_by', null).in('cash_session_id', sids);
+      }
+    } catch (e) {
+      console.warn('orphan sale ownership recovery', e?.message || e);
+    }
     const sale = sanitizeDateFields(body.sale || body);
     session_id = body.session_id || sale.cash_session_id || '';
     device_id = body.device_id || '';
