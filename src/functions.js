@@ -375,14 +375,21 @@ functions.post("/finalize-sale", async (c) => {
           reason: 'wrong_store',
         }, 403);
       }
-      // Se outro aparelho assumiu este caixa → bloqueia venda e força saída
+      // Se o dispositivo mudou mas o caixa é da mesma loja, assume neste aparelho e segue a venda
       if (device_id && cashSession.device_id && cashSession.device_id !== device_id) {
-        return c.json({
-          error: 'Este caixa foi assumido em outro dispositivo. Apenas um aparelho pode usá-lo por vez.',
-          force_exit: true,
-          foreign: true,
-          reason: 'taken_over',
-        }, 409);
+        try {
+          await admin.from('cash_session').update({
+            device_id,
+            last_active_at: new Date().toISOString(),
+            inactive: false,
+          }).eq('id', session_id);
+        } catch (e) {
+          console.warn('auto-takeover device on finalize', e?.message || e);
+        }
+      } else if (device_id && !cashSession.device_id) {
+        try {
+          await admin.from('cash_session').update({ device_id, last_active_at: new Date().toISOString() }).eq('id', session_id);
+        } catch (_) {}
       }
     }
 
