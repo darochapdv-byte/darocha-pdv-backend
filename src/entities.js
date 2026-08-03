@@ -238,7 +238,14 @@ entities.post('/:entity', async (c) => {
   delete body.id;
 
   const { data, error } = await db.from(table).insert(body).select().single();
-  if (error) return c.json({ error: error.message }, 400);
+  if (error) {
+    // SaleAuditLog às vezes tem RLS restritiva — não bloqueia exclusão/auditoria no PDV
+    if (normalizeEntityName(entity) === 'SaleAuditLog') {
+      console.warn('SaleAuditLog insert skipped:', error.message);
+      return c.json({ ok: true, skipped: true, reason: error.message, ...body }, 201);
+    }
+    return c.json({ error: error.message }, 400);
+  }
   const row = toBase44Row(data);
   if (entity === 'AppSettings') {
     row.allow_zero_stock = allowZeroStockSaved ?? (await getAllowZeroStock());
