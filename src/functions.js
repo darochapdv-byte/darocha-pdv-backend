@@ -409,22 +409,56 @@ functions.post("/finalize-sale", async (c) => {
         return c.json(rpcResult, status);
       }
       // Frontend espera { sale: ... }
-      // A RPC às vezes grava a venda sem created_by — corrige ownership multi-tenant
+      // A RPC costuma gravar sem created_by e sem campos de entrega/cliente — completa agora
       let saleRow = rpcResult.sale || rpcResult;
       const saleId = saleRow && (saleRow.id || rpcResult.sale_id);
-      if (saleId && user?.id && (!saleRow.created_by || saleRow.created_by !== user.id)) {
+      if (saleId) {
+        const patch = {
+          created_by: user.id,
+          source: sale.source || saleRow.source || 'pdv',
+          operator_name: operator_name || saleRow.operator_name || null,
+          customer_name: sale.customer_name ?? saleRow.customer_name ?? null,
+          customer_phone: sale.customer_phone ?? saleRow.customer_phone ?? null,
+          customer_id: sale.customer_id || saleRow.customer_id || null,
+          delivery_type: sale.delivery_type || saleRow.delivery_type || null,
+          delivery_address: sale.delivery_address ?? saleRow.delivery_address ?? null,
+          delivery_number: sale.delivery_number ?? saleRow.delivery_number ?? null,
+          delivery_neighborhood: sale.delivery_neighborhood ?? saleRow.delivery_neighborhood ?? null,
+          delivery_complement: sale.delivery_complement ?? saleRow.delivery_complement ?? null,
+          delivery_reference: sale.delivery_reference ?? saleRow.delivery_reference ?? null,
+          delivery_city: sale.delivery_city ?? saleRow.delivery_city ?? null,
+          delivery_state: sale.delivery_state ?? saleRow.delivery_state ?? null,
+          delivery_cep: sale.delivery_cep ?? saleRow.delivery_cep ?? null,
+          delivery_person: sale.delivery_person ?? saleRow.delivery_person ?? null,
+          delivery_fee: sale.delivery_fee != null ? Number(sale.delivery_fee) : (saleRow.delivery_fee ?? 0),
+          payment_method: sale.payment_method || saleRow.payment_method || null,
+          installments: sale.installments != null ? sale.installments : saleRow.installments,
+          discount: sale.discount != null ? sale.discount : saleRow.discount,
+          subtotal: sale.subtotal != null ? sale.subtotal : saleRow.subtotal,
+          fee_amount: sale.fee_amount != null ? sale.fee_amount : saleRow.fee_amount,
+          change_amount: sale.change_amount != null ? sale.change_amount : saleRow.change_amount,
+          cash_received: sale.cash_received != null ? sale.cash_received : saleRow.cash_received,
+          cash_change_for: sale.cash_change_for != null ? sale.cash_change_for : saleRow.cash_change_for,
+          notes: sale.notes ?? saleRow.notes ?? null,
+          seller_name: sale.seller_name ?? saleRow.seller_name ?? null,
+          seller_id: sale.seller_id || saleRow.seller_id || null,
+          items: Array.isArray(sale.items) ? sale.items : saleRow.items,
+        };
+        // remove undefined to avoid wiping columns
+        Object.keys(patch).forEach((k) => { if (patch[k] === undefined) delete patch[k]; });
         try {
-          const { data: fixed } = await admin
+          const { data: fixed, error: fixErr } = await admin
             .from('sale')
-            .update({ created_by: user.id, source: saleRow.source || sale.source || 'pdv' })
+            .update(patch)
             .eq('id', saleId)
             .select()
             .maybeSingle();
+          if (fixErr) console.warn('patch sale after RPC', fixErr.message);
           if (fixed) saleRow = fixed;
-          else saleRow = { ...saleRow, created_by: user.id, id: saleId };
+          else saleRow = { ...saleRow, ...patch, id: saleId };
         } catch (e) {
-          console.warn('fix created_by after finalize_sale RPC', e?.message || e);
-          saleRow = { ...saleRow, created_by: user.id, id: saleId };
+          console.warn('patch sale after finalize_sale RPC', e?.message || e);
+          saleRow = { ...saleRow, ...patch, id: saleId };
         }
       }
       return c.json({ ok: true, success: true, sale: toBase44Row(saleRow), sale_id: saleId || saleRow.id });
