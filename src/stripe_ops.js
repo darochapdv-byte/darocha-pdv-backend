@@ -227,6 +227,89 @@ export async function ensureUserReferralCode(userId) {
   }
 }
 
+/**
+ * Aplica código coringa DAROCHADEV → lifetime (máx. MASTER_CODE_MAX_USES usos).
+ * Pode ser chamado no registro ou depois (link-referral / conta já existente).
+ */
+async function applyMasterCodeLifetime(userId, email) {
+  if (!admin || !userId) {
+    return { ok: false, message: 'Usuário inválido.' };
+  }
+
+  // Já é lifetime?
+  const access = await getAccessStatus(userId);
+  if (access?.status === 'lifetime' || access?.subscription?.permanent_free_access === true) {
+    return { ok: true, message: 'Esta conta já possui acesso vitalício.', already: true };
+  }
+
+  const { data: usages } = await admin
+    .from('subscription_log')
+    .select('id')
+    .eq('action', 'master_code_used');
+  const count = usages?.length || 0;
+  if (count >= MASTER_CODE_MAX_USES) {
+    return {
+      ok: false,
+      message: 'Código coringa esgotado (limite de usos atingido).',
+      exhausted: true,
+    };
+  }
+
+  // Atualiza subscription existente ou cria
+  const { data: subs } = await admin
+    .from('subscription')
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  const prev = subs?.[0];
+
+  if (prev) {
+    await admin
+      .from('subscription')
+      .update({
+        status: 'active',
+        plan: 'lifetime',
+        permanent_free_access: true,
+        trial_end: null,
+      })
+      .eq('id', prev.id);
+  } else {
+    await admin.from('subscription').insert({
+      user_id: userId,
+      user_email: email || null,
+      status: 'active',
+      plan: 'lifetime',
+      amount: 0,
+      permanent_free_access: true,
+      reward_free_months: 0,
+      permanent_discount_active: false,
+    });
+  }
+
+  await admin.from('subscription_log').insert({
+    user_id: userId,
+    action: 'master_code_used',
+    description: JSON.stringify({
+      code: MASTER_CODE,
+      user_email: email || null,
+      used_at: new Date().toISOString(),
+      via: 'apply_master',
+    }),
+  });
+  await admin.from('subscription_log').insert({
+    user_id: userId,
+    action: 'dev_lifetime_granted',
+    description: JSON.stringify({ code: MASTER_CODE, via: 'apply_master' }),
+  });
+
+  return {
+    ok: true,
+    message: 'Código coringa aplicado! Acesso vitalício liberado.',
+    lifetime: true,
+  };
+}
+
 /** Cria trial de 30 dias + código de indicação no registro */
 export async function bootstrapNewUserSubscription(userId, email, referralCodeUsed) {
   if (!admin || !userId) return null;
@@ -763,9 +846,10 @@ stripeOps.post('/link-referral', async (c) => {
     const code = String(body.referral_code || body.referralCode || '').trim().toUpperCase();
     if (!code) return c.json({ ok: false, message: 'Informe um código de indicação.' });
 
-    // Master code só na criação de conta — não via link-referral da UI
+    // Código coringa da equipe (aceita também após o cadastro, enquanto houver usos)
     if (code === MASTER_CODE) {
-      return c.json({ ok: false, message: 'Código de indicação inválido.' });
+      const result = await applyMasterCodeLifetime(user.id, user.email);
+      return c.json(result);
     }
 
     const result = await linkReferralInternal(user.id, user.email, code);
