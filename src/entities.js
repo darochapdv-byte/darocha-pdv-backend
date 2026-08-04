@@ -66,6 +66,27 @@ async function assertSubscription(c) {
 }
 
 
+
+/** Variantes de código de barras para bipagem (zeros à esquerda, só dígitos, etc.) */
+function barcodeVariants(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return [];
+  const digits = s.replace(/\D/g, '');
+  const set = new Set();
+  for (const v of [s, digits, digits.replace(/^0+/, '') || digits]) {
+    if (v) set.add(v);
+  }
+  if (digits && digits.length < 13) {
+    set.add(digits.padStart(13, '0'));
+    set.add(digits.padStart(14, '0'));
+    set.add(digits.padStart(8, '0'));
+  }
+  if (digits && digits.length === 13 && digits.startsWith('0')) {
+    set.add(digits.replace(/^0+/, '') || digits);
+  }
+  return [...set].filter(Boolean).slice(0, 12);
+}
+
 /** Aplica filtro de dono (created_by) — cada usuário só vê os próprios dados. */
 function applyTenantFilter(q, entityName, user) {
   if (!user?.id || !isTenantEntity(entityName)) return q;
@@ -108,8 +129,18 @@ entities.get('/:entity', async (c) => {
   q = applyTenantFilter(q, entity, user);
 
   const allQueries = c.req.queries();
+  let productBarcodeRaw = null;
+  let productCodeRaw = null;
   for (const [k, values] of Object.entries(allQueries)) {
     if (k === 'limit' || k === 'order') continue;
+
+    // PDV bipagem: trata barcode/code de Product de forma flexível (depois)
+    if (entityNorm === 'Product' && (k === 'barcode' || k === 'code')) {
+      const raw = String(values[0] ?? '').replace(/^(eq:|ilike:|like:)/i, '').trim();
+      if (k === 'barcode') productBarcodeRaw = raw;
+      else productCodeRaw = raw;
+      continue;
+    }
 
     for (const v of values) {
       if (v === null || v === 'null') q = q.is(k, null);
@@ -124,6 +155,68 @@ entities.get('/:entity', async (c) => {
       else q = q.eq(k, v);
     }
   }
+
+  // Busca por código de barras no PDV: várias formas + campo code + órfãos da loja
+  if (entityNorm === 'Product' && (productBarcodeRaw || productCodeRaw) && admin && user?.id) {
+    const variants = barcodeVariants(productBarcodeRaw || productCodeRaw);
+    const codeVariants = productCodeRaw ? barcodeVariants(productCodeRaw) : [];
+    const allVars = [...new Set([...variants, ...codeVariants])].filter(Boolean);
+    let found = [];
+    try {
+      // 1) barcode exato em qualquer variante (loja)
+      if (allVars.length) {
+        const { data: byBc } = await admin
+          .from('product')
+          .select('*')
+          .in('barcode', allVars)
+          .limit(50);
+        found = byBc || [];
+      }
+      // 2) code interno
+      if (!found.length && allVars.length) {
+        const { data: byCode } = await admin
+          .from('product')
+          .select('*')
+          .in('code', allVars)
+          .limit(50);
+        found = byCode || [];
+      }
+      // 3) ilike parcial no barcode (espaços / formatação)
+      if (!found.length && (productBarcodeRaw || productCodeRaw)) {
+        const term = String(productBarcodeRaw || productCodeRaw).replace(/\D/g, '') || productBarcodeRaw;
+        if (term) {
+          const { data: byLike } = await admin
+            .from('product')
+            .select('*')
+            .or(`barcode.ilike.%${term}%,code.ilike.%${term}%`)
+            .limit(30);
+          found = byLike || [];
+        }
+      }
+      // Filtra: da loja OU órfão (aí reivindica)
+      const mine = [];
+      for (const p of found) {
+        if (p.created_by === user.id) {
+          mine.push(p);
+        } else if (!p.created_by) {
+          try {
+            await admin.from('product').update({ created_by: user.id }).eq('id', p.id).is('created_by', null);
+            p.created_by = user.id;
+            mine.push(p);
+          } catch (_) {}
+        }
+      }
+      if (mine.length) {
+        return c.json(toBase44Rows(mine.slice(0, limit)));
+      }
+    } catch (e) {
+      console.warn('product barcode flexible search', e?.message || e);
+    }
+    // fallback: eq estrito na query normal (tenant)
+    if (productBarcodeRaw) q = q.eq('barcode', productBarcodeRaw);
+    else if (productCodeRaw) q = q.eq('code', productCodeRaw);
+  }
+
   q = q.order(column, { ascending }).limit(limit);
   const { data, error } = await q;
   if (error) return c.json({ error: error.message }, 400);
