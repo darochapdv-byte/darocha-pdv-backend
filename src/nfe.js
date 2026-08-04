@@ -369,19 +369,53 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
     console.warn('nfe_import skip', e?.message || e);
   }
 
-  // Stock entry history (best effort)
+  // Histórico de entradas: 1 linha por produto (formato do front / StockEntry.list)
   if (updateStock && results.length) {
-    try {
-      await admin.from('stock_entry').insert({
-        type: 'nfe',
-        nfe_import_id: importId,
-        items: results,
-        notes: `NF-e ${parsed.number || ''}`.trim(),
-        created_by: user.id,
+    const now = new Date();
+    const entry_date = now.toISOString().slice(0, 10);
+    const entry_time = now.toTimeString().slice(0, 5);
+    const supplier = parsed.issuer_name || '';
+    const invoice_number = String(parsed.number || '');
+    const invoice_code = String(parsed.nfe_key || parsed.series || '');
+    const user_name = user.full_name || user.email || '';
+
+    for (const it of results) {
+      if (!it.product_id) continue;
+      const qty = Number(it.qty) || 0;
+      const unit_cost = Number(it.unit_cost) || 0;
+      const total_value = Math.round(qty * unit_cost * 100) / 100;
+      const row = {
+        product_id: it.product_id,
+        product_name: it.name || '',
+        barcode: it.barcode || '',
+        supplier,
+        invoice_number,
+        invoice_code,
+        quantity: qty,
+        unit_cost,
+        total_value,
+        notes: `NF-e ${invoice_number}${parsed.series ? ' Série ' + parsed.series : ''}`.trim(),
+        entry_date,
+        entry_time,
+        user_id: user.id,
+        user_name,
         status: 'ativa',
-      });
-    } catch (e) {
-      console.warn('stock_entry skip', e?.message || e);
+        created_by: user.id,
+        source: 'nfe',
+      };
+      try {
+        const { error } = await admin.from('stock_entry').insert(row);
+        if (error) {
+          // tenta sem colunas opcionais que podem não existir
+          const slim = { ...row };
+          delete slim.source;
+          delete slim.invoice_code;
+          const { error: e2 } = await admin.from('stock_entry').insert(slim);
+          if (e2) console.warn('stock_entry insert', e2.message);
+        }
+      } catch (e) {
+        console.warn('stock_entry skip', e?.message || e);
+      }
     }
   }
 
