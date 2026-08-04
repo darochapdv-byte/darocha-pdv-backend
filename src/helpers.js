@@ -449,14 +449,13 @@ export async function upsertSupplier(userId, data = {}) {
 
   try {
     let match = null;
-    if (cnpj && cnpj.length === 14) {
+    if (cnpj && cnpj.length >= 11) {
       const { data: rows } = await admin
         .from('supplier')
         .select('*')
         .eq('created_by', userId)
-        .eq('cnpj', cnpj)
-        .limit(5);
-      match = (rows || [])[0] || null;
+        .limit(2000);
+      match = (rows || []).find((s) => normalizeDoc(s.cnpj) === cnpj) || null;
     }
     if (!match && name) {
       const { data: rows } = await admin
@@ -538,17 +537,15 @@ export async function upsertCustomer(userId, data = {}) {
     let match = null;
 
     if (phone && phone.length >= 10) {
-      const variants = [phone, '55' + phone];
+      // Busca na loja e compara telefone normalizado em memória (mais confiável)
       const { data: rows } = await admin
         .from('customer')
         .select('*')
         .eq('created_by', userId)
-        .or(variants.map((v) => `phone.eq.${v}`).join(','))
-        .limit(20);
+        .limit(3000);
       match = (rows || []).find((cu) => {
-        const p = normalizePhoneBR(cu.phone);
-        // igualdade estrita após normalizar (não endsWith solto)
-        return p === phone;
+        const p = normalizePhoneBR(cu.phone || cu.whatsapp);
+        return p && p === phone;
       }) || null;
     }
 
@@ -602,6 +599,7 @@ export async function upsertCustomer(userId, data = {}) {
 
     const insert = {
       name: name || (phone ? `Cliente ${phone}` : email),
+      person_type: (patch.doc && String(patch.doc).length > 11) ? 'juridica' : 'fisica',
       phone: phone || null,
       whatsapp: phone || null,
       email: email || null,
