@@ -170,7 +170,7 @@ adminOps.post('/cleanup-cash-sessions', async (c) => {
         const { error } = await admin.from('cash_session').update({
           status: 'fechado',
           closed_at: new Date().toISOString(),
-          close_reason: closeAllStale ? 'cleanup_manual' : 'cleanup_stale',
+          notes: closeAllStale ? 'cleanup_manual' : 'cleanup_stale',
         }).eq('id', s.id);
         if (!error) closed++;
       }

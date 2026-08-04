@@ -130,7 +130,7 @@ functions.post('/open-cash-session', async (c) => {
           await admin.from('cash_session').update({
             status: 'fechado',
             closed_at: new Date().toISOString(),
-            close_reason: 'auto_stale_on_open',
+            notes: 'auto_stale_on_open',
           }).eq('id', s.id);
         }
       }
