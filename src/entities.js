@@ -314,7 +314,22 @@ entities.post('/:entity', async (c) => {
     }
     return c.json({ error: msg }, 400);
   }
-  const row = toBase44Row(data);
+  let row = toBase44Row(data);
+  // Wishlist: garante created_by legível no filtro multi-tenant
+  if (normalizeEntityName(entity) === 'WishlistItem' && user?.id && row?.id && !row.created_by) {
+    try {
+      await restQuery(
+        `wishlist_item?id=eq.${encodeURIComponent(row.id)}`,
+        { method: 'PATCH', body: { created_by: user.id }, prefer: 'return=representation' }
+      );
+      row.created_by = user.id;
+    } catch (_) {
+      if (admin) {
+        await admin.from('wishlist_item').update({ created_by: user.id }).eq('id', row.id);
+        row.created_by = user.id;
+      }
+    }
+  }
   if (entity === 'AppSettings') {
     row.allow_zero_stock = allowZeroStockSaved ?? (await getAllowZeroStock());
   }
@@ -380,28 +395,45 @@ entities.patch("/:entity/:id", async (c) => {
     prevStock != null &&
     body.stock != null &&
     Number(body.stock) > prevStock &&
-    admin &&
     user?.id
   ) {
     try {
       const pname = (row.name || '').trim().toLowerCase();
-      const { data: waiting } = await admin
-        .from('wishlist_item')
-        .select('id,product_name,status,created_by')
-        .eq('created_by', user.id)
-        .eq('status', 'aguardando')
-        .limit(200);
+      const productId = row.id || c.req.param('id');
+      let waiting = [];
+      // Preferir PostgREST (mais confiável com service key em algumas tabelas)
+      try {
+        const q1 = `wishlist_item?created_by=eq.${encodeURIComponent(user.id)}&status=eq.aguardando&select=id,product_id,product_name,status,created_by&limit=200`;
+        const rows = await restQuery(q1);
+        waiting = Array.isArray(rows) ? rows : [];
+      } catch (e) {
+        if (admin) {
+          const { data } = await admin
+            .from('wishlist_item')
+            .select('id,product_id,product_name,status,created_by')
+            .eq('created_by', user.id)
+            .eq('status', 'aguardando')
+            .limit(200);
+          waiting = data || [];
+        }
+      }
       const matches = (waiting || []).filter((w) => {
+        if (w.product_id && productId && String(w.product_id) === String(productId)) return true;
         const wn = (w.product_name || '').trim().toLowerCase();
         return wn && pname && wn === pname;
       });
       if (matches.length) {
-        await admin
-          .from('wishlist_item')
-          .update({ status: 'disponivel' })
-          .in('id', matches.map((m) => m.id));
+        try {
+          await restQuery(
+            `wishlist_item?id=in.(${matches.map((m) => m.id).join(',')})`,
+            { method: 'PATCH', body: { status: 'disponivel' }, prefer: 'return=minimal' }
+          );
+        } catch (e) {
+          if (admin) {
+            await admin.from('wishlist_item').update({ status: 'disponivel' }).in('id', matches.map((m) => m.id));
+          }
+        }
       }
-      // Notificação in-app (sem product_id — coluna pode não existir)
       await insertRowBypass('notification', {
         title: 'Produto disponível',
         message: `${row.name || 'Produto'} voltou ao estoque (${matches.length} aviso(s) na lista de espera).`,
