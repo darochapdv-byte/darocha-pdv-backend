@@ -125,6 +125,17 @@ entities.get('/:entity', async (c) => {
   const { data, error } = await q;
   if (error) return c.json({ error: error.message }, 400);
   let rows = toBase44Rows(data);
+  // Wishlist: fallback rest se RLS do client esconder linhas
+  if (normalizeEntityName(entity) === 'WishlistItem' && user?.id && (!rows || rows.length === 0)) {
+    try {
+      const rowsRest = await restQuery(
+        `wishlist_item?created_by=eq.${encodeURIComponent(user.id)}&select=*&order=created_at.desc&limit=${limit}`
+      );
+      if (Array.isArray(rowsRest) && rowsRest.length) rows = toBase44Rows(rowsRest);
+    } catch (e) {
+      console.warn('wishlist list rest', e.message || e);
+    }
+  }
   if (entity === 'AppSettings' && Array.isArray(rows)) {
     const allow = await getAllowZeroStock();
     const enriched = [];
@@ -162,7 +173,18 @@ entities.get('/:entity/:id', async (c) => {
   let q = db.from(table).select('*').eq('id', c.req.param('id'));
   q = applyTenantFilter(q, entity, user);
 
-  const { data, error } = await q.maybeSingle();
+  let { data, error } = await q.maybeSingle();
+  if ((error || !data) && normalizeEntityName(entity) === 'WishlistItem' && user?.id) {
+    try {
+      const rows = await restQuery(
+        `wishlist_item?id=eq.${encodeURIComponent(c.req.param('id'))}&created_by=eq.${encodeURIComponent(user.id)}&select=*&limit=1`
+      );
+      data = Array.isArray(rows) ? rows[0] : rows;
+      error = null;
+    } catch (e) {
+      /* keep previous */
+    }
+  }
   if (error) return c.json({ error: error.message }, 400);
   if (!data) return c.json({ error: 'not_found' }, 404);
   return c.json(toBase44Row(data));
@@ -307,27 +329,53 @@ entities.post('/:entity', async (c) => {
   if (error || !data) {
     const msg = (error && error.message) || 'insert_failed';
     // SaleAuditLog / Wishlist: soft-fail não quebra PDV
-    const soft = ['SaleAuditLog', 'WishlistItem'].includes(normalizeEntityName(entity));
-    if (soft || normalizeEntityName(entity) === 'SaleAuditLog') {
+    const soft = normalizeEntityName(entity) === 'SaleAuditLog';
+    if (soft) {
       console.warn(`${entity} insert soft-fail:`, msg);
       return c.json({ ok: true, skipped: true, reason: msg, ...body }, 201);
     }
     return c.json({ error: msg }, 400);
   }
   let row = toBase44Row(data);
-  // Wishlist: garante created_by legível no filtro multi-tenant
-  if (normalizeEntityName(entity) === 'WishlistItem' && user?.id && row?.id && !row.created_by) {
+  // Wishlist: verifica persistência e ownership (RLS às vezes engole SELECT depois do INSERT)
+  if (normalizeEntityName(entity) === 'WishlistItem' && user?.id) {
     try {
-      await restQuery(
-        `wishlist_item?id=eq.${encodeURIComponent(row.id)}`,
-        { method: 'PATCH', body: { created_by: user.id }, prefer: 'return=representation' }
-      );
-      row.created_by = user.id;
-    } catch (_) {
-      if (admin) {
-        await admin.from('wishlist_item').update({ created_by: user.id }).eq('id', row.id);
-        row.created_by = user.id;
+      if (row?.id) {
+        // força created_by
+        try {
+          await restQuery(
+            `wishlist_item?id=eq.${encodeURIComponent(row.id)}`,
+            { method: 'PATCH', body: { created_by: user.id, status: row.status || 'aguardando' }, prefer: 'return=representation' }
+          );
+        } catch (_) {}
+        let verified = null;
+        try {
+          const rows = await restQuery(
+            `wishlist_item?id=eq.${encodeURIComponent(row.id)}&select=*&limit=1`
+          );
+          verified = Array.isArray(rows) ? rows[0] : rows;
+        } catch (_) {}
+        if (!verified) {
+          // reinsert via rest puro
+          const payload = {
+            product_id: row.product_id || body.product_id || null,
+            product_name: row.product_name || body.product_name || null,
+            customer_name: row.customer_name || body.customer_name || null,
+            customer_phone: row.customer_phone || body.customer_phone || null,
+            status: row.status || body.status || 'aguardando',
+            created_by: user.id,
+          };
+          const inserted = await restQuery('wishlist_item', {
+            method: 'POST',
+            body: payload,
+            prefer: 'return=representation',
+          });
+          verified = Array.isArray(inserted) ? inserted[0] : inserted;
+        }
+        if (verified) row = toBase44Row(verified);
       }
+    } catch (e) {
+      console.warn('wishlist verify', e.message || e);
     }
   }
   if (entity === 'AppSettings') {
