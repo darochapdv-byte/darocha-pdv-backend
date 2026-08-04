@@ -126,10 +126,14 @@ function normalizeClientItems(rawItems) {
       if (!it || typeof it !== 'object') return null;
       const name = String(it.name || it.xProd || it.product_name || it.nome || '').trim();
       const qty = Number(it.qty ?? it.quantity ?? it.qCom ?? it.quantidade ?? 0) || 0;
-      const unit_cost = Number(it.unit_cost ?? it.cost ?? it.cost_price ?? it.vUnCom ?? it.custo ?? 0) || 0;
-      const sale_price = Number(it.sale_price ?? it.price ?? it.preco_venda ?? it.selling_price ?? 0) || 0;
+      const unit_cost = Number(
+        it.unit_cost ?? it.valorUnitario ?? it.cost ?? it.cost_price ?? it.vUnCom ?? it.custo ?? 0
+      ) || 0;
+      const sale_price = Number(
+        it.sale_price ?? it.salePrice ?? it.price ?? it.preco_venda ?? it.selling_price ?? 0
+      ) || 0;
       const barcode = String(it.barcode || it.ean || it.cEAN || it.code_ean || '').trim();
-      const code = String(it.code || it.cProd || it.sku || '').trim();
+      const code = String(it.code || it.cProd || it.sku || it.reference || '').trim();
       if (!name && !barcode && !code) return null;
       return {
         code,
