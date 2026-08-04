@@ -334,7 +334,13 @@ functions.post("/finalize-sale", async (c) => {
   let client_ref = '';
   try {
     const user = await requireUser(c);
-    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!user) {
+      return c.json({
+        error: 'Sessão expirada ou não autorizada. Faça login novamente e tente finalizar a venda.',
+        code: 'session_expired',
+        force_login: true,
+      }, 401);
+    }
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
     const body = await c.req.json().catch(() => ({}));
@@ -388,10 +394,16 @@ functions.post("/finalize-sale", async (c) => {
       }
       if (cashSession.created_by && cashSession.created_by !== user.id) {
         return c.json({
-          error: 'Caixa não pertence a esta loja.',
+          error: 'Caixa não pertence a esta loja. Feche e abra o caixa novamente nesta conta.',
           force_exit: true,
           reason: 'wrong_store',
         }, 403);
+      }
+      // Caixa órfão: vincula à loja logada
+      if (!cashSession.created_by && user.id) {
+        try {
+          await admin.from('cash_session').update({ created_by: user.id }).eq('id', session_id).is('created_by', null);
+        } catch (_) {}
       }
       // Se o dispositivo mudou mas o caixa é da mesma loja, assume neste aparelho e segue a venda
       if (device_id && cashSession.device_id && cashSession.device_id !== device_id) {
@@ -502,9 +514,21 @@ functions.post("/finalize-sale", async (c) => {
     }
 
     const ids = items.map((i) => i.product_id).filter(Boolean);
+    // Busca produtos da loja + órfãos (sem created_by) para não bloquear venda legítima
     let prodQ = admin.from('product').select('id,name,stock,created_by').in('id', ids);
-    if (user?.id) prodQ = prodQ.eq('created_by', user.id);
-    const { data: products } = await prodQ;
+    const { data: productsRaw } = await prodQ;
+    const products = (productsRaw || []).filter(
+      (p) => !p.created_by || p.created_by === user.id
+    );
+    // Vincula órfãos à loja na hora da venda
+    for (const p of products) {
+      if (!p.created_by) {
+        try {
+          await admin.from('product').update({ created_by: user.id }).eq('id', p.id).is('created_by', null);
+          p.created_by = user.id;
+        } catch (_) {}
+      }
+    }
     const stockMap = Object.fromEntries((products || []).map((p) => [p.id, p]));
 
     const insufficient = [];
