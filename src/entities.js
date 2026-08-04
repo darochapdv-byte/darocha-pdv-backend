@@ -89,7 +89,10 @@ entities.get('/:entity/subscribe', async (c) => {
 entities.get('/:entity', async (c) => {
   const entity = c.req.param('entity');
   const table = tableFor(entity);
-  const limit = Math.min(Number(c.req.query('limit') || 100), 10000);
+  // Product: default alto — PDV precisa listar o catálogo inteiro da loja
+  const entityNorm = normalizeEntityName(entity);
+  const defaultLimit = entityNorm === 'Product' ? 5000 : 100;
+  const limit = Math.min(Number(c.req.query('limit') || defaultLimit), 10000);
   const { column, ascending } = parseOrder(c.req.query('order'));
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
@@ -383,6 +386,32 @@ entities.post('/:entity', async (c) => {
   const { data, error } = await insertRowBypass(table, body);
   if (error || !data) {
     const msg = (error && error.message) || 'insert_failed';
+    // Product duplicado: se órfão ou da mesma loja, atualiza/vincula em vez de erro
+    if (normalizeEntityName(entity) === 'Product' && user?.id && admin) {
+      const isDup = /duplicate|unique|23505/i.test(msg);
+      if (isDup) {
+        let existing = null;
+        if (body.barcode) {
+          const { data: byBc } = await admin.from('product').select('*').eq('barcode', body.barcode).limit(1).maybeSingle();
+          existing = byBc;
+        }
+        if (!existing && body.name) {
+          const { data: byName } = await admin.from('product').select('*').eq('name', body.name).eq('created_by', user.id).limit(1).maybeSingle();
+          existing = byName;
+        }
+        if (existing && (!existing.created_by || existing.created_by === user.id)) {
+          const patch = { ...body, created_by: user.id };
+          delete patch.id;
+          const { data: updated, error: uErr } = await admin.from('product').update(patch).eq('id', existing.id).select().single();
+          if (!uErr && updated) {
+            return c.json(toBase44Row(updated));
+          }
+        }
+        if (existing && existing.created_by && existing.created_by !== user.id) {
+          return c.json({ error: 'Produto com este código já existe em outra loja.' }, 409);
+        }
+      }
+    }
     // SaleAuditLog / Wishlist: soft-fail não quebra PDV
     const soft = normalizeEntityName(entity) === 'SaleAuditLog';
     if (soft) {

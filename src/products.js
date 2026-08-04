@@ -293,7 +293,73 @@ products.post('/save-product', async (c) => {
     }
 
     const { data, error } = await admin.from('product').insert(payload).select().single();
-    if (error) return c.json({ error: error.message }, 400);
+    if (error) {
+      // Duplicata de barcode/código: se for órfão ou já do usuário, atualiza em vez de falhar
+      const msg = String(error.message || error.code || '');
+      const isDup =
+        error.code === '23505' ||
+        /duplicate|unique|já exist/i.test(msg);
+      if (isDup) {
+        let existing = null;
+        if (payload.barcode) {
+          const { data: byBc } = await admin
+            .from('product')
+            .select('*')
+            .eq('barcode', payload.barcode)
+            .limit(1)
+            .maybeSingle();
+          existing = byBc;
+        }
+        if (!existing && payload.code) {
+          const { data: byCode } = await admin
+            .from('product')
+            .select('*')
+            .eq('code', payload.code)
+            .limit(1)
+            .maybeSingle();
+          existing = byCode;
+        }
+        if (!existing && payload.name) {
+          const { data: byName } = await admin
+            .from('product')
+            .select('*')
+            .eq('name', payload.name)
+            .eq('created_by', user.id)
+            .limit(1)
+            .maybeSingle();
+          existing = byName;
+        }
+        if (existing) {
+          const owner = existing.created_by;
+          if (owner && owner !== user.id) {
+            return c.json({
+              error: 'Este produto (código de barras) já pertence a outra loja. Use outro código ou edite o produto na lista.',
+              code: 'product_owned_by_other',
+            }, 409);
+          }
+          const claim = { ...payload, created_by: user.id };
+          const { data: updated, error: uErr } = await admin
+            .from('product')
+            .update(claim)
+            .eq('id', existing.id)
+            .select()
+            .single();
+          if (uErr) return c.json({ error: uErr.message }, 400);
+          if (payload.barcode && payload.name) {
+            await persistKnowledge(payload.barcode, { ...payload, source: 'manual' });
+          }
+          return c.json({
+            product: updated,
+            success: true,
+            updated: true,
+            claimed: !owner,
+            id: existing.id,
+            message: owner ? 'Produto atualizado.' : 'Produto encontrado e vinculado à sua loja.',
+          });
+        }
+      }
+      return c.json({ error: error.message }, 400);
+    }
     if (payload.barcode && payload.name) {
       await persistKnowledge(payload.barcode, { ...payload, source: 'manual' });
     }
