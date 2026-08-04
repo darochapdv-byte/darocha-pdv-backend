@@ -836,6 +836,145 @@ stripeOps.post('/subscription-status', async (c) => {
   }
 });
 
+
+/** Cancela assinatura Stripe do usuário logado (padrão: no fim do período pago) */
+stripeOps.post('/cancel-subscription', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const stripe = getStripe();
+    if (!stripe) {
+      return c.json({ error: 'stripe_not_configured', message: 'Stripe não configurado.' }, 501);
+    }
+
+    const body = await c.req.json().catch(() => ({}));
+    const immediate = body.immediate === true || body.at_period_end === false;
+
+    const { data: subs } = await admin
+      .from('subscription')
+      .select('*')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    const sub = subs?.[0];
+    if (!sub) {
+      return c.json({ ok: false, message: 'Nenhuma assinatura encontrada.' }, 404);
+    }
+    if (sub.permanent_free_access === true || sub.plan === 'lifetime' || sub.plan === 'dev_lifetime') {
+      return c.json({ ok: false, message: 'Contas com acesso vitalício não possuem assinatura cancelável no Stripe.' }, 400);
+    }
+
+    const stripeSubId = sub.stripe_subscription_id;
+    if (!stripeSubId) {
+      return c.json({
+        ok: false,
+        message: 'Não há assinatura Stripe vinculada a esta conta. Se você acabou de pagar, aguarde alguns minutos ou contate o suporte.',
+      }, 400);
+    }
+
+    let stripeSub;
+    if (immediate) {
+      stripeSub = await stripe.subscriptions.cancel(stripeSubId);
+    } else {
+      stripeSub = await stripe.subscriptions.update(stripeSubId, { cancel_at_period_end: true });
+    }
+
+    const periodEnd = stripeSub.current_period_end
+      ? new Date(stripeSub.current_period_end * 1000).toISOString()
+      : sub.current_period_end;
+
+    const updatePayload = {
+      cancel_at_period_end: !immediate,
+      current_period_end: periodEnd || sub.current_period_end,
+    };
+    if (immediate || stripeSub.status === 'canceled') {
+      updatePayload.status = 'canceled';
+      updatePayload.cancel_at_period_end = false;
+    }
+
+    await admin.from('subscription').update(updatePayload).eq('id', sub.id);
+    await admin.from('subscription_log').insert({
+      user_id: user.id,
+      action: immediate ? 'subscription_canceled_immediate' : 'subscription_cancel_at_period_end',
+      description: JSON.stringify({
+        stripe_subscription_id: stripeSubId,
+        current_period_end: periodEnd,
+      }),
+    });
+
+    if (immediate) {
+      try {
+        await onSubscriptionCanceled(user.id);
+      } catch (e) {
+        console.warn('onSubscriptionCanceled', e.message || e);
+      }
+    }
+
+    const access = await getAccessStatus(user.id);
+    return c.json({
+      ok: true,
+      immediate,
+      cancel_at_period_end: !immediate && stripeSub.cancel_at_period_end === true,
+      current_period_end: periodEnd,
+      message: immediate
+        ? 'Assinatura cancelada imediatamente.'
+        : `Cancelamento agendado. Você continua com acesso até ${periodEnd ? new Date(periodEnd).toLocaleDateString('pt-BR') : 'o fim do período pago'}.`,
+      access,
+      subscription: { ...sub, ...updatePayload },
+    });
+  } catch (error) {
+    console.error('cancel-subscription', error);
+    return c.json({ error: error.message }, 500);
+  }
+});
+
+/** Reativa cobrança se o cancelamento estava só agendado (cancel_at_period_end) */
+stripeOps.post('/resume-subscription', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const stripe = getStripe();
+    if (!stripe) return c.json({ error: 'stripe_not_configured' }, 501);
+
+    const { data: subs } = await admin
+      .from('subscription')
+      .select('*')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    const sub = subs?.[0];
+    if (!sub?.stripe_subscription_id) {
+      return c.json({ ok: false, message: 'Nenhuma assinatura Stripe encontrada.' }, 404);
+    }
+
+    const stripeSub = await stripe.subscriptions.update(sub.stripe_subscription_id, {
+      cancel_at_period_end: false,
+    });
+
+    await admin.from('subscription').update({
+      cancel_at_period_end: false,
+      status: 'active',
+    }).eq('id', sub.id);
+
+    await admin.from('subscription_log').insert({
+      user_id: user.id,
+      action: 'subscription_resumed',
+      description: JSON.stringify({ stripe_subscription_id: sub.stripe_subscription_id }),
+    });
+
+    const access = await getAccessStatus(user.id);
+    return c.json({
+      ok: true,
+      message: 'Assinatura reativada. As cobranças continuarão normalmente.',
+      access,
+    });
+  } catch (error) {
+    return c.json({ error: error.message }, 500);
+  }
+});
+
 stripeOps.post('/link-referral', async (c) => {
   try {
     const user = await requireUser(c);

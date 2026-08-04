@@ -588,7 +588,7 @@ functions.post('/:name', async (c) => {
   'barcode-lookup','product-name-lookup','enrich-product','save-product','repair-product-ownership','refresh-products-catalog',
   'start-stock-count','stock-count-search','stock-count-apply','sync-pdv-reservations',
   'admin-stats','cleanup-cash-sessions','purge-account','init-help-content',
-  'create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','referral-panel','master-code-status','ensure-referral-code',
+  'create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','referral-panel','master-code-status','ensure-referral-code','cancel-subscription','resume-subscription',
   'fetch-nfe-xml','import-nfe','address-search',
 ];
   if (implemented.includes(name)) return c.json({ error: 'routing_error' }, 500);
