@@ -369,18 +369,22 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
     console.warn('nfe_import skip', e?.message || e);
   }
 
-  // Histórico de entradas: 1 linha por produto (formato do front / StockEntry.list)
+  // Histórico de entradas: 1 linha por produto (mesmo formato do cadastro manual)
   if (updateStock && results.length) {
     const now = new Date();
     const entry_date = now.toISOString().slice(0, 10);
     const entry_time = now.toTimeString().slice(0, 5);
     const supplier = parsed.issuer_name || '';
     const invoice_number = String(parsed.number || '');
-    const invoice_code = String(parsed.nfe_key || parsed.series || '');
+    const invoice_series = String(parsed.series || '');
+    const nfe_key = String(parsed.nfe_key || '');
     const user_name = user.full_name || user.email || '';
 
     for (const it of results) {
-      if (!it.product_id) continue;
+      if (!it.product_id) {
+        console.warn('stock_entry skip item without product_id', it.name);
+        continue;
+      }
       const qty = Number(it.qty) || 0;
       const unit_cost = Number(it.unit_cost) || 0;
       const total_value = Math.round(qty * unit_cost * 100) / 100;
@@ -390,31 +394,50 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
         barcode: it.barcode || '',
         supplier,
         invoice_number,
-        invoice_code,
+        invoice_series: invoice_series || null,
+        nfe_key: nfe_key || null,
         quantity: qty,
         unit_cost,
         total_value,
-        notes: `NF-e ${invoice_number}${parsed.series ? ' Série ' + parsed.series : ''}`.trim(),
+        notes: `Entrada NF-e ${invoice_number}${invoice_series ? ' Série ' + invoice_series : ''}`.trim(),
         entry_date,
         entry_time,
         user_id: user.id,
         user_name,
         status: 'ativa',
         created_by: user.id,
-        source: 'nfe',
       };
       try {
-        const { error } = await admin.from('stock_entry').insert(row);
+        let { data, error } = await admin.from('stock_entry').insert(row).select('id').maybeSingle();
         if (error) {
-          // tenta sem colunas opcionais que podem não existir
-          const slim = { ...row };
-          delete slim.source;
-          delete slim.invoice_code;
-          const { error: e2 } = await admin.from('stock_entry').insert(slim);
-          if (e2) console.warn('stock_entry insert', e2.message);
+          console.warn('stock_entry insert try1', error.message);
+          // remove optional cols
+          const slim = {
+            product_id: row.product_id,
+            product_name: row.product_name,
+            barcode: row.barcode,
+            supplier: row.supplier,
+            invoice_number: row.invoice_number,
+            quantity: row.quantity,
+            unit_cost: row.unit_cost,
+            total_value: row.total_value,
+            notes: row.notes,
+            entry_date: row.entry_date,
+            entry_time: row.entry_time,
+            user_id: row.user_id,
+            user_name: row.user_name,
+            status: 'ativa',
+            created_by: row.created_by,
+          };
+          const r2 = await admin.from('stock_entry').insert(slim).select('id').maybeSingle();
+          if (r2.error) console.warn('stock_entry insert try2', r2.error.message);
+          else data = r2.data;
+        }
+        if (data?.id) {
+          // ok
         }
       } catch (e) {
-        console.warn('stock_entry skip', e?.message || e);
+        console.warn('stock_entry exception', e?.message || e);
       }
     }
   }
