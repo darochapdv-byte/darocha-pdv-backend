@@ -497,10 +497,12 @@ catalog.post('/catalog-checkout', async (c) => {
         const { data: candidates } = await custQuery;
 
         // Confirma match comparando só dígitos (mais seguro)
+        // Match estrito após normalizar (não endsWith — evita misturar clientes diferentes)
         const match = (candidates || []).find((cu) => {
           let p = String(cu.phone || '').replace(/\D/g, '');
           if (p.startsWith('55') && p.length >= 12) p = p.slice(2);
-          return p === phoneDigits || p.endsWith(phoneDigits) || phoneDigits.endsWith(p);
+          if (p.startsWith('0') && p.length > 10) p = p.replace(/^0+/, '');
+          return p === phoneDigits;
         });
 
         if (match) {

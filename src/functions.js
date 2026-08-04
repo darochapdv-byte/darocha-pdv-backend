@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin } from './db.js';
-import { logOperation, releaseSessionReservations, requireUser, stackOf, sanitizeDateFields, toBase44Row, toBase44Rows, getAllowZeroStock } from './helpers.js';
+import { logOperation, releaseSessionReservations, requireUser, stackOf, sanitizeDateFields, toBase44Row, toBase44Rows, getAllowZeroStock, upsertCustomer } from './helpers.js';
 import { registerCashMovement } from './integration.js';
 
 /**
@@ -426,9 +426,35 @@ functions.post("/finalize-sale", async (c) => {
 
 
     // RPC atômica (se 002_finalize_sale_rpc.sql foi aplicado)
+    // Cliente automático antes da RPC também
+    try {
+      const custId = await upsertCustomer(user.id, {
+        name: sale.customer_name || sale.client_name || sale.delivery_person,
+        phone: sale.customer_phone || sale.client_phone || sale.delivery_phone,
+        email: sale.customer_email || sale.client_email,
+        street: sale.delivery_address || sale.customer_address,
+        number: sale.delivery_number,
+        complement: sale.delivery_complement,
+        neighborhood: sale.delivery_neighborhood,
+        city: sale.delivery_city,
+        state: sale.delivery_state,
+        cep: sale.delivery_cep,
+        doc: sale.customer_doc || sale.customer_cpf || sale.cpf,
+      });
+      if (custId) sale.customer_id = custId;
+    } catch (e) {
+      console.warn('customer upsert pre-rpc', e?.message || e);
+    }
+
     const { data: rpcResult, error: rpcError } = await admin.rpc('finalize_sale', {
       p_items: items,
-      p_sale: { ...sale, operator_name, created_by: user.id, source: sale.source || 'pdv' },
+      p_sale: {
+        ...sale,
+        operator_name,
+        created_by: user.id,
+        source: sale.source || 'pdv',
+        customer_id: sale.customer_id || null,
+      },
       p_session_id: session_id || null,
       p_allow_zero_stock: allowZeroStock,
     });
@@ -571,6 +597,26 @@ functions.post("/finalize-sale", async (c) => {
       }
     }
 
+    // Auto-cadastro de cliente (entrega/retirada/balcão) — dedupe por telefone/email
+    try {
+      const custId = await upsertCustomer(user.id, {
+        name: sale.customer_name || sale.client_name || sale.delivery_person,
+        phone: sale.customer_phone || sale.client_phone || sale.delivery_phone,
+        email: sale.customer_email || sale.client_email,
+        street: sale.delivery_address || sale.customer_address,
+        number: sale.delivery_number,
+        complement: sale.delivery_complement,
+        neighborhood: sale.delivery_neighborhood,
+        city: sale.delivery_city,
+        state: sale.delivery_state,
+        cep: sale.delivery_cep,
+        doc: sale.customer_doc || sale.customer_cpf || sale.cpf,
+      });
+      if (custId) sale.customer_id = custId;
+    } catch (e) {
+      console.warn('customer upsert on finalize', e?.message || e);
+    }
+
     const salePayload = {
       ...sale, items,
       cash_session_id: session_id || sale.cash_session_id,
@@ -579,6 +625,9 @@ functions.post("/finalize-sale", async (c) => {
       status: sale.status || 'concluida',
       source: sale.source || 'pdv',
       created_by: user.id,
+      customer_id: sale.customer_id || null,
+      customer_name: sale.customer_name || null,
+      customer_phone: sale.customer_phone || null,
     };
 
     const { data: createdSale, error: sErr } = await admin.from('sale').insert(salePayload).select().single();

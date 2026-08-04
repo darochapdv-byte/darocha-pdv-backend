@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin } from './db.js';
-import { requireUser } from './helpers.js';
+import { requireUser, upsertSupplier } from './helpers.js';
 
 const nfe = new Hono();
 
@@ -214,7 +214,7 @@ async function readImportPayload(c) {
   return { body: body || {}, xml: xml || '' };
 }
 
-async function applyImport(user, parsed, { createProducts = true, updateStock = true } = {}) {
+async function applyImport(user, parsed, { createProducts = true, updateStock = true, supplierId = null } = {}) {
   const results = [];
   let cadastrados = 0;
   let existentes = 0;
@@ -393,6 +393,7 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
         product_name: it.name || '',
         barcode: it.barcode || '',
         supplier,
+        supplier_id: supplierId || null,
         invoice_number,
         invoice_series: invoice_series || null,
         nfe_key: nfe_key || null,
@@ -591,7 +592,23 @@ nfe.post('/import-nfe', async (c) => {
     const createProducts = body.create_products !== false;
     const updateStock = body.update_stock !== false;
 
-    const { results, importId, stats } = await applyImport(user, parsed, { createProducts, updateStock });
+    // Cadastra/atualiza fornecedor automaticamente (CNPJ ou nome único na loja)
+    let supplierId = null;
+    try {
+      supplierId = await upsertSupplier(user.id, {
+        name: parsed.issuer_name,
+        cnpj: parsed.issuer_cnpj,
+        issuer_cnpj: parsed.issuer_cnpj,
+      });
+    } catch (e) {
+      console.warn('supplier upsert on nfe', e?.message || e);
+    }
+
+    const { results, importId, stats } = await applyImport(user, parsed, {
+      createProducts,
+      updateStock,
+      supplierId,
+    });
 
     const fornecedor =
       parsed.issuer_name ||

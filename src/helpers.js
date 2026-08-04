@@ -417,3 +417,213 @@ export function getDeliveryPauseStatus(cfg) {
   return { paused, message: paused ? message : '' };
 }
 
+
+/** Só dígitos */
+export function onlyDigits(v) {
+  return String(v || '').replace(/\D/g, '');
+}
+
+/** Telefone BR normalizado (sem DDI 55) */
+export function normalizePhoneBR(v) {
+  let p = onlyDigits(v);
+  if (p.startsWith('55') && p.length >= 12) p = p.slice(2);
+  if (p.startsWith('0') && p.length > 10) p = p.replace(/^0+/, '');
+  return p;
+}
+
+/** CNPJ/CPF só dígitos */
+export function normalizeDoc(v) {
+  return onlyDigits(v);
+}
+
+/**
+ * Upsert fornecedor da loja.
+ * Match seguro: CNPJ exato (14 dígitos). Sem CNPJ: nome exatamente igual (case-insensitive) na mesma loja.
+ * Nunca une dois CNPJs diferentes no mesmo registro.
+ */
+export async function upsertSupplier(userId, data = {}) {
+  if (!admin || !userId) return null;
+  const name = String(data.name || data.nome || '').trim();
+  const cnpj = normalizeDoc(data.cnpj || data.doc || data.issuer_cnpj || '');
+  if (!name && !cnpj) return null;
+
+  try {
+    let match = null;
+    if (cnpj && cnpj.length === 14) {
+      const { data: rows } = await admin
+        .from('supplier')
+        .select('*')
+        .eq('created_by', userId)
+        .eq('cnpj', cnpj)
+        .limit(5);
+      match = (rows || [])[0] || null;
+    }
+    if (!match && name) {
+      const { data: rows } = await admin
+        .from('supplier')
+        .select('*')
+        .eq('created_by', userId)
+        .ilike('name', name)
+        .limit(10);
+      // exige igualdade ignorando case (ilike sem % já é exact case-insensitive no PostgREST? 
+      // ilike sem wildcards = exact CI)
+      match = (rows || []).find((s) => String(s.name || '').trim().toLowerCase() === name.toLowerCase()) || null;
+      // se o match tem CNPJ diferente do informado, NÃO reutiliza
+      if (match && cnpj && match.cnpj && normalizeDoc(match.cnpj) !== cnpj) {
+        match = null;
+      }
+    }
+
+    const patch = {};
+    if (name) patch.name = name;
+    if (cnpj && cnpj.length >= 11) patch.cnpj = cnpj;
+    if (data.phone) patch.phone = normalizePhoneBR(data.phone) || data.phone;
+    if (data.email) patch.email = data.email;
+    if (data.ie) patch.ie = data.ie;
+    if (data.fantasy_name) patch.fantasy_name = data.fantasy_name;
+    if (data.street) patch.street = data.street;
+    if (data.city) patch.city = data.city;
+    if (data.state) patch.state = data.state;
+    if (data.cep) patch.cep = onlyDigits(data.cep);
+
+    if (match) {
+      // só preenche campos vazios (não sobrescreve dados bons)
+      const updates = {};
+      for (const [k, v] of Object.entries(patch)) {
+        if (v == null || v === '') continue;
+        if (!match[k]) updates[k] = v;
+      }
+      // CNPJ: se match não tinha e agora tem, grava
+      if (cnpj && !match.cnpj) updates.cnpj = cnpj;
+      if (Object.keys(updates).length) {
+        await admin.from('supplier').update(updates).eq('id', match.id);
+      }
+      return match.id;
+    }
+
+    const insert = {
+      name: name || `Fornecedor ${cnpj}`,
+      cnpj: cnpj || null,
+      phone: patch.phone || null,
+      email: patch.email || null,
+      ie: patch.ie || null,
+      fantasy_name: patch.fantasy_name || null,
+      created_by: userId,
+    };
+    const { data: created, error } = await admin.from('supplier').insert(insert).select('id').maybeSingle();
+    if (error) {
+      console.warn('upsertSupplier insert', error.message);
+      return null;
+    }
+    return created?.id || null;
+  } catch (e) {
+    console.warn('upsertSupplier', e?.message || e);
+    return null;
+  }
+}
+
+/**
+ * Upsert cliente da loja.
+ * Match seguro: telefone normalizado (com/sem 55) OU email exato.
+ * NUNCA casa só por nome (evita misturar pessoas diferentes).
+ */
+export async function upsertCustomer(userId, data = {}) {
+  if (!admin || !userId) return null;
+  const name = String(data.name || data.customer_name || '').trim();
+  const phone = normalizePhoneBR(data.phone || data.customer_phone || data.whatsapp || '');
+  const email = String(data.email || '').trim().toLowerCase();
+  if (!name && !phone && !email) return null;
+
+  try {
+    let match = null;
+
+    if (phone && phone.length >= 10) {
+      const variants = [phone, '55' + phone];
+      const { data: rows } = await admin
+        .from('customer')
+        .select('*')
+        .eq('created_by', userId)
+        .or(variants.map((v) => `phone.eq.${v}`).join(','))
+        .limit(20);
+      match = (rows || []).find((cu) => {
+        const p = normalizePhoneBR(cu.phone);
+        // igualdade estrita após normalizar (não endsWith solto)
+        return p === phone;
+      }) || null;
+    }
+
+    if (!match && email && email.includes('@')) {
+      const { data: rows } = await admin
+        .from('customer')
+        .select('*')
+        .eq('created_by', userId)
+        .ilike('email', email)
+        .limit(5);
+      match = (rows || []).find((cu) => String(cu.email || '').trim().toLowerCase() === email) || null;
+    }
+
+    const patch = {};
+    if (name) patch.name = name;
+    if (phone) patch.phone = phone;
+    if (phone) patch.whatsapp = phone;
+    if (email) patch.email = email;
+    if (data.street || data.delivery_address) patch.street = data.street || data.delivery_address;
+    if (data.number || data.delivery_number) patch.number = data.number || data.delivery_number;
+    if (data.complement || data.delivery_complement) patch.complement = data.complement || data.delivery_complement;
+    if (data.neighborhood || data.delivery_neighborhood) patch.neighborhood = data.neighborhood || data.delivery_neighborhood;
+    if (data.city || data.delivery_city) patch.city = data.city || data.delivery_city;
+    if (data.state || data.delivery_state) patch.state = data.state || data.delivery_state;
+    if (data.cep || data.delivery_cep) patch.cep = onlyDigits(data.cep || data.delivery_cep);
+    if (data.doc || data.cpf || data.cnpj) {
+      const doc = normalizeDoc(data.doc || data.cpf || data.cnpj);
+      if (doc) patch.doc = doc;
+    }
+
+    if (match) {
+      const updates = {};
+      for (const [k, v] of Object.entries(patch)) {
+        if (v == null || v === '') continue;
+        if (!match[k]) updates[k] = v;
+      }
+      // nome muito genérico no cadastro → atualiza se veio nome melhor
+      if (name && name.length >= 3 && (!match.name || match.name.length < 3)) {
+        updates.name = name;
+      }
+      if (Object.keys(updates).length) {
+        await admin.from('customer').update(updates).eq('id', match.id);
+      }
+      return match.id;
+    }
+
+    // Sem telefone nem email confiável: não cria (evita duplicata sem chave)
+    if ((!phone || phone.length < 10) && !email) {
+      return null;
+    }
+
+    const insert = {
+      name: name || (phone ? `Cliente ${phone}` : email),
+      phone: phone || null,
+      whatsapp: phone || null,
+      email: email || null,
+      street: patch.street || null,
+      number: patch.number || null,
+      complement: patch.complement || null,
+      neighborhood: patch.neighborhood || null,
+      city: patch.city || null,
+      state: patch.state || null,
+      cep: patch.cep || null,
+      doc: patch.doc || null,
+      active: true,
+      created_by: userId,
+    };
+    const { data: created, error } = await admin.from('customer').insert(insert).select('id').maybeSingle();
+    if (error) {
+      console.warn('upsertCustomer insert', error.message);
+      return null;
+    }
+    return created?.id || null;
+  } catch (e) {
+    console.warn('upsertCustomer', e?.message || e);
+    return null;
+  }
+}
