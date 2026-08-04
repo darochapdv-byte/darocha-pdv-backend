@@ -91,7 +91,7 @@ export async function query(text, params = []) {
  * Necessário porque alguns formatos de chave (sb_secret_*) nem sempre
  * fazem o supabase-js contornar RLS em todas as tabelas.
  */
-export async function restQuery(path, { method = 'GET', body, prefer = 'return=representation' } = {}) {
+export async function restQuery(path, { method = 'GET', body, prefer = 'return=representation', timeoutMs = 8000 } = {}) {
   const base = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
   if (!base || !key) throw new Error('supabase_not_configured');
@@ -103,11 +103,26 @@ export async function restQuery(path, { method = 'GET', body, prefer = 'return=r
   };
   if (prefer) headers.Prefer = prefer;
 
-  const res = await fetch(`${base}/rest/v1/${path}`, {
-    method,
-    headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1000, Number(timeoutMs) || 8000));
+  let res;
+  try {
+    res = await fetch(`${base}/rest/v1/${path}`, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    });
+  } catch (e) {
+    if (e && (e.name === 'AbortError' || String(e.message || '').includes('aborted'))) {
+      const err = new Error(`restQuery timeout after ${timeoutMs}ms: ${path}`);
+      err.status = 504;
+      throw err;
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   const text = await res.text();
   let data = null;
   try {

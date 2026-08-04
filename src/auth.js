@@ -81,16 +81,16 @@ export async function getUserFromRequest(c) {
     }
   }
 
-  // Garante referral_code para contas antigas (sem apagar dados existentes)
+  // referral_code: não bloqueia /auth/me (evita tela branca se PostgREST/RLS travar)
   let referralCode = profile?.referral_code || null;
   if (!referralCode && profile?.id) {
-    try {
-      const { ensureUserReferralCode } = await import('./stripe_ops.js');
-      referralCode = await ensureUserReferralCode(user.id);
-      if (profile) profile.referral_code = referralCode;
-    } catch (e) {
-      console.warn('ensure referral on me', e.message || e);
-    }
+    // fire-and-forget com timeout interno do restQuery
+    import('./stripe_ops.js')
+      .then(({ ensureUserReferralCode }) => ensureUserReferralCode(user.id))
+      .then((code) => {
+        if (code) console.log('referral_code backfilled for', user.id);
+      })
+      .catch((e) => console.warn('ensure referral on me', e.message || e));
   }
 
   const base = {
@@ -109,7 +109,9 @@ export async function getUserFromRequest(c) {
   };
   try {
     const { ensureCatalogSlug } = await import('./helpers.js');
-    const slug = await ensureCatalogSlug(user.id, profile?.company_name || null);
+    const slugPromise = ensureCatalogSlug(user.id, profile?.company_name || null);
+    const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(null), 5000));
+    const slug = await Promise.race([slugPromise, timeoutPromise]);
     base.catalog_slug = slug;
     const frontendBase = process.env.FRONTEND_URL || 'https://dist-ten-mu-12.vercel.app';
     base.catalog_url = slug
