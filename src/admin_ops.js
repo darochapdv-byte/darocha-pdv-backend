@@ -106,7 +106,7 @@ adminOps.post('/admin-stats', async (c) => {
   try {
     const user = await requireUser(c);
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
-    if (user.role !== 'admin') return c.json({ error: 'Forbidden' }, 403);
+    // Qualquer dono de loja autenticado vê as próprias métricas
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
     const today = new Date();
