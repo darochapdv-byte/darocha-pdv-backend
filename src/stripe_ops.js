@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import Stripe from 'stripe';
-import { admin } from './db.js';
+import { admin, restQuery } from './db.js';
 import { requireUser } from './helpers.js';
 
 const stripeOps = new Hono();
@@ -32,12 +32,19 @@ export function generateReferralCode() {
 export async function ensureUniqueReferralCode() {
   for (let attempt = 0; attempt < 20; attempt++) {
     const code = generateReferralCode();
-    const { data } = await admin
-      .from('profiles')
-      .select('id')
-      .eq('referral_code', code)
-      .limit(1);
-    if (!data?.length) return code;
+    try {
+      const rows = await restQuery(
+        `profiles?referral_code=eq.${encodeURIComponent(code)}&select=id&limit=1`
+      );
+      if (!rows?.length) return code;
+    } catch {
+      if (admin) {
+        const { data } = await admin.from('profiles').select('id').eq('referral_code', code).limit(1);
+        if (!data?.length) return code;
+      } else {
+        return code;
+      }
+    }
   }
   return generateReferralCode() + Date.now().toString(36).slice(-2).toUpperCase();
 }
@@ -158,36 +165,66 @@ export async function getAccessStatus(userId) {
 
 /** Garante que o perfil tenha referral_code (usuários antigos / bootstrap falhou) */
 export async function ensureUserReferralCode(userId) {
-  if (!admin || !userId) return null;
-  const { data: profile, error: selErr } = await admin
-    .from('profiles')
-    .select('id,referral_code')
-    .eq('id', userId)
-    .maybeSingle();
-  if (selErr) {
-    console.error('ensureUserReferralCode select', selErr.message);
-    return null;
+  if (!userId) return null;
+
+  // Lê via PostgREST direto (contorna RLS de forma mais confiável que o client js)
+  let profile = null;
+  try {
+    const rows = await restQuery(
+      `profiles?id=eq.${encodeURIComponent(userId)}&select=id,referral_code&limit=1`
+    );
+    profile = Array.isArray(rows) ? rows[0] : null;
+  } catch (e) {
+    console.error('ensureUserReferralCode rest select', e.message || e);
+    // fallback supabase-js
+    if (admin) {
+      const { data } = await admin.from('profiles').select('id,referral_code').eq('id', userId).maybeSingle();
+      profile = data;
+    }
   }
+
   if (!profile) {
-    console.warn('ensureUserReferralCode: profile not found', userId);
+    // Tenta criar perfil mínimo se não existir
+    try {
+      const inserted = await restQuery('profiles', {
+        method: 'POST',
+        body: { id: userId, referral_code: await ensureUniqueReferralCode() },
+        prefer: 'return=representation,resolution=merge-duplicates',
+      });
+      const row = Array.isArray(inserted) ? inserted[0] : inserted;
+      if (row?.referral_code) return String(row.referral_code).toUpperCase();
+    } catch (e) {
+      console.error('ensureUserReferralCode insert profile', e.message || e);
+    }
     return null;
   }
+
   if (profile.referral_code && String(profile.referral_code).trim()) {
     return String(profile.referral_code).trim().toUpperCase();
   }
+
   const code = await ensureUniqueReferralCode();
-  const { data: updated, error: upErr } = await admin
-    .from('profiles')
-    .update({ referral_code: code })
-    .eq('id', userId)
-    .select('id,referral_code')
-    .maybeSingle();
-  if (upErr) {
-    console.error('ensureUserReferralCode update', upErr.message, upErr.details || '', upErr.hint || '');
-    // fallback: tentar via raw se coluna existir com outro nome
-    return null;
+  try {
+    const updated = await restQuery(
+      `profiles?id=eq.${encodeURIComponent(userId)}`,
+      { method: 'PATCH', body: { referral_code: code }, prefer: 'return=representation' }
+    );
+    const row = Array.isArray(updated) ? updated[0] : updated;
+    return (row?.referral_code || code).toUpperCase();
+  } catch (e) {
+    console.error('ensureUserReferralCode rest update', e.message || e);
+    if (admin) {
+      const { data, error } = await admin
+        .from('profiles')
+        .update({ referral_code: code })
+        .eq('id', userId)
+        .select('id,referral_code')
+        .maybeSingle();
+      if (error) console.error('ensureUserReferralCode js update', error.message);
+      return data?.referral_code || code;
+    }
+    return code;
   }
-  return updated?.referral_code || code;
 }
 
 /** Cria trial de 30 dias + código de indicação no registro */
@@ -197,7 +234,15 @@ export async function bootstrapNewUserSubscription(userId, email, referralCodeUs
   const trialEnd = new Date(Date.now() + TRIAL_DAYS * 86400000).toISOString();
   const ownCode = await ensureUniqueReferralCode();
 
-  await admin.from('profiles').update({ referral_code: ownCode }).eq('id', userId);
+  try {
+    await restQuery(
+      `profiles?id=eq.${encodeURIComponent(userId)}`,
+      { method: 'PATCH', body: { referral_code: ownCode }, prefer: 'return=minimal' }
+    );
+  } catch (e) {
+    console.warn('bootstrap referral_code patch', e.message || e);
+    await admin.from('profiles').update({ referral_code: ownCode }).eq('id', userId);
+  }
 
   let plan = 'trial';
   let status = 'trialing';
@@ -815,18 +860,23 @@ stripeOps.post('/ensure-referral-code', async (c) => {
   try {
     const user = await requireUser(c);
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
-    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const code = await ensureUserReferralCode(user.id);
-    const { data: profile, error } = await admin
-      .from('profiles')
-      .select('id,referral_code,referred_by_code,referred_by_user_id')
-      .eq('id', user.id)
-      .maybeSingle();
+    let profile = null;
+    let readError = null;
+    try {
+      const rows = await restQuery(
+        `profiles?id=eq.${encodeURIComponent(user.id)}&select=id,email,referral_code,referred_by_code,referred_by_user_id&limit=1`
+      );
+      profile = Array.isArray(rows) ? rows[0] : null;
+    } catch (e) {
+      readError = e.message || String(e);
+    }
     return c.json({
       ok: !!code,
+      user_id: user.id,
       referral_code: code || profile?.referral_code || null,
       profile,
-      error: error?.message || null,
+      readError,
     });
   } catch (error) {
     return c.json({ error: error.message }, 500);
