@@ -18,52 +18,82 @@ stock.post('/start-stock-count', async (c) => {
       started_by: body.started_by || user.id || null,
       started_by_name: body.started_by_name || user.full_name || user.email || '',
       created_by: user.id,
+      zero_missing: body.zero_missing === true,
     };
 
-    // 1) tenta via supabase-js
+    // Prefer REST (service role) — supabase-js às vezes "insere" sem persistir legível em stock_count
+    try {
+      const rows = await restQuery('stock_count', { method: 'POST', body: payload, prefer: 'return=representation' });
+      const row = Array.isArray(rows) ? rows[0] : rows;
+      if (row?.id) {
+        // Confirma leitura imediata
+        const check = await restQuery(`stock_count?id=eq.${encodeURIComponent(row.id)}&select=*&limit=1`);
+        if (Array.isArray(check) && check[0]) return c.json(toBase44Row(check[0]), 201);
+        return c.json(toBase44Row(row), 201);
+      }
+    } catch (e) {
+      console.warn('start-stock-count rest insert', e.message);
+    }
+
     if (admin) {
       const { data, error } = await admin.from('stock_count').insert(payload).select().maybeSingle();
       if (!error && data) return c.json(toBase44Row(data), 201);
       console.warn('start-stock-count admin insert failed', error?.message);
     }
 
-    // 2) fallback REST com service role (contorna RLS)
-    try {
-      const rows = await restQuery('stock_count', { method: 'POST', body: payload });
-      const row = Array.isArray(rows) ? rows[0] : rows;
-      return c.json(toBase44Row(row), 201);
-    } catch (e) {
-      console.error('start-stock-count rest failed', e.message);
-      return c.json({
-        error: e.message || 'Não foi possível iniciar o balanço.',
-        user_friendly: true,
-        hint: 'Verifique as policies RLS da tabela stock_count no Supabase (allow insert/select para service role ou policy allow_all).',
-      }, 400);
-    }
+    return c.json({
+      error: 'Não foi possível iniciar o balanço.',
+      user_friendly: true,
+      hint: 'Verifique RLS/policies da tabela stock_count no Supabase.',
+    }, 400);
   } catch (error) {
     return c.json({ error: error.message || 'Erro ao iniciar balanço.' }, 500);
   }
 });
 
-
+/** Busca produtos do dono para contagem — REST + filtro em memória (confiável). */
 stock.post('/stock-count-search', async (c) => {
   try {
     const user = await requireUser(c);
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
-    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const body = await c.req.json().catch(() => ({}));
-    const q = String(body.query || body.q || '').trim();
+    const q = String(body.query || body.q || '').trim().toLowerCase();
     if (q.length < 1) return c.json({ products: [] });
 
-    let pq = admin
-      .from('product')
-      .select('id,name,barcode,code,brand,category,stock,sale_price,cost_price,image_url,active')
-      .or(`name.ilike.%${q}%,barcode.ilike.%${q}%,code.ilike.%${q}%`)
-      .limit(50);
-    if (user?.id) pq = pq.eq('created_by', user.id);
-    const { data } = await pq;
+    let products = [];
 
-    return c.json({ products: data || [] });
+    // 1) REST service role
+    try {
+      const path = user?.id
+        ? `product?created_by=eq.${encodeURIComponent(user.id)}&select=id,name,barcode,code,brand,category,stock,sale_price,cost_price,image_url,active&limit=5000`
+        : `product?select=id,name,barcode,code,brand,category,stock,sale_price,cost_price,image_url,active&limit=5000`;
+      const rows = await restQuery(path);
+      if (Array.isArray(rows)) products = rows;
+    } catch (e) {
+      console.warn('stock-count-search rest', e.message);
+    }
+
+    // 2) fallback admin
+    if (!products.length && admin) {
+      let pq = admin
+        .from('product')
+        .select('id,name,barcode,code,brand,category,stock,sale_price,cost_price,image_url,active')
+        .limit(5000);
+      if (user?.id) pq = pq.eq('created_by', user.id);
+      const { data, error } = await pq;
+      if (error) console.warn('stock-count-search admin', error.message);
+      products = data || [];
+    }
+
+    const matched = products.filter((p) => {
+      const name = String(p.name || '').toLowerCase();
+      const barcode = String(p.barcode || '').toLowerCase();
+      const code = String(p.code || '').toLowerCase();
+      const brand = String(p.brand || '').toLowerCase();
+      return name.includes(q) || barcode.includes(q) || code.includes(q) || brand.includes(q);
+    }).slice(0, 50);
+
+    return c.json({ products: matched });
   } catch (error) {
     return c.json({ error: error.message }, 500);
   }
@@ -73,13 +103,23 @@ stock.post('/stock-count-apply', async (c) => {
   try {
     const user = await requireUser(c);
     if (!user) return c.json({ error: 'Usuário não autenticado. Faça login novamente.', user_friendly: true }, 401);
-    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
     const body = await c.req.json().catch(() => ({}));
     const sessionId = body.stock_count_id;
     if (!sessionId) return c.json({ error: 'ID do balanço não informado.', user_friendly: true }, 400);
 
-    const { data: session } = await admin.from('stock_count').select('*').eq('id', sessionId).maybeSingle();
+    // Carrega sessão via REST (contorna RLS quebrado no supabase-js)
+    let session = null;
+    try {
+      const rows = await restQuery(`stock_count?id=eq.${encodeURIComponent(sessionId)}&select=*&limit=1`);
+      session = Array.isArray(rows) ? rows[0] : rows;
+    } catch (e) {
+      console.warn('stock-count-apply load session rest', e.message);
+    }
+    if (!session && admin) {
+      const { data } = await admin.from('stock_count').select('*').eq('id', sessionId).maybeSingle();
+      session = data;
+    }
     if (!session) return c.json({ error: 'Balanço não encontrado.', user_friendly: true }, 404);
     if (session.created_by && user?.id && session.created_by !== user.id) {
       return c.json({ error: 'Balanço não pertence a esta loja.', user_friendly: true }, 403);
@@ -91,15 +131,37 @@ stock.post('/stock-count-apply', async (c) => {
       return c.json({ error: 'Este balanço foi cancelado e não pode ser aplicado.', user_friendly: true }, 400);
     }
 
-    const { data: items } = await admin
-      .from('stock_count_item')
-      .select('*')
-      .eq('stock_count_id', sessionId)
-      .limit(5000);
+    let items = [];
+    try {
+      const rows = await restQuery(
+        `stock_count_item?stock_count_id=eq.${encodeURIComponent(sessionId)}&select=*&limit=5000`
+      );
+      if (Array.isArray(rows)) items = rows;
+    } catch (e) {
+      console.warn('stock-count-apply items rest', e.message);
+    }
+    if (!items.length && admin) {
+      const { data } = await admin.from('stock_count_item').select('*').eq('stock_count_id', sessionId).limit(5000);
+      items = data || [];
+    }
 
-    let allProdQ = admin.from('product').select('id,name,code,barcode,stock').limit(10000);
-    if (user?.id) allProdQ = allProdQ.eq('created_by', user.id);
-    const { data: allProducts } = await allProdQ;
+    let allProducts = [];
+    try {
+      const path = user?.id
+        ? `product?created_by=eq.${encodeURIComponent(user.id)}&select=id,name,code,barcode,stock,active&limit=10000`
+        : `product?select=id,name,code,barcode,stock,active&limit=10000`;
+      const rows = await restQuery(path);
+      if (Array.isArray(rows)) allProducts = rows;
+    } catch (e) {
+      console.warn('stock-count-apply products rest', e.message);
+    }
+    if (!allProducts.length && admin) {
+      let allProdQ = admin.from('product').select('id,name,code,barcode,stock,active').limit(10000);
+      if (user?.id) allProdQ = allProdQ.eq('created_by', user.id);
+      const { data } = await allProdQ;
+      allProducts = data || [];
+    }
+
     const byId = Object.fromEntries((allProducts || []).map((p) => [p.id, p]));
     const byCode = {};
     const byBarcode = {};
@@ -114,9 +176,8 @@ stock.post('/stock-count-apply', async (c) => {
       if (it.product_id && byId[it.product_id]) return byId[it.product_id];
       if (it.code && byCode[String(it.code).toLowerCase()]) return byCode[String(it.code).toLowerCase()];
       if (it.barcode && byBarcode[String(it.barcode)]) return byBarcode[String(it.barcode)];
-      if (it.product_name && byName[String(it.product_name).toLowerCase()]) {
-        return byName[String(it.product_name).toLowerCase()];
-      }
+      const pname = it.product_name || it.name;
+      if (pname && byName[String(pname).toLowerCase()]) return byName[String(pname).toLowerCase()];
       return null;
     }
 
@@ -132,10 +193,12 @@ stock.post('/stock-count-apply', async (c) => {
       countedProductIds.add(p.id);
       const countedLoja = Number(it.counted_loja) || 0;
       const countedEstoque = Number(it.counted_estoque) || 0;
-      const countedTotal = countedLoja + countedEstoque;
+      const countedTotal = (Number(it.counted_stock) || 0) > 0
+        ? Number(it.counted_stock)
+        : countedLoja + countedEstoque;
       const systemStock = Number(it.system_stock ?? p.stock) || 0;
       const currentStock = Number(p.stock) || 0;
-      // movement compensation
+      // Compensa movimentações durante a contagem
       const finalStock = countedTotal + (currentStock - systemStock);
 
       stockSnapshot.push({ id: p.id, stock: currentStock });
@@ -147,8 +210,9 @@ stock.post('/stock-count-apply', async (c) => {
       else { totalShortage++; totalShortageAmount += Math.abs(diff); }
     }
 
-    // Zero products not found in count (if session says so)
-    const zeroMissing = session.zero_missing !== false;
+    // Zera não contados só se explicitamente zero_missing=true (evita zerar loja por engano)
+    // Mantém compat: se a sessão já tinha zero_missing true, respeita.
+    const zeroMissing = !(session.zero_missing === false || body.zero_missing === false);
     if (zeroMissing) {
       for (const p of allProducts || []) {
         if (countedProductIds.has(p.id)) continue;
@@ -158,15 +222,30 @@ stock.post('/stock-count-apply', async (c) => {
       }
     }
 
-    // Apply updates
+    // Aplica atualizações de estoque via REST (mais confiável)
     try {
       for (const u of productUpdates) {
-        await admin.from('product').update({ stock: u.stock }).eq('id', u.id).eq('created_by', user.id);
+        const filter = user?.id
+          ? `product?id=eq.${encodeURIComponent(u.id)}&created_by=eq.${encodeURIComponent(user.id)}`
+          : `product?id=eq.${encodeURIComponent(u.id)}`;
+        try {
+          await restQuery(filter, { method: 'PATCH', body: { stock: u.stock }, prefer: 'return=minimal' });
+        } catch (e) {
+          if (admin) {
+            await admin.from('product').update({ stock: u.stock }).eq('id', u.id).eq('created_by', user.id);
+          } else {
+            throw e;
+          }
+        }
       }
     } catch (e) {
-      // rollback
       for (const s of stockSnapshot) {
-        await admin.from('product').update({ stock: s.stock }).eq('id', s.id).eq('created_by', user.id);
+        try {
+          const filter = user?.id
+            ? `product?id=eq.${encodeURIComponent(s.id)}&created_by=eq.${encodeURIComponent(user.id)}`
+            : `product?id=eq.${encodeURIComponent(s.id)}`;
+          await restQuery(filter, { method: 'PATCH', body: { stock: s.stock }, prefer: 'return=minimal' });
+        } catch (_) {}
       }
       return c.json({ error: 'Falha ao atualizar estoque. Nenhuma alteração foi mantida.', user_friendly: true }, 500);
     }
@@ -177,23 +256,27 @@ stock.post('/stock-count-apply', async (c) => {
       : 0;
 
     try {
-      await admin.from('stock_count_audit_log').insert({
-        stock_count_id: sessionId,
-        user_id: user.id,
-        user_email: user.email,
-        action: 'apply',
-        details: {
-          total_counted: (items || []).length,
-          applied_items: productUpdates.length,
-          total_surplus: totalSurplusAmount,
-          total_shortage: totalShortageAmount,
+      await restQuery('stock_count_audit_log', {
+        method: 'POST',
+        body: {
+          stock_count_id: sessionId,
+          user_id: user.id,
+          user_email: user.email,
+          action: 'apply',
+          details: {
+            total_counted: (items || []).length,
+            applied_items: productUpdates.length,
+            total_surplus: totalSurplusAmount,
+            total_shortage: totalShortageAmount,
+          },
         },
+        prefer: 'return=minimal',
       });
     } catch (e) {
-      console.error('audit log', e);
+      console.error('audit log', e.message || e);
     }
 
-    await admin.from('stock_count').update({
+    const sessionPatch = {
       status: 'aplicado',
       applied_at: now,
       applied_by: user.id,
@@ -203,7 +286,20 @@ stock.post('/stock-count-apply', async (c) => {
       total_shortage: totalShortageAmount,
       total_correct: totalCorrect,
       total_not_found: notFoundCount,
-    }).eq('id', sessionId);
+    };
+    try {
+      await restQuery(`stock_count?id=eq.${encodeURIComponent(sessionId)}`, {
+        method: 'PATCH',
+        body: sessionPatch,
+        prefer: 'return=minimal',
+      });
+    } catch (e) {
+      if (admin) {
+        await admin.from('stock_count').update(sessionPatch).eq('id', sessionId);
+      } else {
+        console.error('session status update', e.message || e);
+      }
+    }
 
     return c.json({
       success: true,

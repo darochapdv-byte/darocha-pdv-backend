@@ -185,6 +185,27 @@ entities.get('/:entity/:id', async (c) => {
       /* keep previous */
     }
   }
+  if ((error || !data) && (normalizeEntityName(entity) === 'StockCount' || normalizeEntityName(entity) === 'StockCountItem') && user?.id) {
+    try {
+      const table = tableFor(normalizeEntityName(entity));
+      let rows = await restQuery(
+        `${table}?id=eq.${encodeURIComponent(c.req.param('id'))}&created_by=eq.${encodeURIComponent(user.id)}&select=*&limit=1`
+      );
+      data = Array.isArray(rows) ? rows[0] : rows;
+      // StockCountItem pode não ter created_by — tenta só por id
+      if (!data && normalizeEntityName(entity) === 'StockCountItem') {
+        rows = await restQuery(`${table}?id=eq.${encodeURIComponent(c.req.param('id'))}&select=*&limit=1`);
+        data = Array.isArray(rows) ? rows[0] : rows;
+      }
+      if (!data && normalizeEntityName(entity) === 'StockCount') {
+        rows = await restQuery(`${table}?id=eq.${encodeURIComponent(c.req.param('id'))}&select=*&limit=1`);
+        data = Array.isArray(rows) ? rows[0] : rows;
+      }
+      error = data ? null : error;
+    } catch (e) {
+      /* keep previous */
+    }
+  }
   if (error) return c.json({ error: error.message }, 400);
   if (!data) return c.json({ error: 'not_found' }, 404);
   return c.json(toBase44Row(data));
@@ -337,6 +358,31 @@ entities.post('/:entity', async (c) => {
     return c.json({ error: msg }, 400);
   }
   let row = toBase44Row(data);
+  // StockCount: confirma persistência via REST (evita sessão fantasma)
+  if (normalizeEntityName(entity) === 'StockCount' && user?.id && row?.id) {
+    try {
+      let check = await restQuery(`stock_count?id=eq.${encodeURIComponent(row.id)}&select=*&limit=1`);
+      let found = Array.isArray(check) ? check[0] : check;
+      if (!found) {
+        // re-insere via REST se o insert js não persistiu de forma legível
+        const payload = {
+          status: body.status || 'em_andamento',
+          started_at: body.started_at || new Date().toISOString(),
+          started_by: body.started_by || user.id,
+          started_by_name: body.started_by_name || user.full_name || user.email || '',
+          created_by: user.id,
+          zero_missing: body.zero_missing === true,
+        };
+        const inserted = await restQuery('stock_count', { method: 'POST', body: payload, prefer: 'return=representation' });
+        found = Array.isArray(inserted) ? inserted[0] : inserted;
+        if (found) row = toBase44Row(found);
+      } else {
+        row = toBase44Row(found);
+      }
+    } catch (e) {
+      console.warn('stock_count verify', e.message || e);
+    }
+  }
   // Wishlist: verifica persistência e ownership (RLS às vezes engole SELECT depois do INSERT)
   if (normalizeEntityName(entity) === 'WishlistItem' && user?.id) {
     try {
@@ -435,7 +481,21 @@ entities.patch("/:entity/:id", async (c) => {
       ({ data, error } = await q.select().single());
     }
   }
+  // StockCount: PATCH via REST se o client não achar a linha (RLS / coerce)
+  if ((error || !data) && (normalizeEntityName(entity) === 'StockCount' || normalizeEntityName(entity) === 'StockCountItem')) {
+    try {
+      const patched = await restQuery(
+        `${table}?id=eq.${encodeURIComponent(c.req.param('id'))}`,
+        { method: 'PATCH', body, prefer: 'return=representation' }
+      );
+      data = Array.isArray(patched) ? patched[0] : patched;
+      if (data) error = null;
+    } catch (e) {
+      console.warn('stock_count patch rest', e.message || e);
+    }
+  }
   if (error) return c.json({ error: error.message }, 400);
+  if (!data) return c.json({ error: 'not_found' }, 404);
   const row = toBase44Row(data);
 
   if (
