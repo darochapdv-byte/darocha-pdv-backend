@@ -208,15 +208,27 @@ auth.post('/register', async (c) => {
     company_phone: extra.company_phone || null,
   });
 
-  // Conta nova começa zerada: cria AppSettings próprio
+  // Conta nova: AppSettings + catálogo habilitado (REST fallback se RLS travar)
   try {
-    await admin.from('app_settings').insert({
+    const seedSettings = {
       created_by: data.user.id,
       company_name: extra.company_name || null,
       catalog_enabled: true,
       catalog_max_qty_per_product: 10,
       catalog_stock_reserve: 0,
-    });
+      printer_print_mode: 'ask',
+      printer_copies: 1,
+    };
+    const { error: sErr } = await admin.from('app_settings').insert(seedSettings);
+    if (sErr) {
+      console.warn('app_settings seed admin', sErr.message);
+      try {
+        const { restQuery } = await import('./db.js');
+        await restQuery('app_settings', { method: 'POST', body: seedSettings, prefer: 'return=minimal' });
+      } catch (e2) {
+        console.warn('app_settings seed rest', e2.message || e2);
+      }
+    }
   } catch (e) {
     console.warn('app_settings seed on register', e.message || e);
   }

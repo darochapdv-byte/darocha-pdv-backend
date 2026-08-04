@@ -113,10 +113,21 @@ adminOps.post('/admin-stats', async (c) => {
     today.setHours(0, 0, 0, 0);
     const todayIso = today.toISOString();
 
-    const { data: sales } = await admin.from('sale').select('id,total,status,created_at,source').limit(5000);
-    const { data: products } = await admin.from('product').select('id,stock,active').limit(5000);
-    const { data: sessions } = await admin.from('cash_session').select('id,status').eq('status', 'aberto');
-    const { data: customers } = await admin.from('customer').select('id').limit(10000);
+    // Isolamento multi-tenant: só dados da loja logada
+    let salesQ = admin.from('sale').select('id,total,status,created_at,source').limit(5000);
+    let productsQ = admin.from('product').select('id,stock,active').limit(5000);
+    let sessionsQ = admin.from('cash_session').select('id,status').eq('status', 'aberto');
+    let customersQ = admin.from('customer').select('id').limit(10000);
+    if (user?.id) {
+      salesQ = salesQ.eq('created_by', user.id);
+      productsQ = productsQ.eq('created_by', user.id);
+      sessionsQ = sessionsQ.eq('created_by', user.id);
+      customersQ = customersQ.eq('created_by', user.id);
+    }
+    const { data: sales } = await salesQ;
+    const { data: products } = await productsQ;
+    const { data: sessions } = await sessionsQ;
+    const { data: customers } = await customersQ;
 
     const allSales = sales || [];
     const todaySales = allSales.filter((s) => s.created_at >= todayIso && s.status !== 'cancelado');
@@ -144,23 +155,27 @@ adminOps.post('/cleanup-cash-sessions', async (c) => {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
     const body = await c.req.json().catch(() => ({}));
-    const staleMinutes = Number(body.stale_minutes) || 120;
+    // default 12h — não fecha caixas de turno ativo
+    const staleMinutes = Math.max(30, Number(body.stale_minutes) || 720);
     const cutoff = new Date(Date.now() - staleMinutes * 60000).toISOString();
+    const closeAllStale = body.close_all === true;
 
-    const { data: open } = await admin.from('cash_session').select('*').eq('status', 'aberto').limit(200);
+    let q = admin.from('cash_session').select('*').eq('status', 'aberto').limit(500);
+    if (user?.id) q = q.eq('created_by', user.id);
+    const { data: open } = await q;
     let closed = 0;
     for (const s of open || []) {
-      const last = s.last_heartbeat || s.updated_at || s.created_at;
-      if (last && last < cutoff) {
-        await admin.from('cash_session').update({
+      const last = s.last_active_at || s.last_heartbeat || s.updated_at || s.created_at;
+      if (closeAllStale || (last && last < cutoff)) {
+        const { error } = await admin.from('cash_session').update({
           status: 'fechado',
           closed_at: new Date().toISOString(),
-          close_reason: 'cleanup_stale',
+          close_reason: closeAllStale ? 'cleanup_manual' : 'cleanup_stale',
         }).eq('id', s.id);
-        closed++;
+        if (!error) closed++;
       }
     }
-    return c.json({ ok: true, closed });
+    return c.json({ ok: true, closed, stale_minutes: staleMinutes, open_before: (open || []).length });
   } catch (error) {
     return c.json({ error: error.message }, 500);
   }

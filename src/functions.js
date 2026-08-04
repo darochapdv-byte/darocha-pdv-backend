@@ -117,10 +117,28 @@ functions.post('/open-cash-session', async (c) => {
       return c.json({ session: toBase44Row(session), resumed: true });
     }
 
-    // 2) Permite MÚLTIPLOS caixas abertos ao mesmo tempo.
-    //    Qualquer operador pode abrir um novo caixa em qualquer dispositivo.
-    //    (Não bloqueia mais por "terminal já ocupado" nem por "operador em outro device")
+    // 2) Fecha caixas zumbis da mesma loja (sem atividade há 12h+)
+    //    Mantém múltiplos caixas legítimos ativos no turno.
+    try {
+      const staleCut = new Date(Date.now() - 12 * 60 * 60000).toISOString();
+      let sq = admin.from('cash_session').select('id,last_active_at,last_heartbeat,updated_at,created_at')
+        .eq('status', 'aberto').eq('created_by', user.id).limit(200);
+      const { data: staleOpen } = await sq;
+      for (const s of staleOpen || []) {
+        const last = s.last_active_at || s.last_heartbeat || s.updated_at || s.created_at;
+        if (last && last < staleCut) {
+          await admin.from('cash_session').update({
+            status: 'fechado',
+            closed_at: new Date().toISOString(),
+            close_reason: 'auto_stale_on_open',
+          }).eq('id', s.id);
+        }
+      }
+    } catch (e) {
+      console.warn('stale cash cleanup on open', e?.message || e);
+    }
 
+    // 3) Permite MÚLTIPLOS caixas abertos ao mesmo tempo (turno real).
     const operatorIsVendedor = Array.isArray(body.operator_funcoes) && body.operator_funcoes.includes('vendedor');
     const payload = {
       opening_amount: Number(body.opening_amount) || 0,

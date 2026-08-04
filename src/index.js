@@ -74,6 +74,13 @@ app.get('/health', async (c) => {
   return c.json(body, dbOk ? 200 : 503);
 });
 
+app.onError((err, c) => {
+  console.error('unhandled', err?.message || err);
+  return c.json({ error: 'internal_error', message: err?.message || 'Erro interno' }, 500);
+});
+
+app.notFound((c) => c.json({ error: 'not_found' }, 404));
+
 app.route('/auth', auth);
 app.route('/entities', entities);
 app.route('/functions', catalog);
