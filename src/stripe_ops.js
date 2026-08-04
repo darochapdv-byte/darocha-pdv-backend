@@ -43,12 +43,42 @@ export async function ensureUniqueReferralCode() {
 }
 
 /**
+ * Normaliza payload de acesso para o frontend (camelCase + aliases legados).
+ * Front espera: hasAccess, status "trial", daysLeft.
+ */
+function withFrontendAccessFields(access) {
+  if (!access || typeof access !== 'object') return access;
+  const out = { ...access };
+  const allowed = access.allowed === true;
+  out.hasAccess = allowed;
+  out.allowed = allowed;
+
+  // Frontend usa "trial"; DB/Stripe usam "trialing"
+  if (access.status === 'trialing') {
+    out.status = 'trial';
+    out.status_raw = 'trialing';
+  }
+
+  if (access.days_left != null) {
+    out.daysLeft = access.days_left;
+    out.days_left = access.days_left;
+  }
+
+  if (access.price_brl != null) {
+    out.price = access.price_brl;
+    out.price_brl = access.price_brl;
+  }
+
+  return out;
+}
+
+/**
  * Status de acesso do usuário.
  * free / trial / active / lifetime / past_due / expired
  */
 export async function getAccessStatus(userId) {
   if (!admin || !userId) {
-    return { allowed: false, status: 'unknown', description: 'no_user' };
+    return withFrontendAccessFields({ allowed: false, status: 'unknown', description: 'no_user' });
   }
 
   const { data: subs } = await admin
@@ -60,60 +90,85 @@ export async function getAccessStatus(userId) {
 
   const sub = subs?.[0];
   if (!sub) {
-    return { allowed: false, status: 'none', description: 'no_subscription' };
+    return withFrontendAccessFields({ allowed: false, status: 'none', description: 'no_subscription' });
   }
 
   if (sub.permanent_free_access === true || sub.plan === 'lifetime' || sub.plan === 'dev_lifetime') {
-    return { allowed: true, status: 'lifetime', subscription: sub, price_brl: 0 };
+    return withFrontendAccessFields({
+      allowed: true,
+      status: 'lifetime',
+      subscription: sub,
+      price_brl: 0,
+    });
   }
 
   if (sub.status === 'active') {
     const price = sub.permanent_discount_active === true ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL;
-    return { allowed: true, status: 'active', subscription: sub, price_brl: price };
+    return withFrontendAccessFields({
+      allowed: true,
+      status: 'active',
+      subscription: sub,
+      price_brl: price,
+    });
   }
 
   if (sub.status === 'trialing') {
     const ends = sub.trial_end ? new Date(sub.trial_end) : null;
     if (ends && ends.getTime() > Date.now()) {
       const daysLeft = Math.ceil((ends.getTime() - Date.now()) / 86400000);
-      return {
+      return withFrontendAccessFields({
         allowed: true,
         status: 'trialing',
         subscription: sub,
         trial_end: sub.trial_end,
         days_left: daysLeft,
         price_brl: MONTHLY_PRICE_BRL,
-      };
+      });
     }
     // Trial acabou
-    return {
+    return withFrontendAccessFields({
       allowed: false,
       status: 'trial_expired',
       subscription: sub,
       trial_end: sub.trial_end,
       description: 'trial_expired',
       price_brl: MONTHLY_PRICE_BRL,
-    };
+    });
   }
 
   // free months credit (recompensa de indicação)
   if (sub.reward_free_months > 0) {
-    return {
+    return withFrontendAccessFields({
       allowed: true,
       status: 'free_credit',
       subscription: sub,
       reward_free_months: sub.reward_free_months,
       price_brl: sub.permanent_discount_active ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL,
-    };
+    });
   }
 
-  return {
+  return withFrontendAccessFields({
     allowed: false,
     status: sub.status || 'expired',
     subscription: sub,
     description: 'subscription_inactive',
     price_brl: MONTHLY_PRICE_BRL,
-  };
+  });
+}
+
+/** Garante que o perfil tenha referral_code (usuários antigos / bootstrap falhou) */
+export async function ensureUserReferralCode(userId) {
+  if (!admin || !userId) return null;
+  const { data: profile } = await admin
+    .from('profiles')
+    .select('id,referral_code')
+    .eq('id', userId)
+    .maybeSingle();
+  if (!profile) return null;
+  if (profile.referral_code) return profile.referral_code;
+  const code = await ensureUniqueReferralCode();
+  await admin.from('profiles').update({ referral_code: code }).eq('id', userId);
+  return code;
 }
 
 /** Cria trial de 30 dias + código de indicação no registro */
@@ -593,20 +648,31 @@ stripeOps.post('/init-subscription', async (c) => {
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
+    // Garante código de indicação mesmo para contas antigas
+    const referralCode = await ensureUserReferralCode(user.id);
+
     const { data: existing } = await admin
       .from('subscription')
       .select('*')
       .eq('user_id', user.id)
       .limit(1);
 
-    if (existing?.length) {
-      const access = await getAccessStatus(user.id);
-      return c.json({ subscription: existing[0], access });
+    let subscription = existing?.[0] || null;
+    if (!subscription) {
+      const result = await bootstrapNewUserSubscription(user.id, user.email, null);
+      subscription = result?.subscription || null;
     }
 
-    const result = await bootstrapNewUserSubscription(user.id, user.email, null);
     const access = await getAccessStatus(user.id);
-    return c.json({ subscription: result?.subscription, access });
+    return c.json({
+      subscription,
+      access,
+      referralCode: referralCode || null,
+      referral_code: referralCode || null,
+      trialDays: TRIAL_DAYS,
+      price: access?.price_brl ?? MONTHLY_PRICE_BRL,
+      price_brl: access?.price_brl ?? MONTHLY_PRICE_BRL,
+    });
   } catch (error) {
     return c.json({ error: error.message }, 500);
   }
@@ -651,6 +717,9 @@ stripeOps.post('/referral-panel', async (c) => {
     const user = await requireUser(c);
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    // Garante código próprio
+    await ensureUserReferralCode(user.id);
 
     const { data: profile } = await admin
       .from('profiles')

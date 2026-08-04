@@ -81,6 +81,18 @@ export async function getUserFromRequest(c) {
     }
   }
 
+  // Garante referral_code para contas antigas (sem apagar dados existentes)
+  let referralCode = profile?.referral_code || null;
+  if (!referralCode && profile?.id) {
+    try {
+      const { ensureUserReferralCode } = await import('./stripe_ops.js');
+      referralCode = await ensureUserReferralCode(user.id);
+      if (profile) profile.referral_code = referralCode;
+    } catch (e) {
+      console.warn('ensure referral on me', e.message || e);
+    }
+  }
+
   const base = {
     id: user.id,
     email: user.email,
@@ -90,7 +102,8 @@ export async function getUserFromRequest(c) {
     company_phone: profile?.company_phone || null,
     company_instagram: profile?.company_instagram || null,
     company_address: profile?.company_address || null,
-    referral_code: profile?.referral_code || null,
+    referral_code: referralCode,
+    referred_by_code: profile?.referred_by_code || null,
     full_name: profile?.company_name || user.email,
     data: profile || {},
   };
