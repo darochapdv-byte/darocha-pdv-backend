@@ -383,6 +383,34 @@ auth.patch('/me', async (c) => {
   return c.json(shape(data, requestedAddress !== undefined ? requestedAddress : undefined));
 });
 
+/** Lista provedores OAuth habilitados no Supabase (público) */
+auth.get('/providers', async (c) => {
+  try {
+    if (useLocal || !process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
+      return c.json({ google: false, email: true, mode: 'local' });
+    }
+    const base = process.env.SUPABASE_URL.replace(/\/$/, '');
+    const res = await fetch(`${base}/auth/v1/settings`, {
+      headers: {
+        apikey: process.env.SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
+      },
+    });
+    if (!res.ok) {
+      return c.json({ google: false, email: true, error: 'settings_unavailable' });
+    }
+    const settings = await res.json();
+    const ext = settings.external || {};
+    return c.json({
+      google: ext.google === true,
+      email: ext.email !== false,
+      apple: ext.apple === true,
+    });
+  } catch (e) {
+    return c.json({ google: false, email: true, error: e.message });
+  }
+});
+
 auth.post('/oauth', async (c) => {
   if (useLocal) {
     return c.json({
@@ -390,13 +418,56 @@ auth.post('/oauth', async (c) => {
       message: 'Google OAuth requer modo Supabase. Use e-mail/senha no modo local.',
     }, 501);
   }
-  const { provider, redirect_to } = await c.req.json();
+  const body = await c.req.json().catch(() => ({}));
+  const provider = String(body.provider || 'google').toLowerCase();
+  const redirect_to = body.redirect_to;
   if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+  // Confere se o provedor está ligado no Supabase (evita tela preta de erro)
+  try {
+    const base = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+    if (base && process.env.SUPABASE_ANON_KEY) {
+      const res = await fetch(`${base}/auth/v1/settings`, {
+        headers: {
+          apikey: process.env.SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
+        },
+      });
+      if (res.ok) {
+        const settings = await res.json();
+        const enabled = settings?.external?.[provider] === true;
+        if (!enabled) {
+          return c.json({
+            error: 'provider_not_enabled',
+            message:
+              provider === 'google'
+                ? 'Login com Google ainda não está ativado. Use e-mail e senha, ou ative o provedor Google no painel do Supabase (Authentication → Providers → Google) com Client ID e Secret do Google Cloud.'
+                : `Provedor "${provider}" não está habilitado no Supabase.`,
+          }, 400);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('oauth provider check', e.message || e);
+  }
+
   const { data, error } = await admin.auth.signInWithOAuth({
     provider,
-    options: { redirectTo: redirect_to },
+    options: {
+      redirectTo: redirect_to || process.env.APP_URL || 'https://dist-ten-mu-12.vercel.app/',
+    },
   });
-  if (error) return c.json({ error: error.message }, 400);
+  if (error) {
+    const msg = error.message || String(error);
+    if (/provider is not enabled|Unsupported provider/i.test(msg)) {
+      return c.json({
+        error: 'provider_not_enabled',
+        message:
+          'Login com Google ainda não está ativado no Supabase. Use e-mail e senha por enquanto.',
+      }, 400);
+    }
+    return c.json({ error: msg }, 400);
+  }
   return c.json({ url: data.url });
 });
 
