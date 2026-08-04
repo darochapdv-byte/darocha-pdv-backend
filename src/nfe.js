@@ -216,9 +216,17 @@ async function readImportPayload(c) {
 
 async function applyImport(user, parsed, { createProducts = true, updateStock = true } = {}) {
   const results = [];
+  let cadastrados = 0;
+  let existentes = 0;
+  let atualizados = 0;
+  let totalEstoque = 0;
+  let valorTotal = 0;
+
   for (const it of parsed.items) {
     let productId = it.product_id || null;
     let currentStock = 0;
+    let wasExisting = false;
+    let wasCreated = false;
 
     if (!productId && it.barcode) {
       const { data: found } = await admin
@@ -232,6 +240,7 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
       if (pick) {
         productId = pick.id;
         currentStock = Number(pick.stock) || 0;
+        wasExisting = true;
         if (!pick.created_by) {
           await admin.from('product').update({ created_by: user.id }).eq('id', pick.id);
         }
@@ -248,28 +257,53 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
       if (found?.[0]) {
         productId = found[0].id;
         currentStock = Number(found[0].stock) || 0;
+        wasExisting = true;
+      }
+    }
+
+    // match by name within store
+    if (!productId && it.name) {
+      const { data: found } = await admin
+        .from('product')
+        .select('id,stock,created_by')
+        .eq('name', it.name)
+        .eq('created_by', user.id)
+        .limit(1);
+      if (found?.[0]) {
+        productId = found[0].id;
+        currentStock = Number(found[0].stock) || 0;
+        wasExisting = true;
       }
     }
 
     const salePrice = Number(it.sale_price) || 0;
     const unitCost = Number(it.unit_cost) || 0;
+    const qty = Number(it.qty) || 0;
+    valorTotal += unitCost * qty;
 
     if (productId) {
       const patch = {};
-      if (unitCost) patch.cost = unitCost;
+      if (unitCost) {
+        patch.cost = unitCost;
+        atualizados += 1;
+      }
       if (salePrice > 0) patch.sale_price = salePrice;
       if (it.name) patch.name = it.name;
-      if (updateStock) patch.stock = currentStock + (Number(it.qty) || 0);
+      if (updateStock) {
+        patch.stock = currentStock + qty;
+        totalEstoque += qty;
+      }
       if (Object.keys(patch).length) {
         await admin.from('product').update(patch).eq('id', productId);
       }
+      existentes += 1;
     } else if (createProducts && it.name) {
       const insertPayload = {
         name: it.name,
         barcode: it.barcode || '',
         code: it.code || '',
         cost: unitCost,
-        stock: updateStock ? Number(it.qty) || 0 : 0,
+        stock: updateStock ? qty : 0,
         sale_price: salePrice,
         active: true,
         created_by: user.id,
@@ -288,8 +322,13 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
             productId = again.id;
             const patch = { created_by: user.id, cost: unitCost };
             if (salePrice > 0) patch.sale_price = salePrice;
-            if (updateStock) patch.stock = (Number(again.stock) || 0) + (Number(it.qty) || 0);
+            if (updateStock) {
+              patch.stock = (Number(again.stock) || 0) + qty;
+              totalEstoque += qty;
+            }
             await admin.from('product').update(patch).eq('id', productId);
+            existentes += 1;
+            atualizados += 1;
           }
         }
         if (!productId) {
@@ -298,10 +337,13 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
         }
       } else {
         productId = created?.id || null;
+        wasCreated = true;
+        cadastrados += 1;
+        if (updateStock) totalEstoque += qty;
       }
     }
 
-    results.push({ ...it, product_id: productId });
+    results.push({ ...it, product_id: productId, was_existing: wasExisting, was_created: wasCreated });
   }
 
   let importId = null;
@@ -327,7 +369,34 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
     console.warn('nfe_import skip', e?.message || e);
   }
 
-  return { results, importId };
+  // Stock entry history (best effort)
+  if (updateStock && results.length) {
+    try {
+      await admin.from('stock_entry').insert({
+        type: 'nfe',
+        nfe_import_id: importId,
+        items: results,
+        notes: `NF-e ${parsed.number || ''}`.trim(),
+        created_by: user.id,
+        status: 'ativa',
+      });
+    } catch (e) {
+      console.warn('stock_entry skip', e?.message || e);
+    }
+  }
+
+  return {
+    results,
+    importId,
+    stats: {
+      encontrados: results.length,
+      cadastrados,
+      existentes,
+      atualizados,
+      totalEstoque,
+      valorTotal: Math.round(valorTotal * 100) / 100,
+    },
+  };
 }
 
 nfe.post('/fetch-nfe-xml', async (c) => {
@@ -400,12 +469,16 @@ nfe.post('/import-nfe', async (c) => {
     );
 
     if ((!parsed || !parsed.items.length) && clientItems.length) {
+      const forn = body.nfe?.fornecedor;
+      const fornName = typeof forn === 'object' ? forn?.nome || forn?.name || '' : forn || '';
       parsed = {
-        nfe_key: String(body.nfe_key || body.chave || body.access_key || '').replace(/\D/g, ''),
-        number: String(body.number || body.nNF || body.nf_number || body.nfe?.number || ''),
-        series: String(body.series || body.serie || body.nfe?.series || ''),
-        issuer_name: String(body.issuer_name || body.emitter || body.supplier_name || body.nfe?.issuer_name || ''),
-        issuer_cnpj: String(body.issuer_cnpj || body.cnpj || body.nfe?.issuer_cnpj || '').replace(/\D/g, ''),
+        nfe_key: String(body.nfe_key || body.chave || body.access_key || body.nfe?.chave || '').replace(/\D/g, ''),
+        number: String(body.number || body.nNF || body.nf_number || body.nfe?.numero || body.nfe?.number || ''),
+        series: String(body.series || body.serie || body.nfe?.serie || body.nfe?.series || ''),
+        issuer_name: String(
+          body.issuer_name || body.emitter || body.supplier_name || body.nfe?.issuer_name || fornName || ''
+        ),
+        issuer_cnpj: String(body.issuer_cnpj || body.cnpj || body.nfe?.issuer_cnpj || forn?.cnpj || '').replace(/\D/g, ''),
         issued_at: body.issued_at || body.dhEmi || body.nfe?.issued_at || null,
         items: clientItems,
       };
@@ -461,11 +534,36 @@ nfe.post('/import-nfe', async (c) => {
     const createProducts = body.create_products !== false;
     const updateStock = body.update_stock !== false;
 
-    const { results, importId } = await applyImport(user, parsed, { createProducts, updateStock });
+    const { results, importId, stats } = await applyImport(user, parsed, { createProducts, updateStock });
+
+    const fornecedor =
+      parsed.issuer_name ||
+      body.nfe?.fornecedor?.nome ||
+      body.nfe?.fornecedor ||
+      body.issuer_name ||
+      '';
+    const numero = parsed.number || body.nfe?.numero || body.number || '';
+    const serie = parsed.series || body.nfe?.serie || body.series || '';
+
+    // Front exige `summary` — sem isso mostra "Erro desconhecido"
+    const summary = {
+      fornecedor,
+      numero,
+      serie,
+      encontrados: stats.encontrados,
+      cadastrados: stats.cadastrados,
+      existentes: stats.existentes,
+      atualizados: stats.atualizados,
+      totalEstoque: stats.totalEstoque,
+      valorTotal: stats.valorTotal,
+      dataImportacao: new Date().toISOString(),
+      import_id: importId,
+    };
 
     return c.json({
       ok: true,
       success: true,
+      summary,
       nfe: parsed,
       import_id: importId,
       items: results,
