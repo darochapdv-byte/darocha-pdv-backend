@@ -375,9 +375,12 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
     const entry_date = now.toISOString().slice(0, 10);
     const entry_time = now.toTimeString().slice(0, 5);
     const supplier = parsed.issuer_name || '';
-    const invoice_number = String(parsed.number || '');
-    const invoice_series = String(parsed.series || '');
-    const nfe_key = String(parsed.nfe_key || '');
+    const invoice_number = String(parsed.number || '').trim();
+    const invoice_series = String(parsed.series || '').trim();
+    const nfe_key = String(parsed.nfe_key || '').trim();
+    const invoice_label = invoice_number
+      ? `NF ${invoice_number}${invoice_series ? ' · Série ' + invoice_series : ''}`
+      : (nfe_key ? `Chave ${nfe_key.slice(0, 20)}…` : '');
     const user_name = user.full_name || user.email || '';
 
     for (const it of results) {
@@ -394,13 +397,14 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
         barcode: it.barcode || '',
         supplier,
         supplier_id: supplierId || null,
-        invoice_number,
+        invoice_number: invoice_label || invoice_number || null,
         invoice_series: invoice_series || null,
+        invoice_code: invoice_label || nfe_key || null,
         nfe_key: nfe_key || null,
         quantity: qty,
         unit_cost,
         total_value,
-        notes: `Entrada NF-e ${invoice_number}${invoice_series ? ' Série ' + invoice_series : ''}`.trim(),
+        notes: invoice_label ? `Entrada ${invoice_label}` : 'Entrada NF-e',
         entry_date,
         entry_time,
         user_id: user.id,
@@ -531,8 +535,12 @@ nfe.post('/import-nfe', async (c) => {
       const fornName = typeof forn === 'object' ? forn?.nome || forn?.name || '' : forn || '';
       parsed = {
         nfe_key: String(body.nfe_key || body.chave || body.access_key || body.nfe?.chave || '').replace(/\D/g, ''),
-        number: String(body.number || body.nNF || body.nf_number || body.nfe?.numero || body.nfe?.number || ''),
-        series: String(body.series || body.serie || body.nfe?.serie || body.nfe?.series || ''),
+        number: String(
+          body.number || body.nNF || body.nf_number || body.nfe?.numero || body.nfe?.number || body.nfe?.nNF || ''
+        ).trim(),
+        series: String(
+          body.series || body.serie || body.nfe?.serie || body.nfe?.series || body.nfe?.serie || ''
+        ).trim(),
         issuer_name: String(
           body.issuer_name || body.emitter || body.supplier_name || body.nfe?.issuer_name || fornName || ''
         ),
