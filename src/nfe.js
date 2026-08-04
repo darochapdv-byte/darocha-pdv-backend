@@ -633,4 +633,161 @@ nfe.post('/import-nfe', async (c) => {
   }
 });
 
+
+
+/**
+ * Reconstrói histórico de entradas a partir de:
+ * 1) nfe_import (se existir)
+ * 2) produtos da loja sem nenhuma StockEntry (estoque já cadastrado antes)
+ */
+nfe.post('/repair-stock-entry-history', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    const body = await c.req.json().catch(() => ({}));
+    const includeProductsWithoutEntry = body.include_products !== false;
+
+    // entradas já existentes (para não duplicar)
+    const { data: existing } = await admin
+      .from('stock_entry')
+      .select('id,product_id,invoice_number,quantity,notes,created_by')
+      .eq('created_by', user.id)
+      .limit(5000);
+    const existingKeys = new Set();
+    for (const e of existing || []) {
+      existingKeys.add(`${e.product_id}|${e.invoice_number || ''}|${e.quantity || 0}`);
+      if (e.product_id) existingKeys.add(`prod:${e.product_id}`);
+    }
+
+    let fromNfe = 0;
+    let fromProducts = 0;
+
+    // 1) nfe_import
+    try {
+      const { data: imports } = await admin
+        .from('nfe_import')
+        .select('*')
+        .or(`created_by.eq.${user.id},imported_by.eq.${user.id}`)
+        .limit(500);
+      for (const imp of imports || []) {
+        const items = Array.isArray(imp.items) ? imp.items : [];
+        const supplier = imp.issuer_name || '';
+        const invoice_number = String(imp.number || '');
+        const invoice_series = String(imp.series || '');
+        const nfe_key = String(imp.nfe_key || '');
+        const created = imp.created_at ? new Date(imp.created_at) : new Date();
+        const entry_date = created.toISOString().slice(0, 10);
+        const entry_time = created.toTimeString().slice(0, 5);
+
+        for (const it of items) {
+          const productId = it.product_id || null;
+          if (!productId) continue;
+          const qty = Number(it.qty || it.quantity || 0) || 0;
+          const unit_cost = Number(it.unit_cost || it.cost || 0) || 0;
+          const key = `${productId}|${invoice_number}|${qty}`;
+          if (existingKeys.has(key)) continue;
+
+          const row = {
+            product_id: productId,
+            product_name: it.name || it.product_name || '',
+            barcode: it.barcode || '',
+            supplier,
+            invoice_number,
+            invoice_series: invoice_series || null,
+            nfe_key: nfe_key || null,
+            quantity: qty,
+            unit_cost,
+            total_value: Math.round(qty * unit_cost * 100) / 100,
+            notes: `Entrada NF-e ${invoice_number} (histórico reconstruído)`.trim(),
+            entry_date,
+            entry_time,
+            user_id: user.id,
+            user_name: user.full_name || user.email || '',
+            status: 'ativa',
+            created_by: user.id,
+          };
+          const { error } = await admin.from('stock_entry').insert(row);
+          if (!error) {
+            fromNfe += 1;
+            existingKeys.add(key);
+            existingKeys.add(`prod:${productId}`);
+          } else {
+            const slim = { ...row };
+            delete slim.invoice_series;
+            delete slim.nfe_key;
+            const r2 = await admin.from('stock_entry').insert(slim);
+            if (!r2.error) {
+              fromNfe += 1;
+              existingKeys.add(key);
+              existingKeys.add(`prod:${productId}`);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('nfe_import backfill', e?.message || e);
+    }
+
+    // 2) produtos com estoque e sem nenhuma entrada
+    if (includeProductsWithoutEntry) {
+      const { data: products } = await admin
+        .from('product')
+        .select('id,name,barcode,code,stock,cost,sale_price,created_at,created_by')
+        .eq('created_by', user.id)
+        .limit(5000);
+
+      for (const p of products || []) {
+        if (existingKeys.has(`prod:${p.id}`)) continue;
+        const stock = Number(p.stock) || 0;
+        // mesmo com estoque 0, se o produto existe pode ter tido entrada; só registra se stock > 0
+        // ou se nunca teve entrada — usuário pediu ver o que já cadastrou
+        if (stock <= 0) continue;
+
+        const unit_cost = Number(p.cost) || 0;
+        const created = p.created_at ? new Date(p.created_at) : new Date();
+        const row = {
+          product_id: p.id,
+          product_name: p.name || '',
+          barcode: p.barcode || p.code || '',
+          supplier: 'Cadastro / importação anterior',
+          invoice_number: '',
+          quantity: stock,
+          unit_cost,
+          total_value: Math.round(stock * unit_cost * 100) / 100,
+          notes: 'Registro retrospectivo do estoque já existente (antes do histórico automático)',
+          entry_date: created.toISOString().slice(0, 10),
+          entry_time: created.toTimeString().slice(0, 5),
+          user_id: user.id,
+          user_name: user.full_name || user.email || '',
+          status: 'ativa',
+          created_by: user.id,
+        };
+        const { error } = await admin.from('stock_entry').insert(row);
+        if (!error) {
+          fromProducts += 1;
+          existingKeys.add(`prod:${p.id}`);
+        } else {
+          console.warn('product backfill entry', error.message);
+        }
+      }
+    }
+
+    return c.json({
+      ok: true,
+      from_nfe_imports: fromNfe,
+      from_products: fromProducts,
+      total_created: fromNfe + fromProducts,
+      message:
+        fromNfe + fromProducts > 0
+          ? `${fromNfe + fromProducts} entrada(s) adicionada(s) ao histórico.`
+          : 'Nada novo para reconstruir (histórico já estava completo ou sem dados).',
+    });
+  } catch (error) {
+    console.error('repair-stock-entry-history', error);
+    return c.json({ error: error.message }, 500);
+  }
+});
+
 export default nfe;
