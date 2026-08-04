@@ -159,16 +159,35 @@ export async function getAccessStatus(userId) {
 /** Garante que o perfil tenha referral_code (usuários antigos / bootstrap falhou) */
 export async function ensureUserReferralCode(userId) {
   if (!admin || !userId) return null;
-  const { data: profile } = await admin
+  const { data: profile, error: selErr } = await admin
     .from('profiles')
     .select('id,referral_code')
     .eq('id', userId)
     .maybeSingle();
-  if (!profile) return null;
-  if (profile.referral_code) return profile.referral_code;
+  if (selErr) {
+    console.error('ensureUserReferralCode select', selErr.message);
+    return null;
+  }
+  if (!profile) {
+    console.warn('ensureUserReferralCode: profile not found', userId);
+    return null;
+  }
+  if (profile.referral_code && String(profile.referral_code).trim()) {
+    return String(profile.referral_code).trim().toUpperCase();
+  }
   const code = await ensureUniqueReferralCode();
-  await admin.from('profiles').update({ referral_code: code }).eq('id', userId);
-  return code;
+  const { data: updated, error: upErr } = await admin
+    .from('profiles')
+    .update({ referral_code: code })
+    .eq('id', userId)
+    .select('id,referral_code')
+    .maybeSingle();
+  if (upErr) {
+    console.error('ensureUserReferralCode update', upErr.message, upErr.details || '', upErr.hint || '');
+    // fallback: tentar via raw se coluna existir com outro nome
+    return null;
+  }
+  return updated?.referral_code || code;
 }
 
 /** Cria trial de 30 dias + código de indicação no registro */
@@ -791,7 +810,31 @@ stripeOps.post('/referral-panel', async (c) => {
   }
 });
 
+/** Força geração/retorno do código de indicação do usuário logado */
+stripeOps.post('/ensure-referral-code', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const code = await ensureUserReferralCode(user.id);
+    const { data: profile, error } = await admin
+      .from('profiles')
+      .select('id,referral_code,referred_by_code,referred_by_user_id')
+      .eq('id', user.id)
+      .maybeSingle();
+    return c.json({
+      ok: !!code,
+      referral_code: code || profile?.referral_code || null,
+      profile,
+      error: error?.message || null,
+    });
+  } catch (error) {
+    return c.json({ error: error.message }, 500);
+  }
+});
+
 /** Uso interno: status do código master (só loga, não expõe na UI) */
+
 stripeOps.post('/master-code-status', async (c) => {
   try {
     const user = await requireUser(c);
