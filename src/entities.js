@@ -136,6 +136,40 @@ entities.get('/:entity', async (c) => {
       console.warn('wishlist list rest', e.message || e);
     }
   }
+  // StockCount / StockCountItem: REST fallback (SELECT às vezes some por RLS)
+  if ((normalizeEntityName(entity) === 'StockCount' || normalizeEntityName(entity) === 'StockCountItem') && user?.id && (!rows || rows.length === 0)) {
+    try {
+      const table = tableFor(normalizeEntityName(entity));
+      let rowsRest = [];
+      try {
+        rowsRest = await restQuery(
+          `${table}?created_by=eq.${encodeURIComponent(user.id)}&select=*&order=created_at.desc&limit=${limit}`
+        );
+      } catch (_) {}
+      if (!Array.isArray(rowsRest) || !rowsRest.length) {
+        try {
+          const all = await restQuery(`${table}?select=*&order=created_at.desc&limit=${Math.min(Number(limit) || 100, 200)}`);
+          if (Array.isArray(all)) {
+            rowsRest = all.filter(
+              (r) => r.created_by === user.id || r.started_by === user.id
+            );
+          }
+        } catch (_) {}
+      }
+      const scId = c.req.query('stock_count_id');
+      if (normalizeEntityName(entity) === 'StockCountItem' && scId) {
+        try {
+          const bySession = await restQuery(
+            `stock_count_item?stock_count_id=eq.${encodeURIComponent(scId)}&select=*&limit=${limit}`
+          );
+          if (Array.isArray(bySession) && bySession.length) rowsRest = bySession;
+        } catch (_) {}
+      }
+      if (Array.isArray(rowsRest) && rowsRest.length) rows = toBase44Rows(rowsRest);
+    } catch (e) {
+      console.warn('stock_count list rest', e.message || e);
+    }
+  }
   if (entity === 'AppSettings' && Array.isArray(rows)) {
     const allow = await getAllowZeroStock();
     const enriched = [];

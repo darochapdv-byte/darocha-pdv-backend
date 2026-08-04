@@ -18,7 +18,6 @@ stock.post('/start-stock-count', async (c) => {
       started_by: body.started_by || user.id || null,
       started_by_name: body.started_by_name || user.full_name || user.email || '',
       created_by: user.id,
-      zero_missing: body.zero_missing === true,
     };
 
     // Prefer REST (service role) — supabase-js às vezes "insere" sem persistir legível em stock_count
@@ -62,36 +61,58 @@ stock.post('/stock-count-search', async (c) => {
 
     let products = [];
 
-    // 1) REST service role
-    try {
-      const path = user?.id
-        ? `product?created_by=eq.${encodeURIComponent(user.id)}&select=id,name,barcode,code,brand,category,stock,sale_price,cost_price,image_url,active&limit=5000`
-        : `product?select=id,name,barcode,code,brand,category,stock,sale_price,cost_price,image_url,active&limit=5000`;
-      const rows = await restQuery(path);
-      if (Array.isArray(rows)) products = rows;
-    } catch (e) {
-      console.warn('stock-count-search rest', e.message);
-    }
-
-    // 2) fallback admin
-    if (!products.length && admin) {
-      let pq = admin
-        .from('product')
-        .select('id,name,barcode,code,brand,category,stock,sale_price,cost_price,image_url,active')
-        .limit(5000);
+    // Mesmo caminho do CRUD de Product (admin + tenant)
+    if (admin) {
+      let pq = admin.from('product').select('*').limit(10000);
       if (user?.id) pq = pq.eq('created_by', user.id);
       const { data, error } = await pq;
       if (error) console.warn('stock-count-search admin', error.message);
       products = data || [];
     }
 
-    const matched = products.filter((p) => {
-      const name = String(p.name || '').toLowerCase();
-      const barcode = String(p.barcode || '').toLowerCase();
-      const code = String(p.code || '').toLowerCase();
-      const brand = String(p.brand || '').toLowerCase();
-      return name.includes(q) || barcode.includes(q) || code.includes(q) || brand.includes(q);
-    }).slice(0, 50);
+    if (!products.length) {
+      try {
+        const pathQ = user?.id
+          ? `product?created_by=eq.${encodeURIComponent(user.id)}&select=*&limit=10000`
+          : `product?select=*&limit=10000`;
+        const rows = await restQuery(pathQ);
+        if (Array.isArray(rows)) products = rows;
+      } catch (e) {
+        console.warn('stock-count-search rest', e.message);
+      }
+    }
+
+    const matched = products
+      .filter((p) => {
+        const name = String(p.name || '').toLowerCase();
+        const barcode = String(p.barcode || '').toLowerCase();
+        const code = String(p.code || '').toLowerCase();
+        const brand = String(p.brand || '').toLowerCase();
+        const sku = String(p.sku || '').toLowerCase();
+        const ref = String(p.reference || '').toLowerCase();
+        return (
+          name.includes(q) ||
+          barcode.includes(q) ||
+          code.includes(q) ||
+          brand.includes(q) ||
+          sku.includes(q) ||
+          ref.includes(q)
+        );
+      })
+      .slice(0, 50)
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        barcode: p.barcode,
+        code: p.code,
+        brand: p.brand,
+        category: p.category,
+        stock: p.stock,
+        sale_price: p.sale_price,
+        cost_price: p.cost_price,
+        image_url: p.image_url,
+        active: p.active,
+      }));
 
     return c.json({ products: matched });
   } catch (error) {
