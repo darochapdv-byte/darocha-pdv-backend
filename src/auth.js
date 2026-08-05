@@ -463,10 +463,27 @@ auth.post('/oauth', async (c) => {
     console.warn('oauth provider check', e.message || e);
   }
 
+  // Nunca redirecionar para localhost em produção (evita tela ERR_CONNECTION_REFUSED no celular)
+  const APP = (process.env.APP_URL || 'https://dist-ten-mu-12.vercel.app').replace(/\/$/, '');
+  let finalRedirect = (redirect_to || APP || '').toString();
+  if (!finalRedirect || /localhost|127\.0\.0\.1|capacitor:\/\/|file:/i.test(finalRedirect)) {
+    finalRedirect = APP + '/';
+  }
+  if (!finalRedirect.startsWith('http')) finalRedirect = APP + '/';
+  // Garante origem permitida
+  try {
+    const u = new URL(finalRedirect);
+    if (!u.hostname.includes('vercel.app') && u.hostname !== 'dist-ten-mu-12.vercel.app') {
+      finalRedirect = APP + '/';
+    }
+  } catch {
+    finalRedirect = APP + '/';
+  }
+
   const { data, error } = await admin.auth.signInWithOAuth({
     provider,
     options: {
-      redirectTo: redirect_to || process.env.APP_URL || 'https://dist-ten-mu-12.vercel.app/',
+      redirectTo: finalRedirect,
     },
   });
   if (error) {
