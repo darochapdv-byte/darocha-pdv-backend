@@ -193,7 +193,7 @@ export function buildStorePublicUrl(slug, path = '') {
   const s = normalizeSlug(slug);
   const apex = String(process.env.APEX_DOMAIN || 'darochapdv.com').replace(/^www\./, '');
   const useSub = process.env.USE_SUBDOMAIN_URLS !== 'false';
-  const legacyBase = String(process.env.FRONTEND_URL || 'https://dist-ten-mu-12.vercel.app').replace(/\/$/, '');
+  const legacyBase = String(process.env.FRONTEND_URL || process.env.APP_URL || 'https://darochapdv.com').replace(/\/$/, '');
   if (!s) return legacyBase;
   const p = path ? (path.startsWith('/') ? path : `/${path}`) : '';
   if (useSub) {

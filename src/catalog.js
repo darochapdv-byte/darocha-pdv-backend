@@ -40,7 +40,8 @@ function extractSlugFromRequest(c, body = {}) {
     const hm = host.match(/^([a-z0-9-]+)\.(?:darochapdv\.com|[^.]+\.vercel\.app)$/i);
     if (hm) {
       const sub = hm[1];
-      if (sub && sub !== 'www' && sub !== 'api') slug = sub;
+      const reservedHost = new Set(['www','api','app','admin','mail','ftp','cdn','static','assets','dashboard','painel','suporte','support']);
+      if (sub && !reservedHost.has(sub)) slug = sub;
     }
   }
   return normalizeSlug(slug);

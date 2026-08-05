@@ -126,6 +126,20 @@ export async function getUserFromRequest(c) {
 auth.get('/me', async (c) => {
   const user = await getUserFromRequest(c);
   if (!user) return c.json({ error: 'unauthorized' }, 401);
+  // Indica se o Host atual (subdomínio) pertence a outra loja
+  try {
+    const host = (c.req.header('X-Forwarded-Host') || c.req.header('Host') || '').split(',')[0].trim().toLowerCase();
+    const hm = host.match(/^([a-z0-9-]+)\.(?:darochapdv\.com)$/i);
+    const hostSlug = hm && hm[1] !== 'www' && hm[1] !== 'api' ? hm[1] : null;
+    if (hostSlug && user.catalog_slug && hostSlug !== user.catalog_slug) {
+      user.host_slug = hostSlug;
+      user.tenant_mismatch = true;
+      user.tenant_warning = `Você está no link da loja "${hostSlug}", mas sua conta é da loja "${user.catalog_slug}".`;
+    } else if (hostSlug) {
+      user.host_slug = hostSlug;
+      user.tenant_mismatch = false;
+    }
+  } catch (_) { /* ignore */ }
   return c.json(user);
 });
 
@@ -515,7 +529,7 @@ auth.post('/reset-password', async (c) => {
   }
   if (!admin) return c.json({ error: 'db_unavailable' }, 503);
   const { error } = await admin.auth.resetPasswordForEmail(email, {
-    redirectTo: redirect_to || process.env.APP_URL || 'http://localhost:5173/reset-password',
+    redirectTo: redirect_to || process.env.APP_URL || 'https://darochapdv.com/reset-password',
   });
   if (error) return c.json({ error: error.message }, 400);
   return c.json({ ok: true });

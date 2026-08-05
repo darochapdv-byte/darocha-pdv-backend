@@ -634,10 +634,10 @@ stripeOps.post('/create-checkout', async (c) => {
 
     const successUrl =
       body.success_url ||
-      `${process.env.APP_URL || 'https://dist-ten-mu-12.vercel.app'}/assinatura?success=1`;
+      `${process.env.APP_URL || 'https://darochapdv.com'}/assinatura?success=1`;
     const cancelUrl =
       body.cancel_url ||
-      `${process.env.APP_URL || 'https://dist-ten-mu-12.vercel.app'}/assinatura?canceled=1`;
+      `${process.env.APP_URL || 'https://darochapdv.com'}/assinatura?canceled=1`;
 
     if (!priceId) return c.json({ error: 'price_id obrigatório — configure STRIPE_PRICE_ID' }, 400);
 
