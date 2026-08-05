@@ -112,7 +112,7 @@ entities.get('/:entity', async (c) => {
   const table = tableFor(entity);
   // Product: default alto — PDV precisa listar o catálogo inteiro da loja
   const entityNorm = normalizeEntityName(entity);
-  const defaultLimit = entityNorm === 'Product' ? 5000 : 100;
+  const defaultLimit = entityNorm === 'Product' ? 5000 : entityNorm === 'Sale' ? 5000 : 100;
   const limit = Math.min(Number(c.req.query('limit') || defaultLimit), 10000);
   const { column, ascending } = parseOrder(c.req.query('order'));
   const db = clientFrom(c);
@@ -732,6 +732,7 @@ entities.patch("/:entity/:id", async (c) => {
 
 entities.delete('/:entity/:id', async (c) => {
   const entity = c.req.param('entity');
+  const entityNorm = normalizeEntityName(entity);
   const table = tableFor(entity);
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
@@ -740,6 +741,41 @@ entities.delete('/:entity/:id', async (c) => {
   if (isTenantEntity(entity) && !user?.id) {
     return c.json({ error: 'Unauthorized' }, 401);
   }
+
+  // PROTEÇÃO: vendas NUNCA são apagadas do banco.
+  // Conclusão/histórico financeiro permanece para sempre.
+  // "Excluir" vira cancelamento (status cancelada) — o registro continua existindo.
+  if (entityNorm === 'Sale') {
+    const id = c.req.param('id');
+    let find = db.from(table).select('id,status,total,created_by').eq('id', id);
+    find = applyTenantFilter(find, entity, user);
+    const { data: sale, error: findErr } = await find.maybeSingle();
+    if (findErr) return c.json({ error: findErr.message }, 400);
+    if (!sale) return c.json({ error: 'Venda não encontrada' }, 404);
+
+    const st = String(sale.status || '').toLowerCase();
+    if (st === 'cancelada' || st === 'cancelado') {
+      return c.json({ ok: true, soft: true, status: sale.status, message: 'Venda já estava cancelada. Registro preservado.' });
+    }
+
+    let q = db.from(table).update({
+      status: 'cancelada',
+      canceled_at: new Date().toISOString(),
+      cancel_reason: 'exclusao_protegida_historico',
+    }).eq('id', id);
+    q = applyTenantFilter(q, entity, user);
+    const { data: updated, error } = await q.select().maybeSingle();
+    if (error) {
+      // fallback se colunas extras não existirem no schema
+      let q2 = db.from(table).update({ status: 'cancelada' }).eq('id', id);
+      q2 = applyTenantFilter(q2, entity, user);
+      const { error: e2 } = await q2;
+      if (e2) return c.json({ error: e2.message }, 400);
+      return c.json({ ok: true, soft: true, status: 'cancelada', message: 'Venda cancelada. Histórico preservado (não apagado).' });
+    }
+    return c.json({ ok: true, soft: true, status: 'cancelada', sale: toBase44Row(updated), message: 'Venda cancelada. Histórico preservado (não apagado).' });
+  }
+
   let q = db.from(table).delete().eq('id', c.req.param('id'));
   q = applyTenantFilter(q, entity, user);
 
