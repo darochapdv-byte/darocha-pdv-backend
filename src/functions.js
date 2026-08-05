@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin } from './db.js';
-import { logOperation, releaseSessionReservations, requireUser, stackOf, sanitizeDateFields, toBase44Row, toBase44Rows, getAllowZeroStock, upsertCustomer, ensureCatalogSlug } from './helpers.js';
+import { logOperation, releaseSessionReservations, requireUser, stackOf, sanitizeDateFields, toBase44Row, toBase44Rows, getAllowZeroStock, upsertCustomer, ensureCatalogSlug, buildStorePublicUrl } from './helpers.js';
 import { registerCashMovement } from './integration.js';
 import { getAccessStatus } from './stripe_ops.js';
 
@@ -727,10 +727,7 @@ functions.post('/app-bootstrap', async (c) => {
       try {
         catalog_slug = await ensureCatalogSlug(uid, settings[0].company_name || user.company_name || null);
       } catch (_) {}
-      const frontendBase = process.env.FRONTEND_URL || process.env.APP_URL || 'https://dist-ten-mu-12.vercel.app';
-      const catalog_url = catalog_slug
-        ? `${String(frontendBase).replace(/\/$/, '')}/catalogo?loja=${encodeURIComponent(catalog_slug)}`
-        : null;
+      const catalog_url = catalog_slug ? buildStorePublicUrl(catalog_slug) : null;
       settings = settings.map((r) => ({
         ...r,
         allow_zero_stock: allowZero === true,

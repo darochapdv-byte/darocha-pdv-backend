@@ -152,17 +152,58 @@ export function toBase44Rows(rows) {
 const ZERO_STOCK_SETTING_TYPE = 'system_setting_allow_zero_stock';
 const CATALOG_SLUG_TYPE = 'catalog_slug';
 
-/** Gera slug a partir do nome da loja (minúsculo, sem acento, só a-z0-9). */
-export function slugifyStoreName(name) {
-  if (!name || typeof name !== 'string') return '';
-  return name
-    .toString()
+/** Subdomínios/slugs reservados (não podem ser usados por lojas). */
+export const RESERVED_SLUGS = new Set([
+  'www', 'app', 'api', 'admin', 'suporte', 'mail', 'ftp', 'dashboard', 'painel',
+  'static', 'assets', 'cdn', 'login', 'register', 'catalogo', 'catalog', 'help',
+  'status', 'billing', 'stripe', 'webhook', 'user', 'users', 'store', 'stores',
+  'darocha', 'darochapdv', 'root', 'null', 'undefined', 'test', 'demo',
+]);
+
+/** Normaliza slug: minúsculo, a-z, 0-9 e hífen. */
+export function normalizeSlug(slug) {
+  if (!slug || typeof slug !== 'string') return '';
+  return String(slug)
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '')
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 48);
+}
+
+/** Gera slug a partir do nome da loja (minúsculo, sem acento, hífens). */
+export function slugifyStoreName(name) {
+  if (!name || typeof name !== 'string') return '';
+  return normalizeSlug(name);
+}
+
+export function isReservedSlug(slug) {
+  const s = normalizeSlug(slug);
+  return !s || RESERVED_SLUGS.has(s);
+}
+
+/**
+ * URL pública da loja.
+ * Preferência: https://{slug}.darochapdv.com
+ * Fallback legado: /catalogo?loja=slug
+ */
+export function buildStorePublicUrl(slug, path = '') {
+  const s = normalizeSlug(slug);
+  const apex = String(process.env.APEX_DOMAIN || 'darochapdv.com').replace(/^www\./, '');
+  const useSub = process.env.USE_SUBDOMAIN_URLS !== 'false';
+  const legacyBase = String(process.env.FRONTEND_URL || 'https://dist-ten-mu-12.vercel.app').replace(/\/$/, '');
+  if (!s) return legacyBase;
+  const p = path ? (path.startsWith('/') ? path : `/${path}`) : '';
+  if (useSub) {
+    return `https://${s}.${apex}${p}`;
+  }
+  if (!p || p === '/' || p.startsWith('/catalogo')) {
+    return `${legacyBase}/catalogo?loja=${encodeURIComponent(s)}`;
+  }
+  const sep = p.includes('?') ? '&' : '?';
+  return `${legacyBase}${p}${sep}loja=${encodeURIComponent(s)}`;
 }
 
 /** Lista todos os slugs já registrados (operational_log). */
@@ -207,7 +248,8 @@ export async function generateUniqueCatalogSlug(companyName, userId) {
 
   let candidate = base;
   let n = 2;
-  while (taken.has(candidate)) {
+  // Evita slugs reservados e colisões
+  while (taken.has(candidate) || isReservedSlug(candidate)) {
     candidate = `${base}${n}`.slice(0, 48);
     n += 1;
     if (n > 9999) {
@@ -221,7 +263,8 @@ export async function generateUniqueCatalogSlug(companyName, userId) {
 /** Persiste o slug da loja (único). */
 export async function setCatalogSlug(userId, slug) {
   if (!admin || !userId || !slug) return false;
-  const normalized = String(slug).toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 48);
+  const normalized = normalizeSlug(slug);
+  if (isReservedSlug(normalized)) throw new Error('Este endereço (slug) é reservado. Escolha outro.');
   if (!normalized) return false;
 
   const existing = await listCatalogSlugs();
@@ -284,10 +327,15 @@ export async function ensureCatalogSlug(userId, companyName) {
 /** Resolve loja a partir do slug do catálogo. Retorna { userId, slug } ou null. */
 export async function resolveStoreBySlug(slug) {
   if (!slug) return null;
-  const normalized = String(slug).toLowerCase().replace(/[^a-z0-9]/g, '');
-  if (!normalized) return null;
+  const normalized = normalizeSlug(slug);
+  const compact = normalized.replace(/-/g, '');
+  if (!normalized && !compact) return null;
+  if (isReservedSlug(normalized)) return null;
   const existing = await listCatalogSlugs();
-  const hit = existing.find((e) => e.slug === normalized);
+  const hit = existing.find((e) => {
+    const es = normalizeSlug(e.slug);
+    return es === normalized || es.replace(/-/g, '') === compact || String(e.slug).toLowerCase() === compact;
+  });
   if (!hit) return null;
   return { userId: hit.user_id, slug: hit.slug };
 }

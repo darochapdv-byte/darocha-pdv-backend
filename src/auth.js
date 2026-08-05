@@ -113,10 +113,8 @@ export async function getUserFromRequest(c) {
     const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(null), 5000));
     const slug = await Promise.race([slugPromise, timeoutPromise]);
     base.catalog_slug = slug;
-    const frontendBase = process.env.FRONTEND_URL || 'https://dist-ten-mu-12.vercel.app';
-    base.catalog_url = slug
-      ? `${frontendBase.replace(/\/$/, '')}/catalogo?loja=${encodeURIComponent(slug)}`
-      : null;
+    const { buildStorePublicUrl } = await import('./helpers.js');
+    base.catalog_url = slug ? buildStorePublicUrl(slug) : null;
   } catch (e) {
     console.warn('catalog slug on me', e.message || e);
     base.catalog_slug = null;

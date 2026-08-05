@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin, userClient, tableFor, restQuery } from './db.js';
-import { sanitizeDateFields, sanitizeEntityBody, toBase44Row, toBase44Rows, requireUser, getAllowZeroStock, setAllowZeroStock, ensureCatalogSlug } from './helpers.js';
+import { sanitizeDateFields, sanitizeEntityBody, toBase44Row, toBase44Rows, requireUser, getAllowZeroStock, setAllowZeroStock, ensureCatalogSlug, buildStorePublicUrl } from './helpers.js';
 import { getAccessStatus } from './stripe_ops.js';
 import { applySaleCancellationSideEffects } from './integration.js';
 
@@ -280,10 +280,7 @@ entities.get('/:entity', async (c) => {
           console.warn('catalog_slug enrich', e.message || e);
         }
       }
-      const frontendBase = process.env.FRONTEND_URL || 'https://dist-ten-mu-12.vercel.app';
-      const catalog_url = catalog_slug
-        ? `${frontendBase.replace(/\/$/, '')}/catalogo?loja=${encodeURIComponent(catalog_slug)}`
-        : null;
+      const catalog_url = catalog_slug ? buildStorePublicUrl(catalog_slug) : null;
       enriched.push({ ...r, allow_zero_stock: allow, catalog_slug, catalog_url });
     }
     rows = enriched;

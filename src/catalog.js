@@ -10,11 +10,13 @@ import {
   setCatalogSlug,
   requireUser,
   getAllowZeroStock,
+  buildStorePublicUrl,
+  normalizeSlug,
 } from './helpers.js';
 
 const catalog = new Hono();
 
-/** Extrai slug da loja do body, query ou Referer (app antigo não envia loja no body). */
+/** Extrai slug: body, query, Referer ou subdomínio do Host (ex: eldorado.darochapdv.com). */
 function extractSlugFromRequest(c, body = {}) {
   let slug = String(body?.slug || body?.loja || body?.store || '').trim();
   if (!slug) {
@@ -26,12 +28,22 @@ function extractSlugFromRequest(c, body = {}) {
   if (!slug) {
     const ref = c.req.header('Referer') || c.req.header('Referrer') || '';
     const m =
-      ref.match(/[?&]loja=([a-zA-Z0-9]+)/) ||
-      ref.match(/[?&]slug=([a-zA-Z0-9]+)/) ||
-      ref.match(/\/catalogo\/([a-zA-Z0-9]+)/);
+      ref.match(/[?&]loja=([a-zA-Z0-9-]+)/) ||
+      ref.match(/[?&]slug=([a-zA-Z0-9-]+)/) ||
+      ref.match(/\/catalogo\/([a-zA-Z0-9-]+)/) ||
+      ref.match(/https?:\/\/([a-z0-9-]+)\.darochapdv\.com/i);
     if (m) slug = m[1];
   }
-  return String(slug || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!slug) {
+    const host = (c.req.header('X-Forwarded-Host') || c.req.header('Host') || '').split(',')[0].trim().toLowerCase();
+    // eldorado.darochapdv.com ou eldorado.dist-ten-mu-12.vercel.app
+    const hm = host.match(/^([a-z0-9-]+)\.(?:darochapdv\.com|[^.]+\.vercel\.app)$/i);
+    if (hm) {
+      const sub = hm[1];
+      if (sub && sub !== 'www' && sub !== 'api') slug = sub;
+    }
+  }
+  return normalizeSlug(slug);
 }
 
 
@@ -230,8 +242,7 @@ catalog.post('/my-catalog-link', async (c) => {
     const { data: profile } = await admin.from('profiles').select('company_name,referral_code').eq('id', user.id).maybeSingle();
     const slug = await ensureCatalogSlug(user.id, profile?.company_name || null);
 
-    const frontendBase = process.env.FRONTEND_URL || 'https://dist-ten-mu-12.vercel.app';
-    const catalogUrl = `${frontendBase.replace(/\/$/, '')}/catalogo?loja=${encodeURIComponent(slug)}`;
+    const catalogUrl = buildStorePublicUrl(slug);
 
     return c.json({
       slug,
@@ -258,8 +269,7 @@ catalog.post('/set-catalog-slug', async (c) => {
     }
 
     await setCatalogSlug(user.id, desired);
-    const frontendBase = process.env.FRONTEND_URL || 'https://dist-ten-mu-12.vercel.app';
-    const catalogUrl = `${frontendBase.replace(/\/$/, '')}/catalogo?loja=${encodeURIComponent(desired)}`;
+    const catalogUrl = buildStorePublicUrl(desired);
 
     return c.json({ slug: desired, catalog_url: catalogUrl });
   } catch (error) {
