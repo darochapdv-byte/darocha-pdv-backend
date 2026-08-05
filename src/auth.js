@@ -462,16 +462,23 @@ auth.post('/oauth', async (c) => {
   }
 
   // Nunca redirecionar para localhost em produção (evita tela ERR_CONNECTION_REFUSED no celular)
-  const APP = (process.env.APP_URL || 'https://dist-ten-mu-12.vercel.app').replace(/\/$/, '');
+  const APP = (process.env.APP_URL || 'https://darochapdv.com').replace(/\/$/, '');
   let finalRedirect = (redirect_to || APP || '').toString();
   if (!finalRedirect || /localhost|127\.0\.0\.1|capacitor:\/\/|file:/i.test(finalRedirect)) {
     finalRedirect = APP + '/';
   }
   if (!finalRedirect.startsWith('http')) finalRedirect = APP + '/';
-  // Garante origem permitida
+  // Origens permitidas: darochapdv.com, subdomínios e Vercel
   try {
     const u = new URL(finalRedirect);
-    if (!u.hostname.includes('vercel.app') && u.hostname !== 'dist-ten-mu-12.vercel.app') {
+    const host = (u.hostname || '').toLowerCase();
+    const allowed =
+      host === 'darochapdv.com' ||
+      host === 'www.darochapdv.com' ||
+      host.endsWith('.darochapdv.com') ||
+      host.endsWith('.vercel.app') ||
+      host === 'dist-ten-mu-12.vercel.app';
+    if (!allowed) {
       finalRedirect = APP + '/';
     }
   } catch {
