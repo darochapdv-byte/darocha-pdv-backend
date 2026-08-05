@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { admin, userClient, tableFor, restQuery } from './db.js';
 import { sanitizeDateFields, sanitizeEntityBody, toBase44Row, toBase44Rows, requireUser, getAllowZeroStock, setAllowZeroStock, ensureCatalogSlug } from './helpers.js';
 import { getAccessStatus } from './stripe_ops.js';
+import { applySaleCancellationSideEffects } from './integration.js';
 
 const entities = new Hono();
 
@@ -612,6 +613,22 @@ entities.patch("/:entity/:id", async (c) => {
   }
   body = stripUnknownForEntity(entity, body);
 
+  // Cancelamento de venda: guardar estado anterior para devolver estoque/caixa
+  let prevSaleForCancel = null;
+  if (normalizeEntityName(entity) === 'Sale' && body.status != null && admin) {
+    const newSt = String(body.status || '').toLowerCase();
+    if (newSt === 'cancelada' || newSt === 'cancelado') {
+      try {
+        let sq = admin.from('sale').select('*').eq('id', c.req.param('id'));
+        sq = applyTenantFilter(sq, entity, user);
+        const { data: prevS } = await sq.maybeSingle();
+        prevSaleForCancel = prevS;
+      } catch (e) {
+        console.warn('load sale for cancel', e?.message || e);
+      }
+    }
+  }
+
   // Entrada de estoque: se Product.stock subir, libera wishlist + notifica
   let prevStock = null;
   if (normalizeEntityName(entity) === 'Product' && body.stock != null && admin) {
@@ -727,6 +744,21 @@ entities.patch("/:entity/:id", async (c) => {
   if (entity === 'AppSettings') {
     row.allow_zero_stock = allowZeroStockSaved ?? (await getAllowZeroStock());
   }
+
+  // Ao cancelar venda: devolve estoque + estorna caixa
+  if (prevSaleForCancel && normalizeEntityName(entity) === 'Sale') {
+    const was = String(prevSaleForCancel.status || '').toLowerCase();
+    if (was !== 'cancelada' && was !== 'cancelado') {
+      try {
+        await applySaleCancellationSideEffects(prevSaleForCancel, {
+          operator_name: user?.full_name || user?.email || '',
+        });
+      } catch (e) {
+        console.warn('cancel side effects', e?.message || e);
+      }
+    }
+  }
+
   return c.json(row);
 });
 
@@ -747,7 +779,7 @@ entities.delete('/:entity/:id', async (c) => {
   // "Excluir" vira cancelamento (status cancelada) — o registro continua existindo.
   if (entityNorm === 'Sale') {
     const id = c.req.param('id');
-    let find = db.from(table).select('id,status,total,created_by').eq('id', id);
+    let find = db.from(table).select('*').eq('id', id);
     find = applyTenantFilter(find, entity, user);
     const { data: sale, error: findErr } = await find.maybeSingle();
     if (findErr) return c.json({ error: findErr.message }, 400);
@@ -758,6 +790,15 @@ entities.delete('/:entity/:id', async (c) => {
       return c.json({ ok: true, soft: true, status: sale.status, message: 'Venda já estava cancelada. Registro preservado.' });
     }
 
+    // Devolve estoque e estorna caixa ANTES de marcar cancelada
+    try {
+      await applySaleCancellationSideEffects(sale, {
+        operator_name: user?.full_name || user?.email || '',
+      });
+    } catch (e) {
+      console.warn('cancel side effects on delete', e?.message || e);
+    }
+
     let q = db.from(table).update({
       status: 'cancelada',
       canceled_at: new Date().toISOString(),
@@ -766,14 +807,13 @@ entities.delete('/:entity/:id', async (c) => {
     q = applyTenantFilter(q, entity, user);
     const { data: updated, error } = await q.select().maybeSingle();
     if (error) {
-      // fallback se colunas extras não existirem no schema
       let q2 = db.from(table).update({ status: 'cancelada' }).eq('id', id);
       q2 = applyTenantFilter(q2, entity, user);
       const { error: e2 } = await q2;
       if (e2) return c.json({ error: e2.message }, 400);
-      return c.json({ ok: true, soft: true, status: 'cancelada', message: 'Venda cancelada. Histórico preservado (não apagado).' });
+      return c.json({ ok: true, soft: true, status: 'cancelada', message: 'Venda cancelada. Estoque/caixa ajustados. Histórico preservado.' });
     }
-    return c.json({ ok: true, soft: true, status: 'cancelada', sale: toBase44Row(updated), message: 'Venda cancelada. Histórico preservado (não apagado).' });
+    return c.json({ ok: true, soft: true, status: 'cancelada', sale: toBase44Row(updated), message: 'Venda cancelada. Estoque/caixa ajustados. Histórico preservado.' });
   }
 
   let q = db.from(table).delete().eq('id', c.req.param('id'));

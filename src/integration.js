@@ -75,6 +75,62 @@ export async function registerCashMovement({
 /**
  * Atribui entregador a um pedido de entrega e avança status.
  */
+
+/**
+ * Efeitos colaterais ao cancelar uma venda concluída:
+ * - devolve estoque dos itens
+ * - registra estorno no caixa (valor negativo) se houver sessão
+ * Idempotente: se já estava cancelada, não faz nada de estoque/caixa de novo
+ * (caller deve checar status anterior).
+ */
+export async function applySaleCancellationSideEffects(sale, { operator_name = '' } = {}) {
+  if (!admin || !sale) return { stock_restored: 0, cash_reversed: false };
+
+  const prev = String(sale.status || '').toLowerCase();
+  // Só devolve estoque se a venda tinha consumido estoque (concluída)
+  const shouldRestoreStock = prev === 'concluida' || prev === 'concluido';
+
+  let stock_restored = 0;
+  if (shouldRestoreStock) {
+    for (const it of sale.items || []) {
+      const pid = it.product_id || it.productId;
+      const qty = Number(it.qty || it.quantity || 0);
+      if (!pid || qty <= 0) continue;
+      try {
+        const { data: p } = await admin.from('product').select('id,stock').eq('id', pid).maybeSingle();
+        if (!p) continue;
+        const next = (Number(p.stock) || 0) + qty;
+        await admin.from('product').update({ stock: next }).eq('id', pid);
+        stock_restored += qty;
+      } catch (e) {
+        console.warn('restore stock on cancel', pid, e?.message || e);
+      }
+    }
+  }
+
+  let cash_reversed = false;
+  const sessionId = sale.cash_session_id;
+  const total = Number(sale.total) || 0;
+  if (sessionId && total > 0 && shouldRestoreStock) {
+    try {
+      await registerCashMovement({
+        cash_session_id: sessionId,
+        type: 'venda',
+        amount: -Math.abs(total),
+        reason: `Estorno cancelamento #${String(sale.id || '').slice(-6).toUpperCase()}`,
+        sale_id: sale.id || null,
+        operator_name: operator_name || sale.operator_name || '',
+      });
+      cash_reversed = true;
+    } catch (e) {
+      console.warn('cash reverse on cancel', e?.message || e);
+    }
+  }
+
+  return { stock_restored, cash_reversed };
+}
+
+
 integration.post('/delivery-assign', async (c) => {
   try {
     const user = await requireUser(c);
