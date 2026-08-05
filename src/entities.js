@@ -623,18 +623,33 @@ entities.patch("/:entity/:id", async (c) => {
     } catch (_) {}
   }
 
-  let q = db.from(table).update(body).eq('id', c.req.param('id'));
+  // AppSettings e afins: preferir admin + maybeSingle (evita "Cannot coerce... single JSON object")
+  const writer = (normalizeEntityName(entity) === 'AppSettings' && admin) ? admin : db;
+  let q = writer.from(table).update(body).eq('id', c.req.param('id'));
   q = applyTenantFilter(q, entity, user);
 
-  let { data, error } = await q.select().single();
-  // fallback rest em caso de coluna desconhecida
+  let { data, error } = await q.select().maybeSingle();
+  // fallback: coluna desconhecida
   if (error) {
     const colMatch = (error.message || '').match(/Could not find the '([^']+)' column/i);
     if (colMatch) {
       delete body[colMatch[1]];
-      q = db.from(table).update(body).eq('id', c.req.param('id'));
+      q = writer.from(table).update(body).eq('id', c.req.param('id'));
       q = applyTenantFilter(q, entity, user);
-      ({ data, error } = await q.select().single());
+      ({ data, error } = await q.select().maybeSingle());
+    }
+  }
+  // fallback REST se ainda falhar
+  if ((error || !data) && admin) {
+    try {
+      const patched = await restQuery(
+        `${table}?id=eq.${encodeURIComponent(c.req.param('id'))}`,
+        { method: 'PATCH', body, prefer: 'return=representation' }
+      );
+      data = Array.isArray(patched) ? patched[0] : patched;
+      if (data) error = null;
+    } catch (e) {
+      if (!error) error = e;
     }
   }
   // StockCount: PATCH via REST se o client não achar a linha (RLS / coerce)
