@@ -1,7 +1,8 @@
 import { Hono } from 'hono';
 import { admin } from './db.js';
-import { logOperation, releaseSessionReservations, requireUser, stackOf, sanitizeDateFields, toBase44Row, toBase44Rows, getAllowZeroStock, upsertCustomer } from './helpers.js';
+import { logOperation, releaseSessionReservations, requireUser, stackOf, sanitizeDateFields, toBase44Row, toBase44Rows, getAllowZeroStock, upsertCustomer, ensureCatalogSlug } from './helpers.js';
 import { registerCashMovement } from './integration.js';
+import { getAccessStatus } from './stripe_ops.js';
 
 /**
  * Backend functions portadas da Base44.
@@ -668,6 +669,112 @@ functions.post("/finalize-sale", async (c) => {
   }
 });
 
+
+// ─── app-bootstrap: 1 request = dados iniciais do app ───────────────────────
+// Reduz 6–10 round-trips do front para 1 (bem mais rápido no celular/3G).
+
+functions.post('/app-bootstrap', async (c) => {
+  const t0 = Date.now();
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    const body = await c.req.json().catch(() => ({}));
+    const productLimit = Math.min(Number(body.product_limit || 500), 2000);
+    const saleLimit = Math.min(Number(body.sale_limit || 80), 300);
+    const customerLimit = Math.min(Number(body.customer_limit || 100), 500);
+    const notifLimit = Math.min(Number(body.notification_limit || 30), 100);
+
+    const uid = user.id;
+
+    const [
+      productsRes,
+      salesRes,
+      customersRes,
+      sellersRes,
+      settingsRes,
+      cashRes,
+      notifRes,
+      feesRes,
+      access,
+      allowZero,
+    ] = await Promise.all([
+      admin.from('product').select('*').eq('created_by', uid).order('created_at', { ascending: false }).limit(productLimit),
+      admin.from('sale').select('*').eq('created_by', uid).order('created_at', { ascending: false }).limit(saleLimit),
+      admin.from('customer').select('*').eq('created_by', uid).order('created_at', { ascending: false }).limit(customerLimit),
+      admin.from('seller').select('*').eq('created_by', uid).order('created_at', { ascending: false }).limit(100),
+      admin.from('app_settings').select('*').eq('created_by', uid).order('created_at', { ascending: false }).limit(5),
+      admin.from('cash_session').select('*').eq('created_by', uid).order('created_at', { ascending: false }).limit(15),
+      admin.from('notification').select('*').eq('created_by', uid).order('created_at', { ascending: false }).limit(notifLimit),
+      admin.from('delivery_fee').select('*').eq('created_by', uid).order('created_at', { ascending: false }).limit(100),
+      getAccessStatus(uid).catch(() => null),
+      getAllowZeroStock().catch(() => false),
+    ]);
+
+    const pick = (res) => {
+      if (res?.error) {
+        console.warn('bootstrap query', res.error.message);
+        return [];
+      }
+      return toBase44Rows(res.data || []);
+    };
+
+    let settings = pick(settingsRes);
+    // Enriquecer AppSettings uma vez (slug + allow_zero_stock)
+    if (settings.length) {
+      let catalog_slug = null;
+      try {
+        catalog_slug = await ensureCatalogSlug(uid, settings[0].company_name || user.company_name || null);
+      } catch (_) {}
+      const frontendBase = process.env.FRONTEND_URL || process.env.APP_URL || 'https://dist-ten-mu-12.vercel.app';
+      const catalog_url = catalog_slug
+        ? `${String(frontendBase).replace(/\/$/, '')}/catalogo?loja=${encodeURIComponent(catalog_slug)}`
+        : null;
+      settings = settings.map((r) => ({
+        ...r,
+        allow_zero_stock: allowZero === true,
+        catalog_slug,
+        catalog_url,
+      }));
+    }
+
+    const openSessions = pick(cashRes).filter((s) => {
+      const st = String(s.status || '').toLowerCase();
+      return st === 'open' || st === 'aberto';
+    });
+
+    const ms = Date.now() - t0;
+    return c.json({
+      ok: true,
+      ms,
+      user: {
+        id: user.id,
+        email: user.email,
+        full_name: user.full_name,
+        company_name: user.company_name,
+        referral_code: user.referral_code,
+        catalog_slug: settings[0]?.catalog_slug || user.catalog_slug || null,
+        catalog_url: settings[0]?.catalog_url || user.catalog_url || null,
+      },
+      access: access || null,
+      allow_zero_stock: allowZero === true,
+      products: pick(productsRes),
+      sales: pick(salesRes),
+      customers: pick(customersRes),
+      sellers: pick(sellersRes),
+      app_settings: settings,
+      cash_sessions: pick(cashRes),
+      open_cash_sessions: openSessions,
+      notifications: pick(notifRes),
+      delivery_fees: pick(feesRes),
+    });
+  } catch (error) {
+    console.error('app-bootstrap', error);
+    return c.json({ error: error.message || 'bootstrap_failed' }, 500);
+  }
+});
+
 // ─── catch-all ─────────────────────────────────────────────────────────────
 
 functions.post('/:name', async (c) => {
@@ -679,7 +786,7 @@ functions.post('/:name', async (c) => {
   'barcode-lookup','product-name-lookup','enrich-product','save-product','repair-product-ownership','refresh-products-catalog',
   'start-stock-count','stock-count-search','stock-count-apply','sync-pdv-reservations',
   'admin-stats','cleanup-cash-sessions','purge-account','init-help-content',
-  'create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','referral-panel','master-code-status','ensure-referral-code','cancel-subscription','resume-subscription',
+  'app-bootstrap','create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','referral-panel','master-code-status','ensure-referral-code','cancel-subscription','resume-subscription',
   'fetch-nfe-xml','import-nfe','address-search',
 ];
   if (implemented.includes(name)) return c.json({ error: 'routing_error' }, 500);

@@ -271,8 +271,8 @@ entities.get('/:entity', async (c) => {
     const enriched = [];
     for (const r of rows) {
       const ownerId = r.created_by || user?.id || null;
-      let catalog_slug = null;
-      if (ownerId) {
+      let catalog_slug = r.catalog_slug || null;
+      if (ownerId && !catalog_slug) {
         try {
           catalog_slug = await ensureCatalogSlug(ownerId, r.company_name || user?.company_name || null);
         } catch (e) {
