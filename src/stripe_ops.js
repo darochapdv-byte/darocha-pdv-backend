@@ -837,6 +837,21 @@ stripeOps.post('/subscription-status', async (c) => {
   }
 });
 
+/** Aliases legados usados pelo frontend (Base44) */
+async function handleAccessStatus(c) {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    const access = await getAccessStatus(user.id);
+    return c.json(access);
+  } catch (error) {
+    return c.json({ error: error.message }, 500);
+  }
+}
+stripeOps.post('/get-access-status', handleAccessStatus);
+stripeOps.post('/access-status', handleAccessStatus);
+
+
 
 /** Cancela assinatura Stripe do usuário logado (padrão: no fim do período pago) */
 stripeOps.post('/cancel-subscription', async (c) => {
