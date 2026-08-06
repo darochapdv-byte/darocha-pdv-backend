@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import Stripe from 'stripe';
 import { admin, restQuery } from './db.js';
 import { requireUser } from './helpers.js';
+import { cacheGet, cacheSet } from './cache.js';
 
 const stripeOps = new Hono();
 
@@ -12,6 +13,7 @@ const DISCOUNT_MIN_REFERRALS = 6;
 const DISCOUNT_MIN_MONTHS_EACH = 6;
 const MASTER_CODE = 'DAROCHADEV';
 const MASTER_CODE_MAX_USES = 3;
+const ACCESS_CACHE_TTL_MS = 60_000;
 
 function getStripe() {
   const key = process.env.STRIPE_SECRET_KEY;
@@ -88,6 +90,10 @@ export async function getAccessStatus(userId) {
     return withFrontendAccessFields({ allowed: false, status: 'unknown', description: 'no_user' });
   }
 
+  const cacheKey = `access:${userId}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
   const { data: subs } = await admin
     .from('subscription')
     .select('*')
@@ -96,34 +102,29 @@ export async function getAccessStatus(userId) {
     .limit(1);
 
   const sub = subs?.[0];
+  let result;
   if (!sub) {
-    return withFrontendAccessFields({ allowed: false, status: 'none', description: 'no_subscription' });
-  }
-
-  if (sub.permanent_free_access === true || sub.plan === 'lifetime' || sub.plan === 'dev_lifetime') {
-    return withFrontendAccessFields({
+    result = withFrontendAccessFields({ allowed: false, status: 'none', description: 'no_subscription' });
+  } else if (sub.permanent_free_access === true || sub.plan === 'lifetime' || sub.plan === 'dev_lifetime') {
+    result = withFrontendAccessFields({
       allowed: true,
       status: 'lifetime',
       subscription: sub,
       price_brl: 0,
     });
-  }
-
-  if (sub.status === 'active') {
+  } else if (sub.status === 'active') {
     const price = sub.permanent_discount_active === true ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL;
-    return withFrontendAccessFields({
+    result = withFrontendAccessFields({
       allowed: true,
       status: 'active',
       subscription: sub,
       price_brl: price,
     });
-  }
-
-  if (sub.status === 'trialing') {
+  } else if (sub.status === 'trialing') {
     const ends = sub.trial_end ? new Date(sub.trial_end) : null;
     if (ends && ends.getTime() > Date.now()) {
       const daysLeft = Math.ceil((ends.getTime() - Date.now()) / 86400000);
-      return withFrontendAccessFields({
+      result = withFrontendAccessFields({
         allowed: true,
         status: 'trialing',
         subscription: sub,
@@ -131,36 +132,36 @@ export async function getAccessStatus(userId) {
         days_left: daysLeft,
         price_brl: MONTHLY_PRICE_BRL,
       });
+    } else {
+      result = withFrontendAccessFields({
+        allowed: false,
+        status: 'trial_expired',
+        subscription: sub,
+        trial_end: sub.trial_end,
+        description: 'trial_expired',
+        price_brl: MONTHLY_PRICE_BRL,
+      });
     }
-    // Trial acabou
-    return withFrontendAccessFields({
-      allowed: false,
-      status: 'trial_expired',
-      subscription: sub,
-      trial_end: sub.trial_end,
-      description: 'trial_expired',
-      price_brl: MONTHLY_PRICE_BRL,
-    });
-  }
-
-  // free months credit (recompensa de indicação)
-  if (sub.reward_free_months > 0) {
-    return withFrontendAccessFields({
+  } else if (sub.reward_free_months > 0) {
+    result = withFrontendAccessFields({
       allowed: true,
       status: 'free_credit',
       subscription: sub,
       reward_free_months: sub.reward_free_months,
       price_brl: sub.permanent_discount_active ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL,
     });
+  } else {
+    result = withFrontendAccessFields({
+      allowed: false,
+      status: sub.status || 'expired',
+      subscription: sub,
+      description: 'subscription_inactive',
+      price_brl: MONTHLY_PRICE_BRL,
+    });
   }
 
-  return withFrontendAccessFields({
-    allowed: false,
-    status: sub.status || 'expired',
-    subscription: sub,
-    description: 'subscription_inactive',
-    price_brl: MONTHLY_PRICE_BRL,
-  });
+  cacheSet(cacheKey, result, ACCESS_CACHE_TTL_MS);
+  return result;
 }
 
 /** Garante que o perfil tenha referral_code (usuários antigos / bootstrap falhou) */

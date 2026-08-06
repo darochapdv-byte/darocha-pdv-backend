@@ -2,11 +2,15 @@ import { Hono } from 'hono';
 import bcrypt from 'bcryptjs';
 import { SignJWT, jwtVerify } from 'jose';
 import { admin, userClient, useLocal, query } from './db.js';
+import { cacheGet, cacheSet, tokenKey } from './cache.js';
 
 const auth = new Hono();
 const JWT_SECRET = new TextEncoder().encode(
   process.env.JWT_SECRET || 'darocha-dev-secret-change-me-in-prod-32'
 );
+
+// Cache de usuário autenticado (evita 2–3 roundtrips Supabase por request)
+const USER_CACHE_TTL_MS = 60_000;
 
 async function signToken(payload) {
   return new SignJWT(payload)
@@ -25,11 +29,26 @@ export async function verifyToken(token) {
   }
 }
 
+/**
+ * Resolve o usuário do request.
+ * - Caminho quente: cache em memória (60s)
+ * - NÃO roda ensureCatalogSlug aqui (só no /auth/me) — isso tirava ~1–5s de cada clique no PDV
+ */
 export async function getUserFromRequest(c) {
   const header = c.req.header('Authorization') || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return null;
 
+  const ck = tokenKey(token);
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
+  const user = await resolveUserFromToken(token);
+  if (user) cacheSet(ck, user, USER_CACHE_TTL_MS);
+  return user;
+}
+
+async function resolveUserFromToken(token) {
   if (useLocal) {
     const payload = await verifyToken(token);
     if (!payload?.sub) return null;
@@ -71,7 +90,6 @@ export async function getUserFromRequest(c) {
       company_cnpj: user.user_metadata?.company_cnpj || null,
       company_phone: user.user_metadata?.company_phone || null,
     };
-    // Service role às vezes ainda esbarra em RLS no INSERT; tenta e segue com seed em memória
     const { data: created, error: cErr } = await admin.from('profiles').insert(seed).select().maybeSingle();
     if (cErr) {
       console.warn('profile seed insert', cErr.message);
@@ -81,10 +99,9 @@ export async function getUserFromRequest(c) {
     }
   }
 
-  // referral_code: não bloqueia /auth/me (evita tela branca se PostgREST/RLS travar)
+  // referral_code: fire-and-forget (não bloqueia request)
   let referralCode = profile?.referral_code || null;
   if (!referralCode && profile?.id) {
-    // fire-and-forget com timeout interno do restQuery
     import('./stripe_ops.js')
       .then(({ ensureUserReferralCode }) => ensureUserReferralCode(user.id))
       .then((code) => {
@@ -93,7 +110,8 @@ export async function getUserFromRequest(c) {
       .catch((e) => console.warn('ensure referral on me', e.message || e));
   }
 
-  const base = {
+  // Sem ensureCatalogSlug no caminho quente — só id/email/profile para tenant filter
+  return {
     id: user.id,
     email: user.email,
     role: profile?.role || 'admin',
@@ -106,26 +124,32 @@ export async function getUserFromRequest(c) {
     referred_by_code: profile?.referred_by_code || null,
     full_name: profile?.company_name || user.email,
     data: profile || {},
+    catalog_slug: profile?.catalog_slug || null,
+    catalog_url: null,
   };
-  try {
-    const { ensureCatalogSlug } = await import('./helpers.js');
-    const slugPromise = ensureCatalogSlug(user.id, profile?.company_name || null);
-    const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(null), 5000));
-    const slug = await Promise.race([slugPromise, timeoutPromise]);
-    base.catalog_slug = slug;
-    const { buildStorePublicUrl } = await import('./helpers.js');
-    base.catalog_url = slug ? buildStorePublicUrl(slug) : null;
-  } catch (e) {
-    console.warn('catalog slug on me', e.message || e);
-    base.catalog_slug = null;
-    base.catalog_url = null;
-  }
-  return base;
 }
 
 auth.get('/me', async (c) => {
   const user = await getUserFromRequest(c);
   if (!user) return c.json({ error: 'unauthorized' }, 401);
+
+  // Slug do catálogo só aqui (não em todo request do PDV)
+  try {
+    if (!user.catalog_slug) {
+      const { ensureCatalogSlug, buildStorePublicUrl } = await import('./helpers.js');
+      const slugPromise = ensureCatalogSlug(user.id, user.company_name || null);
+      const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(null), 4000));
+      const slug = await Promise.race([slugPromise, timeoutPromise]);
+      user.catalog_slug = slug;
+      user.catalog_url = slug ? buildStorePublicUrl(slug) : null;
+    } else if (!user.catalog_url) {
+      const { buildStorePublicUrl } = await import('./helpers.js');
+      user.catalog_url = buildStorePublicUrl(user.catalog_slug);
+    }
+  } catch (e) {
+    console.warn('catalog slug on me', e.message || e);
+  }
+
   // Indica se o Host atual (subdomínio) pertence a outra loja
   try {
     const host = (c.req.header('X-Forwarded-Host') || c.req.header('Host') || '').split(',')[0].trim().toLowerCase();

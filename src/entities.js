@@ -3,8 +3,20 @@ import { admin, userClient, tableFor, restQuery } from './db.js';
 import { sanitizeDateFields, sanitizeEntityBody, toBase44Row, toBase44Rows, requireUser, getAllowZeroStock, setAllowZeroStock, ensureCatalogSlug, buildStorePublicUrl } from './helpers.js';
 import { getAccessStatus } from './stripe_ops.js';
 import { applySaleCancellationSideEffects } from './integration.js';
+import { cacheGet, cacheSet, cacheDelPrefix } from './cache.js';
 
 const entities = new Hono();
+
+// Cache curto de listagens pesadas — invalida em escrita
+const LIST_CACHE_TTL_MS = 25_000;
+const CACHEABLE_LIST = new Set(['Product', 'AppSettings', 'Customer', 'Seller']);
+
+function invalidateListCache(entityName, userId) {
+  if (!userId) return;
+  const n = normalizeEntityName(entityName);
+  if (!CACHEABLE_LIST.has(n)) return;
+  cacheDelPrefix(`list:${n}:${userId}:`);
+}
 
 // Entidades de negócio isoladas por usuário (multi-tenant)
 const TENANT_ENTITIES = new Set([
@@ -123,6 +135,20 @@ entities.get('/:entity', async (c) => {
   // Multiempresa: entidades de negócio exigem autenticação (sem user = vazamento entre lojas)
   if (isTenantEntity(entity) && !user?.id) {
     return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  // Cache de listagens “quentes” (só listagem completa, sem filtros extras)
+  const queryKeys = Object.keys(c.req.queries()).filter((k) => k !== 'limit' && k !== 'order');
+  const canCache =
+    user?.id &&
+    CACHEABLE_LIST.has(entityNorm) &&
+    queryKeys.length === 0;
+  const listCacheKey = canCache
+    ? `list:${entityNorm}:${user.id}:${limit}:${column}:${ascending ? 'asc' : 'desc'}`
+    : null;
+  if (listCacheKey) {
+    const hit = cacheGet(listCacheKey);
+    if (hit) return c.json(hit);
   }
 
   console.log(`[GET /entities/${entity}] table=${table} user=${user?.id || 'anon'} query=${JSON.stringify(c.req.query())}`);
@@ -285,6 +311,7 @@ entities.get('/:entity', async (c) => {
     }
     rows = enriched;
   }
+  if (listCacheKey) cacheSet(listCacheKey, rows, LIST_CACHE_TTL_MS);
   return c.json(rows);
 });
 
@@ -581,6 +608,7 @@ entities.post('/:entity', async (c) => {
   if (entity === 'AppSettings') {
     row.allow_zero_stock = allowZeroStockSaved ?? (await getAllowZeroStock());
   }
+  try { invalidateListCache(entity, user?.id); } catch (_) {}
   return c.json(row, 201);
 });
 
@@ -756,6 +784,7 @@ entities.patch("/:entity/:id", async (c) => {
     }
   }
 
+  try { invalidateListCache(entity, user?.id); } catch (_) {}
   return c.json(row);
 });
 
@@ -818,6 +847,7 @@ entities.delete('/:entity/:id', async (c) => {
 
   const { error } = await q;
   if (error) return c.json({ error: error.message }, 400);
+  try { invalidateListCache(entity, user?.id); } catch (_) {}
   return c.json({ ok: true });
 });
 

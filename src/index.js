@@ -2,6 +2,7 @@
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { compress } from 'hono/compress';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -32,6 +33,9 @@ app.use(
     allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   })
 );
+
+// Gzip — reduz payload de produtos (~400KB → bem menor na rede)
+app.use('*', compress());
 
 // Arquivos enviados (modo local)
 app.get('/uploads/:file', async (c) => {
