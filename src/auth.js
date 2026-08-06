@@ -290,6 +290,30 @@ auth.post('/register', async (c) => {
   return c.json({ token: login.data.session?.access_token, user: data.user }, 201);
 });
 
+auth.post('/refresh', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const refresh_token = body.refresh_token || body.refreshToken;
+  if (!refresh_token) return c.json({ error: 'refresh_token_required' }, 400);
+
+  if (useLocal) {
+    return c.json({ error: 'refresh_not_needed_local' }, 400);
+  }
+  if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+  try {
+    const { data, error } = await admin.auth.refreshSession({ refresh_token });
+    if (error || !data?.session) {
+      return c.json({ error: error?.message || 'refresh_failed' }, 401);
+    }
+    return c.json({
+      token: data.session.access_token,
+      refresh_token: data.session.refresh_token,
+      user: data.user,
+    });
+  } catch (e) {
+    return c.json({ error: e.message || 'refresh_failed' }, 401);
+  }
+});
+
 auth.post('/logout', async (c) => c.json({ ok: true }));
 
 
