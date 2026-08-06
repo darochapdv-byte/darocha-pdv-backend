@@ -349,7 +349,7 @@ stock.post('/sync-pdv-reservations', async (c) => {
     const items = Array.isArray(body.items) ? body.items : [];
     const operatorName = body.operator_name || user.email || 'PDV';
     const expiryMinutes = Number(body.expiry_minutes) || 30;
-    const allowZeroStock = (await getAllowZeroStock()) || body.allow_zero_stock === true;
+    const allowZeroStock = body.allow_zero_stock === true || (await getAllowZeroStock(user.id));
 
     if (!sessionId) return c.json({ error: 'session_id obrigatório' }, 400);
 
@@ -379,7 +379,10 @@ stock.post('/sync-pdv-reservations', async (c) => {
       const qty = Math.max(0, Number(it.qty) || 0);
       const p = prodMap[it.product_id];
       if (!p) {
-        insufficient.push({ product_id: it.product_id, name: it.name || 'Produto', available: 0 });
+        // Produto de outra loja/órfão: com allow_zero não bloqueia o carrinho
+        if (!allowZeroStock) {
+          insufficient.push({ product_id: it.product_id, name: it.name || 'Produto', available: 0 });
+        }
         continue;
       }
       const othersReserved = othersMap[p.id] || 0;
