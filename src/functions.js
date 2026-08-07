@@ -200,21 +200,37 @@ functions.post('/takeover-cash-session', async (c) => {
 
     const previousDeviceId = session.device_id || null;
 
-    // Só atualiza colunas que JÁ existem na tabela cash_session
-    const { data: updated, error } = await admin
+    // Atualiza device_id (obrigatório). Campos extras tentados; se a coluna não existir, tenta só o essencial.
+    const fullPatch = {
+      device_id,
+      terminal: body.terminal || session.terminal || '',
+      takeover_history: [...existingHistory, entry],
+      inactive: false,
+      last_active_at: entry.at,
+    };
+    let updated = null;
+    let error = null;
+    ({ data: updated, error } = await admin
       .from('cash_session')
-      .update({
-        device_id,
-        terminal: body.terminal || session.terminal || '',
-        takeover_history: [...existingHistory, entry],
-        inactive: false,
-        last_active_at: entry.at,
-      })
+      .update(fullPatch)
       .eq('id', session_id)
       .select()
-      .single();
+      .single());
 
-    if (error) return c.json({ error: error.message }, 500);
+    if (error) {
+      // Fallback: só device_id + terminal (colunas garantidas)
+      const minimal = {
+        device_id,
+        terminal: body.terminal || session.terminal || '',
+      };
+      ({ data: updated, error } = await admin
+        .from('cash_session')
+        .update(minimal)
+        .eq('id', session_id)
+        .select()
+        .single());
+      if (error) return c.json({ error: error.message || 'Falha ao assumir o caixa.' }, 500);
+    }
 
     await logOperation({
       type: 'cash_recovery', level: 'warn',
