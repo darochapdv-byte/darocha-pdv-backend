@@ -1,0 +1,13 @@
+-- CHECKLIST RLS (NÃO aplicar cegamente sem revisar nomes de tabelas/colunas)
+-- O backend atual usa service role (admin) e filtra created_by na aplicação.
+-- Para nota 10 de segurança, o ideal é:
+-- 1) Políticas RLS por auth.uid() = created_by nas tabelas de negócio
+-- 2) Backend usar user JWT (não só service role) em leituras/escritas do tenant
+-- 3) Service role só para jobs admin / repair / Stripe webhooks
+--
+-- Exemplo (ajuste nomes reais antes de rodar):
+-- ALTER TABLE product ENABLE ROW LEVEL SECURITY;
+-- CREATE POLICY product_tenant_select ON product
+--   FOR SELECT USING (created_by = auth.uid());
+-- CREATE POLICY product_tenant_write ON product
+--   FOR ALL USING (created_by = auth.uid()) WITH CHECK (created_by = auth.uid());

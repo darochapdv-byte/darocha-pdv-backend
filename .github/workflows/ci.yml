@@ -1,0 +1,32 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install
+        run: npm ci --omit=dev || npm install --omit=dev
+      - name: Syntax check
+        run: |
+          node --check src/index.js
+          node --check src/auth.js
+          node --check src/entities.js
+          node --check src/functions.js
+          node --check src/catalog.js
+          node --check src/helpers.js
+      - name: Health (production)
+        if: github.event_name == 'push'
+        continue-on-error: true
+        run: |
+          curl -fsS --max-time 30 "https://darocha-pdv-backend.onrender.com/health" | head -c 500

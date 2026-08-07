@@ -25,14 +25,45 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const app = new Hono();
 
+const ALLOWED_ORIGINS = new Set([
+  'https://darochapdv.com',
+  'https://www.darochapdv.com',
+  'https://dist-ten-mu-12.vercel.app',
+  'https://darocha-pdv-darochapdv.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://127.0.0.1:5173',
+]);
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // same-origin / curl / mobile webview sem Origin
+  if (ALLOWED_ORIGINS.has(origin)) return true;
+  try {
+    const u = new URL(origin);
+    if (u.hostname.endsWith('.darochapdv.com')) return true;
+    if (u.hostname.endsWith('.vercel.app') && u.hostname.includes('darocha')) return true;
+  } catch { /* ignore */ }
+  return false;
+}
+
 app.use(
   '*',
   cors({
-    origin: (origin) => origin || '*',
+    origin: (origin) => (isAllowedOrigin(origin) ? origin || '*' : ''),
     allowHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'stripe-signature'],
     allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    credentials: true,
   })
 );
+
+// Headers de segurança básicos
+app.use('*', async (c, next) => {
+  await next();
+  c.res.headers.set('X-Content-Type-Options', 'nosniff');
+  c.res.headers.set('X-Frame-Options', 'SAMEORIGIN');
+  c.res.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  c.res.headers.set('Permissions-Policy', 'camera=(self), microphone=(), geolocation=()');
+});
 
 // Gzip — reduz payload de produtos (~400KB → bem menor na rede)
 app.use('*', compress());
