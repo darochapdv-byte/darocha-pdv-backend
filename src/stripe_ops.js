@@ -103,6 +103,14 @@ export async function getAccessStatus(userId) {
 
   const sub = subs?.[0];
   let result;
+  const priceOf = (s) =>
+    s?.permanent_discount_active === true ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL;
+  const periodStillValid = (s) => {
+    if (!s?.current_period_end) return false;
+    const end = new Date(s.current_period_end).getTime();
+    return Number.isFinite(end) && end > Date.now();
+  };
+
   if (!sub) {
     result = withFrontendAccessFields({ allowed: false, status: 'none', description: 'no_subscription' });
   } else if (sub.permanent_free_access === true || sub.plan === 'lifetime' || sub.plan === 'dev_lifetime') {
@@ -112,18 +120,10 @@ export async function getAccessStatus(userId) {
       subscription: sub,
       price_brl: 0,
     });
-  } else if (sub.status === 'active') {
-    const price = sub.permanent_discount_active === true ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL;
-    result = withFrontendAccessFields({
-      allowed: true,
-      status: 'active',
-      subscription: sub,
-      price_brl: price,
-    });
   } else if (sub.status === 'trialing') {
     const ends = sub.trial_end ? new Date(sub.trial_end) : null;
     if (ends && ends.getTime() > Date.now()) {
-      const daysLeft = Math.ceil((ends.getTime() - Date.now()) / 86400000);
+      const daysLeft = Math.max(0, Math.ceil((ends.getTime() - Date.now()) / 86400000));
       result = withFrontendAccessFields({
         allowed: true,
         status: 'trialing',
@@ -140,15 +140,78 @@ export async function getAccessStatus(userId) {
         trial_end: sub.trial_end,
         description: 'trial_expired',
         price_brl: MONTHLY_PRICE_BRL,
+        block_reason: 'trial_expired',
       });
     }
-  } else if (sub.reward_free_months > 0) {
+  } else if (sub.status === 'active') {
+    // Cancelamento agendado: acesso até current_period_end
+    if (sub.cancel_at_period_end === true) {
+      if (periodStillValid(sub)) {
+        result = withFrontendAccessFields({
+          allowed: true,
+          status: 'cancel_scheduled',
+          subscription: sub,
+          current_period_end: sub.current_period_end,
+          price_brl: priceOf(sub),
+          description: 'cancel_at_period_end',
+        });
+      } else {
+        result = withFrontendAccessFields({
+          allowed: false,
+          status: 'canceled',
+          subscription: sub,
+          description: 'period_ended_after_cancel',
+          price_brl: priceOf(sub),
+          block_reason: 'canceled',
+        });
+      }
+    } else {
+      result = withFrontendAccessFields({
+        allowed: true,
+        status: 'active',
+        subscription: sub,
+        current_period_end: sub.current_period_end,
+        price_brl: priceOf(sub),
+      });
+    }
+  } else if (sub.status === 'past_due' || sub.status === 'unpaid') {
+    // Stripe em recuperação de pagamento: manter acesso (não bloquear no 1º erro)
+    result = withFrontendAccessFields({
+      allowed: true,
+      status: 'past_due',
+      subscription: sub,
+      price_brl: priceOf(sub),
+      description: 'payment_recovery',
+      payment_issue: true,
+    });
+  } else if (sub.status === 'canceled' || sub.status === 'incomplete_expired' || sub.status === 'expired') {
+    // Se ainda há período pago residual, liberar até a data
+    if (periodStillValid(sub)) {
+      result = withFrontendAccessFields({
+        allowed: true,
+        status: 'cancel_scheduled',
+        subscription: sub,
+        current_period_end: sub.current_period_end,
+        price_brl: priceOf(sub),
+        description: 'access_until_period_end',
+      });
+    } else {
+      result = withFrontendAccessFields({
+        allowed: false,
+        status: sub.status === 'canceled' ? 'canceled' : 'expired',
+        subscription: sub,
+        description: 'subscription_inactive',
+        price_brl: priceOf(sub),
+        block_reason: sub.status === 'canceled' ? 'canceled' : 'expired',
+      });
+    }
+  } else if (Number(sub.reward_free_months) > 0) {
     result = withFrontendAccessFields({
       allowed: true,
       status: 'free_credit',
       subscription: sub,
       reward_free_months: sub.reward_free_months,
-      price_brl: sub.permanent_discount_active ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL,
+      price_brl: priceOf(sub),
     });
   } else {
     result = withFrontendAccessFields({
@@ -156,7 +219,8 @@ export async function getAccessStatus(userId) {
       status: sub.status || 'expired',
       subscription: sub,
       description: 'subscription_inactive',
-      price_brl: MONTHLY_PRICE_BRL,
+      price_brl: priceOf(sub),
+      block_reason: 'inactive',
     });
   }
 
@@ -680,11 +744,61 @@ stripeOps.post('/stripe-webhook', async (c) => {
     if (secret && sig) {
       event = stripe.webhooks.constructEvent(raw, sig, secret);
     } else {
+      // Apenas em ambiente sem secret (dev). Em produção exige assinatura.
       event = JSON.parse(raw);
     }
 
+    const eventId = event.id || null;
     const type = event.type;
     const obj = event.data?.object;
+
+    // Idempotência: mesmo event.id não processa de novo
+    if (eventId) {
+      const { data: already } = await admin
+        .from('subscription_log')
+        .select('id')
+        .eq('action', `stripe_event:${eventId}`)
+        .limit(1);
+      if (already?.length) {
+        return c.json({ received: true, duplicate: true });
+      }
+    }
+
+    const mapStripeSubStatus = (stripeStatus, isDeleted) => {
+      if (isDeleted) return 'canceled';
+      const s = String(stripeStatus || '').toLowerCase();
+      if (s === 'active') return 'active';
+      if (s === 'trialing') return 'trialing';
+      if (s === 'past_due' || s === 'unpaid') return 'past_due';
+      if (s === 'canceled' || s === 'incomplete_expired') return 'canceled';
+      if (s === 'incomplete') return 'incomplete';
+      return s || 'canceled';
+    };
+
+    const periodFieldsFromStripeSub = (subObj) => {
+      const out = {};
+      if (subObj?.current_period_end) {
+        out.current_period_end = new Date(subObj.current_period_end * 1000).toISOString();
+      }
+      if (subObj?.current_period_start) {
+        out.current_period_start = new Date(subObj.current_period_start * 1000).toISOString();
+      }
+      if (typeof subObj?.cancel_at_period_end === 'boolean') {
+        out.cancel_at_period_end = subObj.cancel_at_period_end;
+      }
+      return out;
+    };
+
+    const findUserIdByStripeSub = async (stripeSubId, metaUserId) => {
+      if (metaUserId) return metaUserId;
+      if (!stripeSubId) return null;
+      const { data: rows } = await admin
+        .from('subscription')
+        .select('user_id')
+        .eq('stripe_subscription_id', stripeSubId)
+        .limit(1);
+      return rows?.[0]?.user_id || null;
+    };
 
     if (type === 'checkout.session.completed' && obj) {
       const userId = obj.metadata?.user_id || obj.client_reference_id;
@@ -701,7 +815,13 @@ stripeOps.post('/stripe-webhook', async (c) => {
           .select('id', { count: 'exact', head: true })
           .eq('user_id', userId)
           .eq('action', 'checkout_completed');
-        const isFirstPayment = !prev || (paidCount || 0) === 0 || prev.status === 'trialing' || prev.status === 'trial_expired';
+        const isFirstPayment =
+          !prev ||
+          (paidCount || 0) === 0 ||
+          prev.status === 'trialing' ||
+          prev.status === 'trial_expired' ||
+          prev.status === 'canceled' ||
+          prev.status === 'expired';
 
         const upsertPayload = {
           user_id: userId,
@@ -713,6 +833,7 @@ stripeOps.post('/stripe-webhook', async (c) => {
           permanent_free_access: prev?.permanent_free_access === true,
           permanent_discount_active: prev?.permanent_discount_active === true,
           reward_free_months: Number(prev?.reward_free_months) || 0,
+          cancel_at_period_end: false,
         };
         if (prev?.id) {
           await admin.from('subscription').update(upsertPayload).eq('id', prev.id);
@@ -723,64 +844,103 @@ stripeOps.post('/stripe-webhook', async (c) => {
         await admin.from('subscription_log').insert({
           user_id: userId,
           action: 'checkout_completed',
-          description: JSON.stringify({ session_id: obj.id, first_payment: isFirstPayment }),
+          description: JSON.stringify({ session_id: obj.id, subscription: obj.subscription }),
         });
 
         if (isFirstPayment) {
-          await processReferralOnFirstPayment(userId);
+          try {
+            await processReferralOnFirstPayment(userId);
+          } catch (e) {
+            console.warn('processReferralOnFirstPayment', e.message || e);
+          }
         }
       }
     }
 
     if (type === 'invoice.paid' && obj) {
-      const userId = obj.subscription_details?.metadata?.user_id || obj.metadata?.user_id;
-      // Busca via stripe_subscription_id
-      let uid = userId;
+      let uid =
+        obj.subscription_details?.metadata?.user_id ||
+        obj.metadata?.user_id ||
+        null;
       if (!uid && obj.subscription) {
-        const { data: rows } = await admin
-          .from('subscription')
-          .select('user_id')
-          .eq('stripe_subscription_id', obj.subscription)
-          .limit(1);
-        if (rows?.[0]) {
-          uid = rows[0].user_id;
-          await admin
-            .from('subscription')
-            .update({ status: 'active' })
-            .eq('user_id', uid);
-          await onSubscriptionRenewal(uid);
+        uid = await findUserIdByStripeSub(obj.subscription, null);
+      }
+      if (uid) {
+        const patch = { status: 'active', cancel_at_period_end: false };
+        if (obj.lines?.data?.[0]?.period?.end) {
+          patch.current_period_end = new Date(obj.lines.data[0].period.end * 1000).toISOString();
         }
-      } else if (uid) {
-        await onSubscriptionRenewal(uid);
+        if (obj.lines?.data?.[0]?.period?.start) {
+          patch.current_period_start = new Date(obj.lines.data[0].period.start * 1000).toISOString();
+        }
+        await admin.from('subscription').update(patch).eq('user_id', uid);
+        try {
+          await onSubscriptionRenewal(uid);
+        } catch (e) {
+          console.warn('onSubscriptionRenewal', e.message || e);
+        }
+      }
+    }
+
+    if (type === 'invoice.payment_failed' && obj) {
+      let uid =
+        obj.subscription_details?.metadata?.user_id ||
+        obj.metadata?.user_id ||
+        null;
+      if (!uid && obj.subscription) {
+        uid = await findUserIdByStripeSub(obj.subscription, null);
+      }
+      if (uid) {
+        // Não bloqueia: marca past_due para aviso no front; acesso permanece via getAccessStatus
+        await admin
+          .from('subscription')
+          .update({ status: 'past_due' })
+          .eq('user_id', uid);
+        await admin.from('subscription_log').insert({
+          user_id: uid,
+          action: 'invoice_payment_failed',
+          description: JSON.stringify({
+            invoice_id: obj.id,
+            attempt_count: obj.attempt_count,
+            next_payment_attempt: obj.next_payment_attempt,
+          }),
+        });
       }
     }
 
     if (type === 'customer.subscription.updated' || type === 'customer.subscription.deleted') {
-      const status =
-        obj.status === 'active' || obj.status === 'trialing' ? 'active' : 'canceled';
-      let userId = obj.metadata?.user_id;
+      const isDeleted = type.endsWith('deleted');
+      const newStatus = mapStripeSubStatus(obj?.status, isDeleted);
+      let userId = obj?.metadata?.user_id || null;
       if (!userId) {
-        const { data: rows } = await admin
-          .from('subscription')
-          .select('user_id')
-          .eq('stripe_subscription_id', obj.id)
-          .limit(1);
-        userId = rows?.[0]?.user_id;
+        userId = await findUserIdByStripeSub(obj?.id, null);
       }
       if (userId) {
-        const newStatus = type.endsWith('deleted') ? 'canceled' : status;
-        await admin
-          .from('subscription')
-          .update({
-            status: newStatus,
-            stripe_subscription_id: obj.id,
-          })
-          .eq('user_id', userId);
+        const updatePayload = {
+          status: newStatus,
+          stripe_subscription_id: obj.id,
+          ...periodFieldsFromStripeSub(obj),
+        };
+        await admin.from('subscription').update(updatePayload).eq('user_id', userId);
 
-        if (newStatus === 'canceled') {
-          await onSubscriptionCanceled(userId);
+        if (newStatus === 'canceled' && !periodFieldsFromStripeSub(obj).current_period_end) {
+          // deleted sem período residual
+          try {
+            await onSubscriptionCanceled(userId);
+          } catch (e) {
+            console.warn('onSubscriptionCanceled', e.message || e);
+          }
         }
       }
+    }
+
+    // Registra evento processado (idempotência)
+    if (eventId) {
+      await admin.from('subscription_log').insert({
+        user_id: obj?.metadata?.user_id || null,
+        action: `stripe_event:${eventId}`,
+        description: JSON.stringify({ type, object_id: obj?.id || null }),
+      });
     }
 
     return c.json({ received: true });

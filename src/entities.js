@@ -65,12 +65,18 @@ async function assertSubscription(c) {
   if (!user) return { error: c.json({ error: 'Unauthorized' }, 401) };
   const access = await getAccessStatus(user.id);
   if (!access.allowed) {
+    let message = 'Assinatura inativa. Regularize para continuar usando o sistema.';
+    if (access.status === 'trial_expired' || access.block_reason === 'trial_expired') {
+      message = 'Seu período gratuito terminou. Assine o Darocha PDV para continuar.';
+    } else if (access.status === 'canceled' || access.block_reason === 'canceled') {
+      message = 'Sua assinatura foi encerrada. Faça uma nova assinatura para voltar a utilizar o Darocha PDV.';
+    } else if (access.status === 'past_due') {
+      message = 'Há um problema com sua cobrança. Regularize o pagamento para continuar.';
+    }
     return {
       error: c.json({
         error: 'subscription_required',
-        message: access.status === 'trial_expired'
-          ? 'Seu período de teste acabou. Assine o plano de R$ 100/mês para continuar.'
-          : 'Assinatura inativa. Regularize para continuar usando o sistema.',
+        message,
         access,
       }, 402),
     };
@@ -615,6 +621,11 @@ entities.post('/:entity', async (c) => {
 entities.patch("/:entity/:id", async (c) => {
   const entity = c.req.param("entity");
   const table = tableFor(entity);
+  // Bloqueia escrita se trial acabou / sem assinatura
+  if (isTenantEntity(entity) && entity !== 'AppSettings') {
+    const gate = await assertSubscription(c);
+    if (gate.error) return gate.error;
+  }
   let body = await c.req.json();
   body = sanitizeEntityBody(body);
   // Impede troca de dono pelo cliente
@@ -792,6 +803,11 @@ entities.delete('/:entity/:id', async (c) => {
   const entity = c.req.param('entity');
   const entityNorm = normalizeEntityName(entity);
   const table = tableFor(entity);
+  // Bloqueia exclusão se trial acabou / sem assinatura
+  if (isTenantEntity(entity) && entity !== 'AppSettings') {
+    const gate = await assertSubscription(c);
+    if (gate.error) return gate.error;
+  }
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
