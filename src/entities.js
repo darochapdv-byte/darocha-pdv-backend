@@ -649,6 +649,26 @@ entities.patch("/:entity/:id", async (c) => {
   }
   body = stripUnknownForEntity(entity, body);
 
+  // Se só alterou allow_zero_stock, não precisa UPDATE vazio (evita erro falso no front)
+  if (
+    normalizeEntityName(entity) === 'AppSettings' &&
+    allowZeroStockSaved !== null &&
+    body &&
+    Object.keys(body).length === 0
+  ) {
+    try {
+      let sq = (admin || db).from(table).select('*').eq('id', c.req.param('id'));
+      sq = applyTenantFilter(sq, entity, user);
+      const { data: existing } = await sq.maybeSingle();
+      const row = toBase44Row(existing || { id: c.req.param('id') });
+      row.allow_zero_stock = allowZeroStockSaved;
+      try { invalidateListCache(entity, user?.id); } catch (_) {}
+      return c.json(row);
+    } catch (e) {
+      return c.json({ id: c.req.param('id'), allow_zero_stock: allowZeroStockSaved });
+    }
+  }
+
   // Cancelamento de venda: guardar estado anterior para devolver estoque/caixa
   let prevSaleForCancel = null;
   if (normalizeEntityName(entity) === 'Sale' && body.status != null && admin) {
