@@ -579,5 +579,175 @@ integration.post('/cancel-open-order', async (c) => {
 });
 
 
+
+/**
+ * Edita venda concluída com ajuste de estoque e totais.
+ * body: { sale_id, items, discount, notes, payment_method, reason }
+ */
+integration.post('/edit-concluded-sale', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    const body = await c.req.json().catch(() => ({}));
+    const sale_id = body.sale_id || body.id;
+    if (!sale_id) return c.json({ error: 'sale_id obrigatório' }, 400);
+    if (!body.reason || !String(body.reason).trim()) {
+      return c.json({ error: 'Informe o motivo da alteração' }, 400);
+    }
+
+    const { data: sale } = await admin.from('sale').select('*').eq('id', sale_id).maybeSingle();
+    if (!sale) return c.json({ error: 'Venda não encontrada' }, 404);
+
+    const oldItems = Array.isArray(sale.items) ? sale.items : [];
+    const newItems = Array.isArray(body.items) ? body.items : oldItems;
+
+    // mapa qty por produto
+    const oldMap = {};
+    for (const it of oldItems) {
+      if (!it.product_id) continue;
+      oldMap[it.product_id] = (oldMap[it.product_id] || 0) + (Number(it.qty) || 0);
+    }
+    const newMap = {};
+    for (const it of newItems) {
+      if (!it.product_id) continue;
+      newMap[it.product_id] = (newMap[it.product_id] || 0) + (Number(it.qty) || 0);
+    }
+
+    const allIds = new Set([...Object.keys(oldMap), ...Object.keys(newMap)]);
+    for (const pid of allIds) {
+      const delta = (newMap[pid] || 0) - (oldMap[pid] || 0);
+      if (delta === 0) continue;
+      const { data: prod } = await admin.from('product').select('id,stock,name').eq('id', pid).maybeSingle();
+      if (!prod) continue;
+      // delta > 0 = mais vendido = baixa estoque; delta < 0 = devolve
+      const nextStock = (Number(prod.stock) || 0) - delta;
+      await admin.from('product').update({ stock: nextStock }).eq('id', pid);
+    }
+
+    let subtotal = 0;
+    const normalized = newItems.map((it) => {
+      const qty = Number(it.qty) || 0;
+      const unit = Number(it.unit_price) || 0;
+      const total = Math.round(qty * unit * 100) / 100;
+      subtotal += total;
+      return {
+        product_id: it.product_id,
+        name: it.name || '',
+        qty,
+        unit_price: unit,
+        total,
+        discount: Number(it.discount) || 0,
+      };
+    });
+    subtotal = Math.round(subtotal * 100) / 100;
+    const discount = Number(body.discount != null ? body.discount : sale.discount) || 0;
+    const deliveryFee = Number(sale.delivery_fee) || 0;
+    const feeAmount = Number(body.fee_amount != null ? body.fee_amount : sale.fee_amount) || 0;
+    const total = Math.round((subtotal - discount + deliveryFee + feeAmount) * 100) / 100;
+
+    const updates = {
+      items: normalized,
+      subtotal,
+      discount,
+      total,
+      notes: body.notes != null ? body.notes : sale.notes,
+    };
+    if (body.payment_method) updates.payment_method = body.payment_method;
+    if (body.payments) updates.payments = body.payments;
+    if (body.installment_plan) updates.installment_plan = body.installment_plan;
+
+    const { data: updated, error } = await admin
+      .from('sale')
+      .update(updates)
+      .eq('id', sale_id)
+      .select()
+      .maybeSingle();
+    if (error) return c.json({ error: error.message }, 500);
+
+    try {
+      await admin.from('sale_audit_log').insert({
+        sale_id,
+        user_name: user.full_name || user.email || user.id,
+        action: 'edicao',
+        reason: String(body.reason).trim(),
+        previous_values: JSON.stringify({
+          items: oldItems,
+          discount: sale.discount,
+          total: sale.total,
+          payment_method: sale.payment_method,
+        }),
+        new_values: JSON.stringify({
+          items: normalized,
+          discount,
+          total,
+          payment_method: updates.payment_method || sale.payment_method,
+        }),
+        created_by: user.id,
+      });
+    } catch (e) {
+      console.warn('sale_audit_log', e.message);
+    }
+
+    await logOperation({
+      type: 'sale_edit',
+      level: 'info',
+      description: `Venda editada #${String(sale_id).slice(-6).toUpperCase()}: ${body.reason}`,
+      operator_name: user.full_name || user.email || '',
+      sale_id,
+    });
+
+    return c.json({ ok: true, sale: toBase44Row(updated) });
+  } catch (e) {
+    console.error('edit-concluded-sale', e);
+    return c.json({ error: e.message || 'failed' }, 500);
+  }
+});
+
+/**
+ * Marca parcela de vale como paga
+ * body: { sale_id, parcel_n, paid?: true }
+ */
+integration.post('/mark-vale-paid', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    const body = await c.req.json().catch(() => ({}));
+    const sale_id = body.sale_id;
+    const parcel_n = Number(body.parcel_n);
+    if (!sale_id || !parcel_n) return c.json({ error: 'sale_id e parcel_n obrigatórios' }, 400);
+
+    const { data: sale } = await admin.from('sale').select('*').eq('id', sale_id).maybeSingle();
+    if (!sale) return c.json({ error: 'Venda não encontrada' }, 404);
+
+    const plan = Array.isArray(sale.installment_plan) ? [...sale.installment_plan] : [];
+    const idx = plan.findIndex((p) => Number(p.n) === parcel_n);
+    if (idx < 0) return c.json({ error: 'Parcela não encontrada' }, 404);
+
+    plan[idx] = {
+      ...plan[idx],
+      paid: body.paid !== false,
+      paid_at: body.paid === false ? null : new Date().toISOString(),
+      paid_by: body.paid === false ? null : (user.full_name || user.email || user.id),
+    };
+
+    const { data: updated, error } = await admin
+      .from('sale')
+      .update({ installment_plan: plan })
+      .eq('id', sale_id)
+      .select()
+      .maybeSingle();
+    if (error) return c.json({ error: error.message }, 500);
+
+    return c.json({ ok: true, sale: toBase44Row(updated), plan });
+  } catch (e) {
+    return c.json({ error: e.message || 'failed' }, 500);
+  }
+});
+
+
 export default integration;
 export { integration };
