@@ -826,7 +826,7 @@ functions.post('/sales-revenue-summary', async (c) => {
     for (let guard = 0; guard < 100; guard++) {
       const { data, error } = await admin
         .from('sale')
-        .select('id,total,status,fee_amount,delivery_fee,created_at,seller_id,seller_name')
+        .select('id,total,status,fee_amount,delivery_fee,created_at,seller_id,seller_name,source,delivery_type')
         .eq('created_by', user.id)
         .order('created_at', { ascending: false })
         .range(offset, offset + pageSize - 1);
@@ -849,24 +849,34 @@ functions.post('/sales-revenue-summary', async (c) => {
       let pendingTotal = 0;
       let pendingCount = 0;
       const byStatus = {};
+      const bySeller = {};
+      let presencial = 0;
+      let online = 0;
       for (const s of all) {
         const ts = saleTime(s);
         if (ts == null || ts < fromMs || ts > toMs) continue;
         const stKey = String(s.status || '(vazio)');
         byStatus[stKey] = (byStatus[stKey] || 0) + (Number(s.total) || 0);
         if (isCounted(s)) {
-          total += Number(s.total) || 0;
+          const amt = Number(s.total) || 0;
+          total += amt;
           feeTotal += Number(s.fee_amount) || 0;
           deliveryTotal += Number(s.delivery_fee) || 0;
           count += 1;
+          const sid = String(s.seller_id || s.seller_name || '_sem_vendedor');
+          if (!bySeller[sid]) bySeller[sid] = { seller_id: s.seller_id || null, seller_name: s.seller_name || '', total: 0, count: 0 };
+          bySeller[sid].total += amt;
+          bySeller[sid].count += 1;
+          const isOnline = s.source === 'catalog' || s.delivery_type === 'entrega' || s.delivery_type === 'retirada';
+          if (isOnline) online += amt; else presencial += amt;
         } else {
           pendingTotal += Number(s.total) || 0;
           pendingCount += 1;
         }
       }
-      // arredonda cada status
-      for (const k of Object.keys(byStatus)) {
-        byStatus[k] = Math.round(byStatus[k] * 100) / 100;
+      for (const k of Object.keys(byStatus)) byStatus[k] = Math.round(byStatus[k] * 100) / 100;
+      for (const k of Object.keys(bySeller)) {
+        bySeller[k].total = Math.round(bySeller[k].total * 100) / 100;
       }
       return {
         total: Math.round(total * 100) / 100,
@@ -876,6 +886,11 @@ functions.post('/sales-revenue-summary', async (c) => {
         pending_total: Math.round(pendingTotal * 100) / 100,
         pending_count: pendingCount,
         by_status: byStatus,
+        by_seller: bySeller,
+        by_channel: {
+          presencial: Math.round(presencial * 100) / 100,
+          online: Math.round(online * 100) / 100,
+        },
       };
     }
 
@@ -901,6 +916,8 @@ functions.post('/sales-revenue-summary', async (c) => {
       scanned: all.length,
       pages,
       by_status: current.by_status || {},
+      by_seller: current.by_seller || {},
+      by_channel: current.by_channel || { presencial: 0, online: 0 },
     });
   } catch (e) {
     console.error('sales-revenue-summary', e);
