@@ -77,8 +77,9 @@ catalogExtra.post('/address-search', async (c) => {
       return c.json({ error: 'Informe ao menos 3 caracteres para a busca.' }, 400);
     }
 
-    // ViaCEP se for CEP puro
     const digits = query.replace(/\D/g, '');
+
+    // 1) CEP puro (8 dígitos)
     if (digits.length === 8) {
       try {
         const r = await fetch(`https://viacep.com.br/ws/${digits}/json/`, { signal: AbortSignal.timeout(8000) });
@@ -86,7 +87,7 @@ catalogExtra.post('/address-search', async (c) => {
         if (!j.erro) {
           return c.json({
             candidates: [{
-              cep: digits,
+              cep: String(j.cep || digits).replace(/\D/g, ''),
               street: j.logradouro || '',
               neighborhood: j.bairro || '',
               city: j.localidade || '',
@@ -97,26 +98,98 @@ catalogExtra.post('/address-search', async (c) => {
       } catch { /* fallthrough */ }
     }
 
-    // BrasilAPI / OpenStreetMap Nominatim fallback
+    // 2) ViaCEP por UF/cidade/logradouro — formato: "Rua X, Cidade - UF" ou "Rua X Cidade UF"
+    async function viaCepStreet(uf, city, street) {
+      if (!uf || !city || !street || street.length < 3) return [];
+      const url = `https://viacep.com.br/ws/${encodeURIComponent(uf)}/${encodeURIComponent(city)}/${encodeURIComponent(street)}/json/`;
+      const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+      const j = await r.json();
+      const arr = Array.isArray(j) ? j : (j && !j.erro ? [j] : []);
+      return arr.slice(0, 8).map((row) => ({
+        cep: String(row.cep || '').replace(/\D/g, ''),
+        street: row.logradouro || street,
+        neighborhood: row.bairro || '',
+        city: row.localidade || city,
+        state: row.uf || uf,
+      })).filter((x) => x.cep);
+    }
+
+    // Tenta extrair UF (2 letras no final) e cidade
+    let ufGuess = '';
+    let cityGuess = '';
+    let streetGuess = query;
+    const ufMatch = query.match(/\b([A-Za-z]{2})\s*$/);
+    if (ufMatch) {
+      ufGuess = ufMatch[1].toUpperCase();
+      streetGuess = query.slice(0, ufMatch.index).trim().replace(/[,-]\s*$/, '');
+    }
+    // "rua, cidade" ou "rua - cidade"
+    const parts = streetGuess.split(/,|\s+-\s+/).map((s) => s.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      streetGuess = parts[0];
+      cityGuess = parts[parts.length - 1];
+    }
+
+    // UFs comuns se não informada — tenta com cidades do body
+    const bodyCity = String(body.city || body.cidade || '').trim();
+    const bodyUf = String(body.state || body.uf || ufGuess || '').trim().toUpperCase();
+    if (bodyCity) cityGuess = bodyCity;
+    if (bodyUf) ufGuess = bodyUf;
+
+    if (ufGuess && cityGuess && streetGuess) {
+      try {
+        const found = await viaCepStreet(ufGuess, cityGuess, streetGuess);
+        if (found.length) return c.json({ candidates: found });
+      } catch { /* fallthrough */ }
+    }
+
+    // 3) Nominatim + enriquecer CEP via ViaCEP
     try {
       const r = await fetch(
-        `https://nominatim.openstreetmap.org/search?format=json&countrycodes=br&limit=5&q=${encodeURIComponent(query)}`,
+        `https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&countrycodes=br&limit=6&q=${encodeURIComponent(query + ' Brasil')}`,
         {
-          headers: { 'User-Agent': 'DarochaPDV/1.0' },
+          headers: { 'User-Agent': 'DarochaPDV/1.0 (contato@darochapdv.com)' },
           signal: AbortSignal.timeout(10000),
         }
       );
       const arr = await r.json();
-      const candidates = (arr || []).map((a) => {
-        const parts = (a.display_name || '').split(',').map((s) => s.trim());
-        return {
-          cep: '',
-          street: parts[0] || '',
-          neighborhood: parts[1] || '',
-          city: parts[parts.length - 3] || parts[2] || '',
-          state: (parts[parts.length - 2] || '').slice(0, 2).toUpperCase(),
-        };
-      });
+      const candidates = [];
+      for (const a of arr || []) {
+        const addr = a.address || {};
+        const street = addr.road || addr.pedestrian || addr.street || (a.display_name || '').split(',')[0] || '';
+        const neighborhood = addr.suburb || addr.neighbourhood || addr.quarter || addr.city_district || '';
+        const city = addr.city || addr.town || addr.village || addr.municipality || '';
+        const state = String(addr.state_code || addr.state || '').slice(0, 2).toUpperCase();
+        let cep = String(addr.postcode || '').replace(/\D/g, '').slice(0, 8);
+
+        // Se não veio CEP, tenta ViaCEP com rua+cidade+UF
+        if (cep.length !== 8 && state && city && street) {
+          try {
+            const extra = await viaCepStreet(state, city, street.split(',')[0].trim());
+            if (extra[0]?.cep) {
+              cep = extra[0].cep;
+              candidates.push({
+                cep,
+                street: extra[0].street || street,
+                neighborhood: extra[0].neighborhood || neighborhood,
+                city: extra[0].city || city,
+                state: extra[0].state || state,
+              });
+              continue;
+            }
+          } catch { /* ignore */ }
+        }
+
+        candidates.push({
+          cep: cep.length === 8 ? cep : '',
+          street,
+          neighborhood,
+          city,
+          state,
+        });
+      }
+      // Preferir os que têm CEP
+      candidates.sort((a, b) => (b.cep ? 1 : 0) - (a.cep ? 1 : 0));
       return c.json({ candidates });
     } catch (e) {
       return c.json({ candidates: [], error: e.message });

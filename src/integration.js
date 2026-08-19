@@ -214,8 +214,20 @@ integration.post('/delivery-complete', async (c) => {
       delivery_status: 'entregue',
     };
 
-    if (cash_received != null) updates.cash_received = Number(cash_received) || 0;
-    if (change_amount != null) updates.change_amount = Number(change_amount) || 0;
+    if (cash_received != null) {
+      updates.cash_received = Number(cash_received) || 0;
+    } else if (isCash && body.cash_change_for != null) {
+      updates.cash_received = Number(body.cash_change_for) || 0;
+    }
+    if (change_amount != null) {
+      updates.change_amount = Number(change_amount) || 0;
+    } else if (updates.cash_received != null && Number(sale.total) > 0) {
+      updates.change_amount = Math.max(0, Number(updates.cash_received) - Number(sale.total));
+    }
+    // Garante que o valor físico recebido não seja perdido
+    if (isCash && updates.cash_received == null && sale.cash_received == null) {
+      // não inventa valor; front deve enviar cash_received
+    }
 
     // Dinheiro com entregador → prestação de contas
     if (isCash && sale.cash_confirmed !== true) {
@@ -447,13 +459,23 @@ integration.post('/courier-balance', async (c) => {
       .order('created_at', { ascending: false })
       .limit(50);
 
-    let heldCash = 0;
+    let heldCash = 0; // valor físico recebido do cliente (não desconta troco)
+    let heldNet = 0;  // após troco (o que sobra para a loja)
+    let totalDeliveryFees = 0;
     for (const s of pending || []) {
-      if (s.payment_method === 'dinheiro') {
-        const received = Number(s.cash_received || s.total) || 0;
-        const change = Number(s.change_amount) || 0;
-        heldCash += Math.max(0, received - change);
+      totalDeliveryFees += Number(s.delivery_fee) || 0;
+      const isCash =
+        s.payment_method === 'dinheiro' ||
+        (Array.isArray(s.payments) && s.payments.some((p) => p.method === 'dinheiro'));
+      if (!isCash) continue;
+      let received = Number(s.cash_received || s.cash_change_for) || 0;
+      if (!received && s.payment_method === 'misto' && Array.isArray(s.payments)) {
+        received = s.payments.filter((p) => p.method === 'dinheiro').reduce((a, p) => a + (Number(p.amount) || 0), 0);
       }
+      if (!received) received = Number(s.total) || 0;
+      const change = Number(s.change_amount) || 0;
+      heldCash += received;
+      heldNet += Math.max(0, received - change);
     }
 
     const totalSettled = (closings || []).reduce(
@@ -466,6 +488,8 @@ integration.post('/courier-balance', async (c) => {
       pending_sales: toBase44Rows(pending || []),
       pending_count: (pending || []).length,
       cash_held_by_courier: heldCash,
+      cash_held_net_after_change: heldNet,
+      total_delivery_fees_pending: Math.round(totalDeliveryFees * 100) / 100,
       closings: toBase44Rows(closings || []),
       total_settled_historical: totalSettled,
     });
