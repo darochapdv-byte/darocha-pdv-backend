@@ -498,5 +498,86 @@ integration.post('/courier-balance', async (c) => {
   }
 });
 
+
+/**
+ * Cancela pedido em aberto (PDV salvo ou catálogo orçamento) e devolve estoque.
+ */
+integration.post('/cancel-open-order', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    const body = await c.req.json().catch(() => ({}));
+    const sale_id = body.sale_id || body.id;
+    if (!sale_id) return c.json({ error: 'sale_id obrigatório' }, 400);
+
+    const { data: sale } = await admin.from('sale').select('*').eq('id', sale_id).maybeSingle();
+    if (!sale) return c.json({ error: 'Pedido não encontrado' }, 404);
+    if (sale.created_by && user.id && sale.created_by !== user.id) {
+      // multi-tenant: allow if same store owner
+      // if strict, check created_by
+    }
+
+    const st = String(sale.status || '').toLowerCase();
+    if (st === 'cancelado' || st === 'cancelada') {
+      return c.json({ ok: true, already: true });
+    }
+    // Só cancela abertos / orçamento / aguardando (não vendas concluídas sem fluxo de cancelamento formal)
+    const openStatuses = ['pedido_aberto', 'orcamento', 'orçamento', 'aguardando'];
+    if (!openStatuses.includes(st) && sale.source !== 'catalog') {
+      // ainda permite se delivery_status aguardando
+      if (String(sale.delivery_status || '').toLowerCase() !== 'aguardando') {
+        return c.json({ error: 'Este pedido não pode ser cancelado por este fluxo.' }, 400);
+      }
+    }
+
+    // Devolve estoque dos itens
+    for (const it of sale.items || []) {
+      if (!it.product_id || !it.qty) continue;
+      try {
+        const { data: p } = await admin.from('product').select('id,stock').eq('id', it.product_id).maybeSingle();
+        if (p) {
+          await admin.from('product').update({
+            stock: (Number(p.stock) || 0) + Number(it.qty),
+          }).eq('id', it.product_id);
+        }
+      } catch (e) {
+        console.warn('cancel-open-order stock', e.message);
+      }
+    }
+
+    const { data: updated, error } = await admin
+      .from('sale')
+      .update({
+        status: 'cancelado',
+        pickup_status: sale.pickup_status === 'aguardando' ? 'cancelado' : sale.pickup_status,
+        delivery_status: sale.delivery_status === 'aguardando' ? 'cancelado' : sale.delivery_status,
+        cancelled_at: new Date().toISOString(),
+        cancelled_by: user.full_name || user.email || user.id,
+      })
+      .eq('id', sale_id)
+      .select()
+      .maybeSingle();
+    if (error) return c.json({ error: error.message }, 500);
+
+    try {
+      await logOperation({
+        type: 'order_cancel',
+        level: 'info',
+        description: `Pedido cancelado #${String(sale_id).slice(-6).toUpperCase()}`,
+        operator_name: user.full_name || user.email || '',
+        sale_id,
+      });
+    } catch (_) {}
+
+    return c.json({ ok: true, sale: toBase44Row(updated || { id: sale_id, status: 'cancelado' }) });
+  } catch (e) {
+    console.error('cancel-open-order', e);
+    return c.json({ error: e.message || 'failed' }, 500);
+  }
+});
+
+
 export default integration;
 export { integration };
