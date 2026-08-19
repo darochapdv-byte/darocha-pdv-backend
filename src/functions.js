@@ -811,8 +811,11 @@ functions.post('/sales-revenue-summary', async (c) => {
     }
 
     function isConcluded(s) {
-      const st = String(s.status || '').toLowerCase().normalize('NFD').replace(/\p{M}/gu, '');
-      return st === 'concluida' || st === 'finalizada' || st === 'pago' || st === 'paid';
+      const st = String(s.status || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+      if (!st) return true; // legado sem status
+      if (st.includes('cancel')) return false;
+      if (st === 'orcamento' || st === 'pedido_aberto' || st === 'aguardando') return false;
+      return st === 'concluida' || st === 'finalizada' || st === 'pago' || st === 'paid' || st === 'entregue' || st === 'completed';
     }
 
     // Carrega vendas recentes em páginas (sem filtro de data no SQL — mais compatível)
