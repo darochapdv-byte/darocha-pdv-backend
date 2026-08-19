@@ -773,30 +773,28 @@ functions.post('/sales-revenue-summary', async (c) => {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
     const body = await c.req.json().catch(() => ({}));
-    // Usa fuso de Brasília para delimitar o mês
-    const now = new Date();
-    const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit' });
-    const partsNow = fmt.formatToParts(now);
-    const yNow = Number(partsNow.find((p) => p.type === 'year').value);
-    const mNow = Number(partsNow.find((p) => p.type === 'month').value) - 1; // 0-11
-    const year = Number(body.year) || yNow;
-    const month = body.month != null ? Number(body.month) : mNow;
 
-    // Início/fim do mês em BRT → ISO
-    function brtBound(y, m, day, h, mi, s, ms) {
-      // constrói string local BRT e interpreta
-      const pad = (n) => String(n).padStart(2, '0');
-      const local = `${y}-${pad(m + 1)}-${pad(day)}T${pad(h)}:${pad(mi)}:${pad(s)}.${String(ms).padStart(3, '0')}-03:00`;
-      return new Date(local);
-    }
+    // Mês em America/Sao_Paulo
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Sao_Paulo',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    const nowParts = Object.fromEntries(fmt.formatToParts(new Date()).map((p) => [p.type, p.value]));
+    const year = Number(body.year) || Number(nowParts.year);
+    const month = body.month != null ? Number(body.month) : Number(nowParts.month) - 1;
+
+    const pad = (n) => String(n).padStart(2, '0');
     const lastDay = new Date(year, month + 1, 0).getDate();
-    const start = brtBound(year, month, 1, 0, 0, 0, 0);
-    const end = brtBound(year, month, lastDay, 23, 59, 59, 999);
-    const prevLast = new Date(year, month, 0).getDate();
+    // bounds BRT
+    const start = new Date(`${year}-${pad(month + 1)}-01T00:00:00.000-03:00`);
+    const end = new Date(`${year}-${pad(month + 1)}-${pad(lastDay)}T23:59:59.999-03:00`);
     const prevMonth = month === 0 ? 11 : month - 1;
     const prevYear = month === 0 ? year - 1 : year;
-    const prevStart = brtBound(prevYear, prevMonth, 1, 0, 0, 0, 0);
-    const prevEnd = brtBound(prevYear, prevMonth, prevLast, 23, 59, 59, 999);
+    const prevLast = new Date(prevYear, prevMonth + 1, 0).getDate();
+    const prevStart = new Date(`${prevYear}-${pad(prevMonth + 1)}-01T00:00:00.000-03:00`);
+    const prevEnd = new Date(`${prevYear}-${pad(prevMonth + 1)}-${pad(prevLast)}T23:59:59.999-03:00`);
 
     const startMs = start.getTime();
     const endMs = end.getTime();
@@ -810,37 +808,36 @@ functions.post('/sales-revenue-summary', async (c) => {
       return Number.isNaN(t) ? null : t;
     }
 
-    function isConcluded(s) {
-      const st = String(s.status || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
-      if (!st) return true;
-      // Só exclui canceladas e pedidos ainda não efetivados
+    function isCounted(s) {
+      const st = String(s.status || '')
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '');
       if (st.includes('cancel')) return false;
-      if (st === 'orcamento' || st === 'orçamento' || st === 'pedido_aberto') return false;
-      // Inclui concluida, entregue, aguardando prestacao de contas, etc.
+      if (st === 'orcamento' || st === 'pedido_aberto') return false;
       return true;
     }
 
-    // Carrega vendas recentes em páginas (sem filtro de data no SQL — mais compatível)
+    // Pagina TODAS as vendas da loja até passar o mês anterior (sem early-break agressivo)
     const all = [];
     const pageSize = 1000;
     let offset = 0;
-    for (let guard = 0; guard < 40; guard++) {
+    let pages = 0;
+    for (let guard = 0; guard < 100; guard++) {
       const { data, error } = await admin
         .from('sale')
-        .select('id,total,status,fee_amount,delivery_fee,created_at,created_date')
+        .select('id,total,status,fee_amount,delivery_fee,created_at,seller_id,seller_name')
         .eq('created_by', user.id)
         .order('created_at', { ascending: false })
         .range(offset, offset + pageSize - 1);
       if (error) {
-        console.warn('sales-revenue-summary list', error.message);
+        console.warn('sales-revenue-summary', error.message);
         break;
       }
       const rows = data || [];
+      pages += 1;
       all.push(...rows);
       if (rows.length < pageSize) break;
-      // para cedo se a página inteira já é anterior ao mês passado
-      const oldest = saleTime(rows[rows.length - 1]);
-      if (oldest != null && oldest < prevStartMs) break;
       offset += pageSize;
     }
 
@@ -855,20 +852,21 @@ functions.post('/sales-revenue-summary', async (c) => {
       for (const s of all) {
         const ts = saleTime(s);
         if (ts == null || ts < fromMs || ts > toMs) continue;
-        const st = String(s.status || '(vazio)');
-        byStatus[st] = (byStatus[st] || 0) + (Number(s.total) || 0);
-        if (isConcluded(s)) {
+        const stKey = String(s.status || '(vazio)');
+        byStatus[stKey] = (byStatus[stKey] || 0) + (Number(s.total) || 0);
+        if (isCounted(s)) {
           total += Number(s.total) || 0;
           feeTotal += Number(s.fee_amount) || 0;
           deliveryTotal += Number(s.delivery_fee) || 0;
           count += 1;
         } else {
-          const stl = st.toLowerCase();
-          if (stl.includes('orcamento') || stl === 'pedido_aberto') {
-            pendingTotal += Number(s.total) || 0;
-            pendingCount += 1;
-          }
+          pendingTotal += Number(s.total) || 0;
+          pendingCount += 1;
         }
+      }
+      // arredonda cada status
+      for (const k of Object.keys(byStatus)) {
+        byStatus[k] = Math.round(byStatus[k] * 100) / 100;
       }
       return {
         total: Math.round(total * 100) / 100,
@@ -901,6 +899,7 @@ functions.post('/sales-revenue-summary', async (c) => {
       pending_catalog: { total: current.pending_total, count: current.pending_count },
       revenue_including_pending: Math.round((current.total + current.pending_total) * 100) / 100,
       scanned: all.length,
+      pages,
       by_status: current.by_status || {},
     });
   } catch (e) {
