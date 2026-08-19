@@ -812,10 +812,12 @@ functions.post('/sales-revenue-summary', async (c) => {
 
     function isConcluded(s) {
       const st = String(s.status || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
-      if (!st) return true; // legado sem status
+      if (!st) return true;
+      // Só exclui canceladas e pedidos ainda não efetivados
       if (st.includes('cancel')) return false;
-      if (st === 'orcamento' || st === 'pedido_aberto' || st === 'aguardando') return false;
-      return st === 'concluida' || st === 'finalizada' || st === 'pago' || st === 'paid' || st === 'entregue' || st === 'completed';
+      if (st === 'orcamento' || st === 'orçamento' || st === 'pedido_aberto') return false;
+      // Inclui concluida, entregue, aguardando prestacao de contas, etc.
+      return true;
     }
 
     // Carrega vendas recentes em páginas (sem filtro de data no SQL — mais compatível)
@@ -849,17 +851,20 @@ functions.post('/sales-revenue-summary', async (c) => {
       let deliveryTotal = 0;
       let pendingTotal = 0;
       let pendingCount = 0;
+      const byStatus = {};
       for (const s of all) {
         const ts = saleTime(s);
         if (ts == null || ts < fromMs || ts > toMs) continue;
+        const st = String(s.status || '(vazio)');
+        byStatus[st] = (byStatus[st] || 0) + (Number(s.total) || 0);
         if (isConcluded(s)) {
           total += Number(s.total) || 0;
           feeTotal += Number(s.fee_amount) || 0;
           deliveryTotal += Number(s.delivery_fee) || 0;
           count += 1;
         } else {
-          const st = String(s.status || '').toLowerCase();
-          if (st.includes('orcamento') || st.includes('aguardando')) {
+          const stl = st.toLowerCase();
+          if (stl.includes('orcamento') || stl === 'pedido_aberto') {
             pendingTotal += Number(s.total) || 0;
             pendingCount += 1;
           }
@@ -872,6 +877,7 @@ functions.post('/sales-revenue-summary', async (c) => {
         delivery_total: Math.round(deliveryTotal * 100) / 100,
         pending_total: Math.round(pendingTotal * 100) / 100,
         pending_count: pendingCount,
+        by_status: byStatus,
       };
     }
 
@@ -895,6 +901,7 @@ functions.post('/sales-revenue-summary', async (c) => {
       pending_catalog: { total: current.pending_total, count: current.pending_count },
       revenue_including_pending: Math.round((current.total + current.pending_total) * 100) / 100,
       scanned: all.length,
+      by_status: current.by_status || {},
     });
   } catch (e) {
     console.error('sales-revenue-summary', e);
