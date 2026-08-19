@@ -174,8 +174,8 @@ entities.get('/:entity', async (c) => {
   const table = tableFor(entity);
   // Product: default alto — PDV precisa listar o catálogo inteiro da loja
   const entityNorm = normalizeEntityName(entity);
-  const defaultLimit = entityNorm === 'Product' ? 5000 : entityNorm === 'Sale' ? 5000 : 100;
-  const limit = Math.min(Math.max(1, Number(c.req.query('limit') || defaultLimit) || defaultLimit), 5000);
+  const defaultLimit = entityNorm === 'Product' ? 5000 : entityNorm === 'Sale' ? 15000 : 100;
+  const limit = Math.min(Math.max(1, Number(c.req.query('limit') || defaultLimit) || defaultLimit), entityNorm === 'Sale' ? 20000 : 5000);
   const { column, ascending } = parseOrder(c.req.query('order'));
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);

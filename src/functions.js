@@ -686,6 +686,129 @@ functions.post("/finalize-sale", async (c) => {
 });
 
 
+
+// Soma de faturamento no servidor (evita limite de paginação do front)
+functions.post('/sales-revenue-summary', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    const body = await c.req.json().catch(() => ({}));
+    const now = new Date();
+    const year = Number(body.year) || now.getFullYear();
+    const month = body.month != null ? Number(body.month) : now.getMonth(); // 0-11
+
+    const start = new Date(year, month, 1, 0, 0, 0, 0);
+    const end = new Date(year, month + 1, 0, 23, 59, 59, 999);
+    const prevStart = new Date(year, month - 1, 1, 0, 0, 0, 0);
+    const prevEnd = new Date(year, month, 0, 23, 59, 59, 999);
+
+    const startIso = start.toISOString();
+    const endIso = end.toISOString();
+    const prevStartIso = prevStart.toISOString();
+    const prevEndIso = prevEnd.toISOString();
+
+    // Busca todas as vendas do período (paginado no server)
+    async function sumPeriod(fromIso, toIso) {
+      let total = 0;
+      let count = 0;
+      let feeTotal = 0;
+      let deliveryTotal = 0;
+      let offset = 0;
+      const pageSize = 1000;
+      for (let guard = 0; guard < 50; guard++) {
+        const { data, error } = await admin
+          .from('sale')
+          .select('id,total,status,fee_amount,delivery_fee,created_at,created_date')
+          .eq('created_by', user.id)
+          .in('status', ['concluida', 'concluída', 'finalizada'])
+          .gte('created_at', fromIso)
+          .lte('created_at', toIso)
+          .order('created_at', { ascending: false })
+          .range(offset, offset + pageSize - 1);
+        if (error) {
+          // fallback created_date text field
+          console.warn('sales-revenue-summary page', error.message);
+          break;
+        }
+        const rows = data || [];
+        for (const s of rows) {
+          total += Number(s.total) || 0;
+          feeTotal += Number(s.fee_amount) || 0;
+          deliveryTotal += Number(s.delivery_fee) || 0;
+          count += 1;
+        }
+        if (rows.length < pageSize) break;
+        offset += pageSize;
+      }
+      return {
+        total: Math.round(total * 100) / 100,
+        count,
+        fee_total: Math.round(feeTotal * 100) / 100,
+        delivery_total: Math.round(deliveryTotal * 100) / 100,
+      };
+    }
+
+    // Também contar orcamento do mês (pedidos catálogo ainda não finalizados) — informativo
+    async function sumOrcamento(fromIso, toIso) {
+      let total = 0;
+      let count = 0;
+      let offset = 0;
+      const pageSize = 1000;
+      for (let guard = 0; guard < 30; guard++) {
+        const { data, error } = await admin
+          .from('sale')
+          .select('id,total,status,created_at')
+          .eq('created_by', user.id)
+          .in('status', ['orcamento', 'orçamento', 'aguardando'])
+          .gte('created_at', fromIso)
+          .lte('created_at', toIso)
+          .range(offset, offset + pageSize - 1);
+        if (error) break;
+        const rows = data || [];
+        for (const s of rows) {
+          total += Number(s.total) || 0;
+          count += 1;
+        }
+        if (rows.length < pageSize) break;
+        offset += pageSize;
+      }
+      return { total: Math.round(total * 100) / 100, count };
+    }
+
+    const [current, previous, pending] = await Promise.all([
+      sumPeriod(startIso, endIso),
+      sumPeriod(prevStartIso, prevEndIso),
+      sumOrcamento(startIso, endIso),
+    ]);
+
+    const pct = previous.total > 0 ? ((current.total - previous.total) / previous.total) * 100 : null;
+
+    return c.json({
+      ok: true,
+      year,
+      month,
+      month_start: startIso,
+      month_end: endIso,
+      revenue: current.total,
+      sales_count: current.count,
+      fee_total: current.fee_total,
+      delivery_total: current.delivery_total,
+      prev_revenue: previous.total,
+      prev_sales_count: previous.count,
+      pct_vs_prev: pct,
+      pending_catalog: pending,
+      // total "bruto" se alguém somar também pedidos em aberto
+      revenue_including_pending: Math.round((current.total + pending.total) * 100) / 100,
+    });
+  } catch (e) {
+    console.error('sales-revenue-summary', e);
+    return c.json({ error: e.message || 'failed' }, 500);
+  }
+});
+
+
 // ─── app-bootstrap: 1 request = dados iniciais do app ───────────────────────
 // Reduz 6–10 round-trips do front para 1 (bem mais rápido no celular/3G).
 
@@ -799,7 +922,7 @@ functions.post('/:name', async (c) => {
   'barcode-lookup','product-name-lookup','enrich-product','save-product','repair-product-ownership','refresh-products-catalog',
   'start-stock-count','stock-count-search','stock-count-apply','sync-pdv-reservations',
   'admin-stats','cleanup-cash-sessions','purge-account','init-help-content',
-  'app-bootstrap','create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','get-access-status','access-status','referral-panel','master-code-status','ensure-referral-code','cancel-subscription','resume-subscription',
+  'sales-revenue-summary','app-bootstrap','create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','get-access-status','access-status','referral-panel','master-code-status','ensure-referral-code','cancel-subscription','resume-subscription',
   'fetch-nfe-xml','import-nfe','address-search',
 ];
   if (implemented.includes(name)) return c.json({ error: 'routing_error' }, 500);
