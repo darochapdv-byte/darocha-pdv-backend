@@ -516,6 +516,8 @@ functions.post("/finalize-sale", async (c) => {
           discount: sale.discount != null ? sale.discount : saleRow.discount,
           subtotal: sale.subtotal != null ? sale.subtotal : saleRow.subtotal,
           fee_amount: sale.fee_amount != null ? sale.fee_amount : saleRow.fee_amount,
+          installment_plan: sale.installment_plan != null ? sale.installment_plan : saleRow.installment_plan,
+          vale_interval_days: sale.vale_interval_days != null ? sale.vale_interval_days : saleRow.vale_interval_days,
           change_amount: sale.change_amount != null ? sale.change_amount : saleRow.change_amount,
           cash_received: sale.cash_received != null ? sale.cash_received : saleRow.cash_received,
           cash_change_for: sale.cash_change_for != null ? sale.cash_change_for : saleRow.cash_change_for,
@@ -688,6 +690,82 @@ functions.post("/finalize-sale", async (c) => {
 
 
 // Soma de faturamento no servidor (evita limite de paginação do front)
+
+// Verifica parcelas de vale próximas/vencidas e cria notificações
+functions.post('/check-vale-due', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    const body = await c.req.json().catch(() => ({}));
+    const warnDays = Math.min(Math.max(Number(body.warn_days) || 3, 0), 30);
+
+    const { data: sales } = await admin
+      .from('sale')
+      .select('id,customer_name,customer_phone,total,installment_plan,payment_method,status,created_by')
+      .eq('created_by', user.id)
+      .eq('payment_method', 'vale')
+      .order('created_at', { ascending: false })
+      .limit(500);
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    let created = 0;
+
+    for (const sale of sales || []) {
+      const plan = Array.isArray(sale.installment_plan) ? sale.installment_plan : [];
+      for (const p of plan) {
+        if (p.paid) continue;
+        if (!p.due_date) continue;
+        const due = new Date(p.due_date + 'T12:00:00');
+        const diffDays = Math.round((due.getTime() - today.getTime()) / 86400000);
+        let kind = null;
+        if (diffDays < 0) kind = 'vencida';
+        else if (diffDays === 0) kind = 'vence_hoje';
+        else if (diffDays <= warnDays) kind = 'proxima';
+        if (!kind) continue;
+
+        const title =
+          kind === 'vencida'
+            ? `Vale vencido · parcela ${p.n}`
+            : kind === 'vence_hoje'
+              ? `Vale vence hoje · parcela ${p.n}`
+              : `Vale em ${diffDays} dia(s) · parcela ${p.n}`;
+        const message = `${sale.customer_name || 'Cliente'} · R$ ${Number(p.amount || 0).toFixed(2)} · venc. ${p.due_date} · pedido #${String(sale.id).slice(-6).toUpperCase()}`;
+
+        // evita spam: mesma sale+parcela+kind no dia
+        const { data: existing } = await admin
+          .from('notification')
+          .select('id')
+          .eq('created_by', user.id)
+          .eq('sale_id', sale.id)
+          .eq('type', `vale_${kind}`)
+          .ilike('message', `%parcela ${p.n}%`)
+          .limit(1);
+
+        if (existing?.length) continue;
+
+        await admin.from('notification').insert({
+          title,
+          message,
+          sale_id: sale.id,
+          type: `vale_${kind}`,
+          read: false,
+          created_by: user.id,
+        });
+        created += 1;
+      }
+    }
+
+    return c.json({ ok: true, notifications_created: created, warn_days: warnDays });
+  } catch (e) {
+    console.error('check-vale-due', e);
+    return c.json({ error: e.message || 'failed' }, 500);
+  }
+});
+
+
 functions.post('/sales-revenue-summary', async (c) => {
   try {
     const user = await requireUser(c);
@@ -934,7 +1012,7 @@ functions.post('/:name', async (c) => {
   'barcode-lookup','product-name-lookup','enrich-product','save-product','repair-product-ownership','refresh-products-catalog',
   'start-stock-count','stock-count-search','stock-count-apply','sync-pdv-reservations',
   'admin-stats','cleanup-cash-sessions','purge-account','init-help-content',
-  'sales-revenue-summary','app-bootstrap','create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','get-access-status','access-status','referral-panel','master-code-status','ensure-referral-code','cancel-subscription','resume-subscription',
+  'check-vale-due','sales-revenue-summary','app-bootstrap','create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','get-access-status','access-status','referral-panel','master-code-status','ensure-referral-code','cancel-subscription','resume-subscription',
   'fetch-nfe-xml','import-nfe','address-search',
 ];
   if (implemented.includes(name)) return c.json({ error: 'routing_error' }, 500);
