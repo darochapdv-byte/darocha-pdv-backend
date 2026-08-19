@@ -695,102 +695,115 @@ functions.post('/sales-revenue-summary', async (c) => {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
     const body = await c.req.json().catch(() => ({}));
+    // Usa fuso de Brasília para delimitar o mês
     const now = new Date();
-    const year = Number(body.year) || now.getFullYear();
-    const month = body.month != null ? Number(body.month) : now.getMonth(); // 0-11
+    const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit' });
+    const partsNow = fmt.formatToParts(now);
+    const yNow = Number(partsNow.find((p) => p.type === 'year').value);
+    const mNow = Number(partsNow.find((p) => p.type === 'month').value) - 1; // 0-11
+    const year = Number(body.year) || yNow;
+    const month = body.month != null ? Number(body.month) : mNow;
 
-    const start = new Date(year, month, 1, 0, 0, 0, 0);
-    const end = new Date(year, month + 1, 0, 23, 59, 59, 999);
-    const prevStart = new Date(year, month - 1, 1, 0, 0, 0, 0);
-    const prevEnd = new Date(year, month, 0, 23, 59, 59, 999);
+    // Início/fim do mês em BRT → ISO
+    function brtBound(y, m, day, h, mi, s, ms) {
+      // constrói string local BRT e interpreta
+      const pad = (n) => String(n).padStart(2, '0');
+      const local = `${y}-${pad(m + 1)}-${pad(day)}T${pad(h)}:${pad(mi)}:${pad(s)}.${String(ms).padStart(3, '0')}-03:00`;
+      return new Date(local);
+    }
+    const lastDay = new Date(year, month + 1, 0).getDate();
+    const start = brtBound(year, month, 1, 0, 0, 0, 0);
+    const end = brtBound(year, month, lastDay, 23, 59, 59, 999);
+    const prevLast = new Date(year, month, 0).getDate();
+    const prevMonth = month === 0 ? 11 : month - 1;
+    const prevYear = month === 0 ? year - 1 : year;
+    const prevStart = brtBound(prevYear, prevMonth, 1, 0, 0, 0, 0);
+    const prevEnd = brtBound(prevYear, prevMonth, prevLast, 23, 59, 59, 999);
 
-    const startIso = start.toISOString();
-    const endIso = end.toISOString();
-    const prevStartIso = prevStart.toISOString();
-    const prevEndIso = prevEnd.toISOString();
+    const startMs = start.getTime();
+    const endMs = end.getTime();
+    const prevStartMs = prevStart.getTime();
+    const prevEndMs = prevEnd.getTime();
 
-    // Busca todas as vendas do período (paginado no server)
-    async function sumPeriod(fromIso, toIso) {
+    function saleTime(s) {
+      const raw = s.created_at || s.created_date || s.updated_at;
+      if (!raw) return null;
+      const t = new Date(raw).getTime();
+      return Number.isNaN(t) ? null : t;
+    }
+
+    function isConcluded(s) {
+      const st = String(s.status || '').toLowerCase().normalize('NFD').replace(/\p{M}/gu, '');
+      return st === 'concluida' || st === 'finalizada' || st === 'pago' || st === 'paid';
+    }
+
+    // Carrega vendas recentes em páginas (sem filtro de data no SQL — mais compatível)
+    const all = [];
+    const pageSize = 1000;
+    let offset = 0;
+    for (let guard = 0; guard < 40; guard++) {
+      const { data, error } = await admin
+        .from('sale')
+        .select('id,total,status,fee_amount,delivery_fee,created_at,created_date')
+        .eq('created_by', user.id)
+        .order('created_at', { ascending: false })
+        .range(offset, offset + pageSize - 1);
+      if (error) {
+        console.warn('sales-revenue-summary list', error.message);
+        break;
+      }
+      const rows = data || [];
+      all.push(...rows);
+      if (rows.length < pageSize) break;
+      // para cedo se a página inteira já é anterior ao mês passado
+      const oldest = saleTime(rows[rows.length - 1]);
+      if (oldest != null && oldest < prevStartMs) break;
+      offset += pageSize;
+    }
+
+    function sumInRange(fromMs, toMs) {
       let total = 0;
       let count = 0;
       let feeTotal = 0;
       let deliveryTotal = 0;
-      let offset = 0;
-      const pageSize = 1000;
-      for (let guard = 0; guard < 50; guard++) {
-        const { data, error } = await admin
-          .from('sale')
-          .select('id,total,status,fee_amount,delivery_fee,created_at,created_date')
-          .eq('created_by', user.id)
-          .in('status', ['concluida', 'concluída', 'finalizada'])
-          .gte('created_at', fromIso)
-          .lte('created_at', toIso)
-          .order('created_at', { ascending: false })
-          .range(offset, offset + pageSize - 1);
-        if (error) {
-          // fallback created_date text field
-          console.warn('sales-revenue-summary page', error.message);
-          break;
-        }
-        const rows = data || [];
-        for (const s of rows) {
+      let pendingTotal = 0;
+      let pendingCount = 0;
+      for (const s of all) {
+        const ts = saleTime(s);
+        if (ts == null || ts < fromMs || ts > toMs) continue;
+        if (isConcluded(s)) {
           total += Number(s.total) || 0;
           feeTotal += Number(s.fee_amount) || 0;
           deliveryTotal += Number(s.delivery_fee) || 0;
           count += 1;
+        } else {
+          const st = String(s.status || '').toLowerCase();
+          if (st.includes('orcamento') || st.includes('aguardando')) {
+            pendingTotal += Number(s.total) || 0;
+            pendingCount += 1;
+          }
         }
-        if (rows.length < pageSize) break;
-        offset += pageSize;
       }
       return {
         total: Math.round(total * 100) / 100,
         count,
         fee_total: Math.round(feeTotal * 100) / 100,
         delivery_total: Math.round(deliveryTotal * 100) / 100,
+        pending_total: Math.round(pendingTotal * 100) / 100,
+        pending_count: pendingCount,
       };
     }
 
-    // Também contar orcamento do mês (pedidos catálogo ainda não finalizados) — informativo
-    async function sumOrcamento(fromIso, toIso) {
-      let total = 0;
-      let count = 0;
-      let offset = 0;
-      const pageSize = 1000;
-      for (let guard = 0; guard < 30; guard++) {
-        const { data, error } = await admin
-          .from('sale')
-          .select('id,total,status,created_at')
-          .eq('created_by', user.id)
-          .in('status', ['orcamento', 'orçamento', 'aguardando'])
-          .gte('created_at', fromIso)
-          .lte('created_at', toIso)
-          .range(offset, offset + pageSize - 1);
-        if (error) break;
-        const rows = data || [];
-        for (const s of rows) {
-          total += Number(s.total) || 0;
-          count += 1;
-        }
-        if (rows.length < pageSize) break;
-        offset += pageSize;
-      }
-      return { total: Math.round(total * 100) / 100, count };
-    }
-
-    const [current, previous, pending] = await Promise.all([
-      sumPeriod(startIso, endIso),
-      sumPeriod(prevStartIso, prevEndIso),
-      sumOrcamento(startIso, endIso),
-    ]);
-
+    const current = sumInRange(startMs, endMs);
+    const previous = sumInRange(prevStartMs, prevEndMs);
     const pct = previous.total > 0 ? ((current.total - previous.total) / previous.total) * 100 : null;
 
     return c.json({
       ok: true,
       year,
       month,
-      month_start: startIso,
-      month_end: endIso,
+      month_start: start.toISOString(),
+      month_end: end.toISOString(),
       revenue: current.total,
       sales_count: current.count,
       fee_total: current.fee_total,
@@ -798,16 +811,15 @@ functions.post('/sales-revenue-summary', async (c) => {
       prev_revenue: previous.total,
       prev_sales_count: previous.count,
       pct_vs_prev: pct,
-      pending_catalog: pending,
-      // total "bruto" se alguém somar também pedidos em aberto
-      revenue_including_pending: Math.round((current.total + pending.total) * 100) / 100,
+      pending_catalog: { total: current.pending_total, count: current.pending_count },
+      revenue_including_pending: Math.round((current.total + current.pending_total) * 100) / 100,
+      scanned: all.length,
     });
   } catch (e) {
     console.error('sales-revenue-summary', e);
-    return c.json({ error: e.message || 'failed' }, 500);
+    return c.json({ error: e.message || 'failed', ok: false }, 500);
   }
 });
-
 
 // ─── app-bootstrap: 1 request = dados iniciais do app ───────────────────────
 // Reduz 6–10 round-trips do front para 1 (bem mais rápido no celular/3G).
