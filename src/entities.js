@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin, userClient, tableFor, restQuery } from './db.js';
-import { sanitizeDateFields, sanitizeEntityBody, toBase44Row, toBase44Rows, requireUser, getAllowZeroStock, setAllowZeroStock, ensureCatalogSlug, buildStorePublicUrl } from './helpers.js';
+import { sanitizeDateFields, sanitizeEntityBody, toBase44Row, toBase44Rows, requireUser, getAllowZeroStock, setAllowZeroStock, ensureCatalogSlug, buildStorePublicUrl, normalizePhoneBR } from './helpers.js';
 import { getAccessStatus } from './stripe_ops.js';
 import { applySaleCancellationSideEffects } from './integration.js';
 import { cacheGet, cacheSet, cacheDelPrefix } from './cache.js';
@@ -114,6 +114,49 @@ function applyTenantFilter(q, entityName, user) {
 
 
 // SSE realtime (deve vir ANTES de /:entity/:id)
+
+/** Normaliza telefone de Customer e bloqueia duplicata por telefone na mesma loja */
+async function prepareCustomerPhone(body, user, { isUpdate = false, existingId = null } = {}) {
+  if (!body || typeof body !== 'object') return body;
+  const raw = body.phone || body.whatsapp || body.customer_phone || '';
+  if (raw) {
+    const norm = normalizePhoneBR(raw);
+    if (norm) {
+      body.phone = norm;
+      body.whatsapp = norm;
+    }
+  }
+  const phone = normalizePhoneBR(body.phone || body.whatsapp || '');
+  if (phone && phone.length >= 10 && user?.id && admin) {
+    const { data: rows } = await admin.from('customer').select('id,phone,whatsapp,name').eq('created_by', user.id).limit(5000);
+    const dup = (rows || []).find((cu) => {
+      if (existingId && String(cu.id) === String(existingId)) return false;
+      const p = normalizePhoneBR(cu.phone || cu.whatsapp);
+      return p && p === phone;
+    });
+    if (dup) {
+      const err = new Error(`Cliente já cadastrado com este telefone: ${dup.name || phone}`);
+      err.code = 'duplicate_phone';
+      err.existing_id = dup.id;
+      throw err;
+    }
+  }
+  return body;
+}
+
+/** Produto no catálogo exige foto */
+function assertCatalogImage(body, existing) {
+  const wantShow = body.show_in_catalog === true;
+  if (!wantShow) return;
+  const img = body.image_url ?? body.image ?? body.photo ?? existing?.image_url ?? existing?.image ?? '';
+  if (!String(img || '').trim()) {
+    const err = new Error('Produto incompleto: adicione uma foto antes de publicar no catálogo.');
+    err.code = 'catalog_requires_image';
+    throw err;
+  }
+}
+
+
 entities.get('/:entity/subscribe', async (c) => {
   c.header('Content-Type', 'text/event-stream');
   c.header('Cache-Control', 'no-cache');
@@ -481,6 +524,26 @@ entities.post('/:entity', async (c) => {
   const db = clientFrom(c);
   if (!db) return c.json({ error: 'db_unavailable' }, 503);
 
+  {
+    const userEarly = await requireUser(c);
+    try {
+      if (normalizeEntityName(entity) === 'Customer') {
+        body = await prepareCustomerPhone(body, userEarly, { isUpdate: false });
+      }
+      if (normalizeEntityName(entity) === 'Product') {
+        assertCatalogImage(body, null);
+      }
+    } catch (e) {
+      if (e && e.code === 'duplicate_phone') {
+        return c.json({ error: e.message, code: 'duplicate_phone', existing_id: e.existing_id }, 409);
+      }
+      if (e && e.code === 'catalog_requires_image') {
+        return c.json({ error: e.message, code: 'catalog_requires_image' }, 400);
+      }
+      throw e;
+    }
+  }
+
   // Bloqueia escrita se trial acabou / sem assinatura
   if (isTenantEntity(entity) && entity !== 'AppSettings') {
     const gate = await assertSubscription(c);
@@ -631,6 +694,33 @@ entities.patch("/:entity/:id", async (c) => {
   // Impede troca de dono pelo cliente
   delete body.created_by;
   delete body.id;
+
+  {
+    const userEarly = await requireUser(c);
+    try {
+      if (normalizeEntityName(entity) === 'Customer') {
+        body = await prepareCustomerPhone(body, userEarly, { isUpdate: true, existingId: c.req.param('id') });
+      }
+      if (normalizeEntityName(entity) === 'Product') {
+        let existing = null;
+        try {
+          if (admin) {
+            const { data } = await admin.from(table).select('id,image_url,show_in_catalog').eq('id', c.req.param('id')).maybeSingle();
+            existing = data;
+          }
+        } catch (_) {}
+        assertCatalogImage(body, existing);
+      }
+    } catch (e) {
+      if (e && e.code === 'duplicate_phone') {
+        return c.json({ error: e.message, code: 'duplicate_phone', existing_id: e.existing_id }, 409);
+      }
+      if (e && e.code === 'catalog_requires_image') {
+        return c.json({ error: e.message, code: 'catalog_requires_image' }, 400);
+      }
+      throw e;
+    }
+  }
 
   // Política global "vender sem estoque" (pode não existir como coluna)
   let allowZeroStockSaved = null;
