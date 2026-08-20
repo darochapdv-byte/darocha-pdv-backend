@@ -225,13 +225,14 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
   for (const it of parsed.items) {
     let productId = it.product_id || null;
     let currentStock = 0;
+    let currentCost = 0;
     let wasExisting = false;
     let wasCreated = false;
 
     if (!productId && it.barcode) {
       const { data: found } = await admin
         .from('product')
-        .select('id,stock,created_by')
+        .select('id,stock,cost,created_by')
         .eq('barcode', it.barcode)
         .limit(5);
       const mine = (found || []).find((p) => p.created_by === user.id);
@@ -240,6 +241,7 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
       if (pick) {
         productId = pick.id;
         currentStock = Number(pick.stock) || 0;
+        currentCost = Number(pick.cost) || 0;
         wasExisting = true;
         if (!pick.created_by) {
           await admin.from('product').update({ created_by: user.id }).eq('id', pick.id);
@@ -250,13 +252,14 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
     if (!productId && it.code) {
       const { data: found } = await admin
         .from('product')
-        .select('id,stock,created_by')
+        .select('id,stock,cost,created_by')
         .eq('code', it.code)
         .eq('created_by', user.id)
         .limit(1);
       if (found?.[0]) {
         productId = found[0].id;
         currentStock = Number(found[0].stock) || 0;
+        currentCost = Number(found[0].cost) || 0;
         wasExisting = true;
       }
     }
@@ -265,13 +268,14 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
     if (!productId && it.name) {
       const { data: found } = await admin
         .from('product')
-        .select('id,stock,created_by')
+        .select('id,stock,cost,created_by')
         .eq('name', it.name)
         .eq('created_by', user.id)
         .limit(1);
       if (found?.[0]) {
         productId = found[0].id;
         currentStock = Number(found[0].stock) || 0;
+        currentCost = Number(found[0].cost) || 0;
         wasExisting = true;
       }
     }
@@ -283,16 +287,28 @@ async function applyImport(user, parsed, { createProducts = true, updateStock = 
 
     if (productId) {
       const patch = {};
-      if (unitCost) {
-        patch.cost = unitCost;
+      const oldCost = Number(currentCost) || 0;
+      const oldStock = Number(currentStock) || 0;
+      if (updateStock && qty > 0) {
+        const newStock = oldStock + qty;
+        // Custo médio ponderado (inclui custo 0 de brinde/amostra)
+        const weighted =
+          newStock > 0
+            ? Math.round(((oldStock * oldCost + qty * unitCost) / newStock) * 100) / 100
+            : unitCost;
+        patch.cost = weighted;
+        patch.stock = newStock;
+        totalEstoque += qty;
         atualizados += 1;
+      } else if (unitCost > 0 || unitCost === 0) {
+        // sem estoque a atualizar, ainda grava custo informado (0 = brinde)
+        if (it.unit_cost !== undefined && it.unit_cost !== null) {
+          patch.cost = unitCost;
+          atualizados += 1;
+        }
       }
       if (salePrice > 0) patch.sale_price = salePrice;
       if (it.name) patch.name = it.name;
-      if (updateStock) {
-        patch.stock = currentStock + qty;
-        totalEstoque += qty;
-      }
       if (Object.keys(patch).length) {
         await admin.from('product').update(patch).eq('id', productId);
       }
@@ -551,24 +567,34 @@ nfe.post('/import-nfe', async (c) => {
       };
     }
 
-    // Se veio XML + items da revisão, mescla preços de venda
-    if (parsed?.items?.length && clientItems.length) {
-      parsed.items = parsed.items.map((it) => {
-        const match = clientItems.find(
-          (c) =>
-            (it.barcode && c.barcode && it.barcode === c.barcode) ||
-            (it.code && c.code && it.code === c.code) ||
-            (it.name && c.name && it.name === c.name)
-        );
-        if (!match) return it;
-        return {
-          ...it,
-          qty: match.qty || it.qty,
-          unit_cost: match.unit_cost || it.unit_cost,
-          sale_price: match.sale_price || it.sale_price || 0,
-          product_id: match.product_id || null,
-        };
-      });
+    // Itens da revisão no front são a fonte da verdade (linhas distintas + edições de qtd/custo/preço).
+    // NÃO mesclar por nome/código com .find() — isso colava a 1ª linha nas demais (ex.: 1 e 8 viravam 8 e 8).
+    if (clientItems.length) {
+      const forn = body.nfe?.fornecedor;
+      const fornName = typeof forn === 'object' ? forn?.nome || forn?.name || '' : forn || '';
+      parsed = {
+        nfe_key: String(
+          (parsed && parsed.nfe_key) || body.nfe_key || body.chave || body.nfe?.chave || ''
+        ).replace(/\D/g, ''),
+        number: String(
+          (parsed && parsed.number) || body.nfe?.numero || body.nfe?.number || body.number || ''
+        ).trim(),
+        series: String(
+          (parsed && parsed.series) || body.nfe?.serie || body.nfe?.series || body.series || ''
+        ).trim(),
+        issuer_name: String(
+          (parsed && parsed.issuer_name) ||
+            body.nfe?.issuer_name ||
+            (typeof forn === 'object' ? fornName : forn) ||
+            body.issuer_name ||
+            ''
+        ),
+        issuer_cnpj: String(
+          (parsed && parsed.issuer_cnpj) || body.nfe?.issuer_cnpj || forn?.cnpj || body.issuer_cnpj || ''
+        ).replace(/\D/g, ''),
+        issued_at: (parsed && parsed.issued_at) || body.nfe?.issued_at || body.issued_at || null,
+        items: clientItems,
+      };
     }
 
     if (!parsed || !parsed.items.length) {
