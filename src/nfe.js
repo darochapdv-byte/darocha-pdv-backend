@@ -470,8 +470,9 @@ nfe.post('/fetch-nfe-xml', async (c) => {
     return c.json({
       found: false,
       message:
-        'Busca automática pela chave não está disponível. Baixe o XML e use "Importar XML Manualmente".',
+        'A SEFAZ não disponibiliza o XML só com a chave (exige certificado digital do emitente/destinatário). Baixe o XML no e-mail/portal do fornecedor ou na consulta da nota e use "Importar XML Manualmente".',
       chave,
+      code: 'auto_fetch_unavailable',
     });
   } catch (error) {
     return c.json({ found: false, message: error.message }, 500);
