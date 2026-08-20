@@ -775,6 +775,22 @@ entities.patch("/:entity/:id", async (c) => {
     }
   }
 
+  // Cancelamento de entrada de estoque: guardar para reverter quantidade no produto
+  let prevStockEntryForCancel = null;
+  if (normalizeEntityName(entity) === 'StockEntry' && body.status != null && admin) {
+    const newSt = String(body.status || '').toLowerCase();
+    if (newSt === 'cancelada' || newSt === 'cancelado') {
+      try {
+        let sq = admin.from('stock_entry').select('*').eq('id', c.req.param('id'));
+        sq = applyTenantFilter(sq, entity, user);
+        const { data: prevE } = await sq.maybeSingle();
+        prevStockEntryForCancel = prevE;
+      } catch (e) {
+        console.warn('load stock_entry for cancel', e?.message || e);
+      }
+    }
+  }
+
   // Entrada de estoque: se Product.stock subir, libera wishlist + notifica
   let prevStock = null;
   if (normalizeEntityName(entity) === 'Product' && body.stock != null && admin) {
@@ -901,6 +917,41 @@ entities.patch("/:entity/:id", async (c) => {
         });
       } catch (e) {
         console.warn('cancel side effects', e?.message || e);
+      }
+    }
+  }
+
+  // Ao cancelar entrada de estoque: remove a quantidade que tinha entrado
+  if (prevStockEntryForCancel && normalizeEntityName(entity) === 'StockEntry' && admin) {
+    const was = String(prevStockEntryForCancel.status || '').toLowerCase();
+    if (was !== 'cancelada' && was !== 'cancelado') {
+      try {
+        const pid = prevStockEntryForCancel.product_id;
+        const qty = Number(prevStockEntryForCancel.quantity) || 0;
+        if (pid && qty > 0) {
+          const { data: prod } = await admin
+            .from('product')
+            .select('id,stock,cost')
+            .eq('id', pid)
+            .maybeSingle();
+          if (prod) {
+            const oldStock = Number(prod.stock) || 0;
+            const newStock = Math.max(0, oldStock - qty);
+            const patch = { stock: newStock };
+            const entryCost = Number(prevStockEntryForCancel.unit_cost);
+            const oldCost = Number(prod.cost) || 0;
+            if (newStock > 0 && Number.isFinite(entryCost) && oldStock > 0) {
+              const remainingValue = oldStock * oldCost - qty * entryCost;
+              if (remainingValue >= 0) {
+                patch.cost = Math.round((remainingValue / newStock) * 100) / 100;
+              }
+            }
+            await admin.from('product').update(patch).eq('id', pid);
+            console.log('stock_entry cancel reverse', pid, oldStock, '->', newStock, 'qty', qty);
+          }
+        }
+      } catch (e) {
+        console.warn('stock_entry cancel reverse stock', e?.message || e);
       }
     }
   }
