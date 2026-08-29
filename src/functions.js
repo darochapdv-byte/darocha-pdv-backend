@@ -1044,14 +1044,18 @@ functions.post('/top-products-month', async (c) => {
           itemsCounted += 1;
           const pid = it.product_id || it.id || null;
           const name = String(it.name || it.product_name || 'Produto').trim() || 'Produto';
+          let rev = Number(it.total);
+          if (!(rev > 0)) rev = (Number(it.unit_price) || 0) * qty;
           if (pid) {
-            if (!byId[pid]) byId[pid] = { product_id: pid, name, qty: 0 };
+            if (!byId[pid]) byId[pid] = { product_id: pid, name, qty: 0, revenue: 0 };
             byId[pid].qty += qty;
+            byId[pid].revenue += rev;
             if (name && name !== 'Produto') byId[pid].name = name;
           }
           const nk = name.toLowerCase();
-          if (!byName[nk]) byName[nk] = { name, qty: 0 };
+          if (!byName[nk]) byName[nk] = { name, qty: 0, revenue: 0 };
           byName[nk].qty += qty;
+          byName[nk].revenue += rev;
         }
       }
 
@@ -1062,13 +1066,13 @@ functions.post('/top-products-month', async (c) => {
     const products = Object.values(byId)
       .sort((a, b) => b.qty - a.qty)
       .slice(0, limit)
-      .map((p) => ({ product_id: p.product_id, name: p.name, qty: Math.round(p.qty * 1000) / 1000 }));
+      .map((p) => ({ product_id: p.product_id, name: p.name, qty: Math.round(p.qty * 1000) / 1000, revenue: Math.round((p.revenue || 0) * 100) / 100 }));
 
     // Fallback: se nenhuma venda tem product_id, usa agregação por nome
     const byNameList = Object.values(byName)
       .sort((a, b) => b.qty - a.qty)
       .slice(0, limit)
-      .map((p) => ({ product_id: null, name: p.name, qty: Math.round(p.qty * 1000) / 1000 }));
+      .map((p) => ({ product_id: null, name: p.name, qty: Math.round(p.qty * 1000) / 1000, revenue: Math.round((p.revenue || 0) * 100) / 100 }));
 
     return c.json({
       ok: true,
