@@ -872,7 +872,7 @@ functions.post('/sales-revenue-summary', async (c) => {
     for (let guard = 0; guard < 100; guard++) {
       const { data, error } = await admin
         .from('sale')
-        .select('id,total,status,fee_amount,delivery_fee,created_at,seller_id,seller_name,source,delivery_type')
+        .select('id,total,status,fee_amount,delivery_fee,created_at,seller_id,seller_name,operator_name,source,delivery_type')
         .eq('created_by', user.id)
         .order('created_at', { ascending: false })
         .range(offset, offset + pageSize - 1);
@@ -909,10 +909,12 @@ functions.post('/sales-revenue-summary', async (c) => {
           feeTotal += Number(s.fee_amount) || 0;
           deliveryTotal += Number(s.delivery_fee) || 0;
           count += 1;
-          const sid = String(s.seller_id || s.seller_name || '_sem_vendedor');
-          if (!bySeller[sid]) bySeller[sid] = { seller_id: s.seller_id || null, seller_name: s.seller_name || '', total: 0, count: 0 };
+          const sName = String(s.seller_name || s.operator_name || '').trim();
+          const sid = String(s.seller_id || sName || '_sem_vendedor');
+          if (!bySeller[sid]) bySeller[sid] = { seller_id: s.seller_id || null, seller_name: sName || 'Sem vendedor', total: 0, count: 0 };
           bySeller[sid].total += amt;
           bySeller[sid].count += 1;
+          if (sName && !bySeller[sid].seller_name) bySeller[sid].seller_name = sName;
           const isOnline = s.source === 'catalog' || s.delivery_type === 'entrega' || s.delivery_type === 'retirada';
           if (isOnline) online += amt; else presencial += amt;
         } else {
