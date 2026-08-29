@@ -359,16 +359,29 @@ catalog.post('/catalog-checkout', async (c) => {
       return c.json({ error: 'Vendedor inválido ou inativo' }, 400);
     }
 
+    const payOnline = body.pay_online === true || body.online_payment === true
+      || body.payment_flow === 'online'
+      || (body.payment_method === 'pix' && body.pay_online !== false && body.online === true);
     let sessionsQuery = admin.from('cash_session').select('id,created_by').eq('status', 'aberto').limit(5);
     if (storeOwnerId) sessionsQuery = sessionsQuery.eq('created_by', storeOwnerId);
     const { data: openSessions } = await sessionsQuery;
-    if (!openSessions?.length) {
+    if (!openSessions?.length && !payOnline) {
       return c.json({
         error: 'Nossa loja está fechada no momento. Você pode montar seu carrinho normalmente e finalizar seu pedido assim que houver um caixa aberto. Agradecemos sua compreensão!',
         store_closed: true,
       }, 409);
     }
-
+    if (payOnline && storeOwnerId) {
+      try {
+        const { loadMpAccount } = await import('./payments_mp.js');
+        const mpAcc = await loadMpAccount(storeOwnerId);
+        if (!(mpAcc && mpAcc.status === 'connected' && mpAcc.access_token_encrypted)) {
+          return c.json({ error: 'Esta loja ainda não ativou pagamento online (Mercado Pago).', mp_required: true }, 400);
+        }
+      } catch (e) {
+        console.warn('mp check', e.message);
+      }
+    }
 
     // Bloqueio de entrega no intervalo do entregador
     if (deliveryType === 'entrega') {
@@ -462,8 +475,11 @@ catalog.post('/catalog-checkout', async (c) => {
     for (const it of saleItems) {
       const product = prodById[it.product_id];
       if (!product) continue;
-      const newStock = Math.max(0, (Number(product.stock) || 0) - it.qty);
-      await admin.from('product').update({ stock: newStock }).eq('id', it.product_id);
+      // Pagamento online: estoque só baixa após confirmação do Mercado Pago
+      if (!payOnline) {
+        const newStock = Math.max(0, (Number(product.stock) || 0) - it.qty);
+        await admin.from('product').update({ stock: newStock }).eq('id', it.product_id);
+      }
     }
 
     let pickupDeadline;
@@ -580,7 +596,7 @@ catalog.post('/catalog-checkout', async (c) => {
 
 
     // Vincula ao caixa aberto (mesmo fluxo da loja — um único caixa)
-    const openSession = openSessions[0];
+    const openSession = (openSessions && openSessions[0]) || null;
 
     const saleOwnerId = storeOwnerId || openSession?.created_by || null;
 
@@ -597,7 +613,8 @@ catalog.post('/catalog-checkout', async (c) => {
       total,
       // Retirada no balcão pode ser tratada como pedido em aberto até retirada;
       // entrega começa em orçamento/aguardando e só conclui na entrega + prestação.
-      status: deliveryType === 'retirada' ? 'orcamento' : 'orcamento',
+      status: payOnline ? 'pending_payment' : 'orcamento',
+      payment_status: payOnline ? 'pending' : null,
       source: 'catalog',
       cash_session_id: openSession?.id || null,
       created_by: saleOwnerId,
@@ -638,21 +655,30 @@ catalog.post('/catalog-checkout', async (c) => {
     try {
       const orderNum = String(sale.id).slice(-6).toUpperCase();
       const modality = sale.delivery_type === 'entrega' ? 'Entrega' : 'Retirada';
-      await admin.from('notification').insert({
-        title: `Novo pedido #${orderNum}`,
-        message: `${modality} · ${sale.customer_name || 'Cliente'} · R$ ${Number(sale.total || 0).toFixed(2)}`,
-        sale_id: sale.id,
-        type: 'novo_pedido',
-        delivery_type: sale.delivery_type || 'retirada',
-        read: false,
-        created_by: saleOwnerId,
-      });
+      if (!payOnline) {
+        await admin.from('notification').insert({
+          title: `Novo pedido #${orderNum}`,
+          message: `${modality} · ${sale.customer_name || 'Cliente'} · R$ ${Number(sale.total || 0).toFixed(2)}`,
+          sale_id: sale.id,
+          type: 'novo_pedido',
+          delivery_type: sale.delivery_type || 'retirada',
+          read: false,
+          created_by: saleOwnerId,
+        });
+      }
 
     } catch (e) {
       console.error('notification create error', e);
     }
 
-    return c.json({ success: true, sale_id: sale.id });
+    return c.json({
+      success: true,
+      sale_id: sale.id,
+      need_payment: !!payOnline,
+      payment_method: paymentMethod,
+      total: sale.total,
+      pay_online: !!payOnline,
+    });
   } catch (error) {
     console.error('catalog-checkout error', error);
     return c.json({ error: error.message }, 500);
