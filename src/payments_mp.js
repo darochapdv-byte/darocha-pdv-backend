@@ -537,6 +537,7 @@ payments.post('/catalog-checkout-card', async (c) => {
     const amount = Math.round(Number(sale.total) * 100) / 100;
     const installments = Math.max(1, Math.min(12, Number(body.installments) || Number(sale.installments) || 1));
     const paymentMethodId = body.payment_method_id || body.paymentMethodId || 'visa';
+    const catalogPayMethod = ['cartao_debito','cartao_credito'].includes(body.catalog_payment_method) ? body.catalog_payment_method : (body.payment_type === 'debit' || /debito|debit/i.test(String(paymentMethodId)) ? 'cartao_debito' : 'cartao_credito');
     const payerEmail = body.payer?.email || body.payer_email || sale.customer_email || `cliente+${String(sale.id).slice(-8)}@darochapdv.com`;
     const identification = body.payer?.identification || body.identification || null;
 
@@ -582,7 +583,7 @@ payments.post('/catalog-checkout-card', async (c) => {
       order_id: saleId,
       provider: 'mercadopago',
       provider_payment_id: String(data.id),
-      payment_method: 'cartao_credito',
+      payment_method: catalogPayMethod,
       status,
       amount,
       installments,
@@ -597,8 +598,8 @@ payments.post('/catalog-checkout-card', async (c) => {
         await deductStockForSale(sale);
       }
       await updateSalePaid(saleId, {
-        payment_method: 'cartao_credito',
-        installments,
+        payment_method: catalogPayMethod,
+        installments: catalogPayMethod === 'cartao_debito' ? 1 : installments,
         mp_payment_id: String(data.id),
         payment_meta: { provider: 'mercadopago', payment_id: data.id, status },
       });
@@ -620,7 +621,7 @@ payments.post('/catalog-checkout-card', async (c) => {
     await admin.from('sale').update({
       payment_status: 'pending',
       status: 'pending_payment',
-      payment_method: 'cartao_credito',
+      payment_method: catalogPayMethod,
       mp_payment_id: String(data.id),
       payment_meta: { provider: 'mercadopago', payment_id: data.id, status },
     }).eq('id', saleId);

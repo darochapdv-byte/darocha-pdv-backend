@@ -361,7 +361,7 @@ catalog.post('/catalog-checkout', async (c) => {
 
     const payOnline = body.pay_online === true || body.online_payment === true
       || body.payment_flow === 'online'
-      || (body.payment_method === 'pix' && body.pay_online !== false && body.online === true);
+      || (['pix','cartao_credito','cartao_debito'].includes(String(body.payment_method||'')) && body.pay_online === true);
     let sessionsQuery = admin.from('cash_session').select('id,created_by').eq('status', 'aberto').limit(5);
     if (storeOwnerId) sessionsQuery = sessionsQuery.eq('created_by', storeOwnerId);
     const { data: openSessions } = await sessionsQuery;
