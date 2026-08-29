@@ -670,6 +670,14 @@ catalog.post('/catalog-checkout', async (c) => {
       console.error('notification create error', e);
     }
 
+    let mp_public_key = null;
+    if (payOnline) {
+      try {
+        const { loadMpAccount } = await import('./payments_mp.js');
+        const acc = await loadMpAccount(saleOwnerId);
+        mp_public_key = acc?.public_key || process.env.MP_PUBLIC_KEY || null;
+      } catch (_) {}
+    }
     return c.json({
       success: true,
       sale_id: sale.id,
@@ -677,6 +685,7 @@ catalog.post('/catalog-checkout', async (c) => {
       payment_method: paymentMethod,
       total: sale.total,
       pay_online: !!payOnline,
+      mp_public_key,
     });
   } catch (error) {
     console.error('catalog-checkout error', error);
