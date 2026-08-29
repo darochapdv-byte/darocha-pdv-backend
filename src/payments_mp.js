@@ -52,13 +52,6 @@ function decrypt(payload) {
 
 /** Persiste conta MP do lojista em app_settings (JSONB mercadopago) */
 async function saveMpAccount(userId, data) {
-  const { data: rows } = await admin
-    .from('app_settings')
-    .select('id,mercadopago')
-    .eq('created_by', userId)
-    .order('created_at', { ascending: false })
-    .limit(1);
-  const row = rows?.[0];
   const payload = {
     provider: 'mercadopago',
     status: data.status || 'connected',
@@ -71,33 +64,57 @@ async function saveMpAccount(userId, data) {
     nickname: data.nickname || null,
     email: data.email || null,
   };
+
+  // 1) payment_account (se a tabela existir)
+  try {
+    const { data: existing } = await admin
+      .from('payment_account')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('provider', 'mercadopago')
+      .maybeSingle();
+    if (existing?.id) {
+      const { error } = await admin.from('payment_account').update({
+        ...payload,
+        updated_at: new Date().toISOString(),
+      }).eq('id', existing.id);
+      if (error) throw error;
+    } else {
+      const { error } = await admin.from('payment_account').insert({
+        user_id: userId,
+        ...payload,
+      });
+      if (error) throw error;
+    }
+    return;
+  } catch (e) {
+    console.warn('payment_account save fallback', e.message || e);
+  }
+
+  // 2) app_settings.role_payment_methods.__darocha_mp (coluna já existe)
+  const { data: rows, error: selErr } = await admin
+    .from('app_settings')
+    .select('id,role_payment_methods')
+    .eq('created_by', userId)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (selErr) throw new Error(selErr.message);
+  const row = rows?.[0];
+  const current = (row?.role_payment_methods && typeof row.role_payment_methods === 'object' && !Array.isArray(row.role_payment_methods))
+    ? { ...row.role_payment_methods }
+    : {};
+  current.__darocha_mp = payload;
   if (row?.id) {
-    const { error } = await admin.from('app_settings').update({ mercadopago: payload }).eq('id', row.id);
+    const { error } = await admin.from('app_settings').update({ role_payment_methods: current }).eq('id', row.id);
     if (error) throw new Error(error.message);
   } else {
-    const { error } = await admin.from('app_settings').insert({ created_by: userId, mercadopago: payload });
+    const { error } = await admin.from('app_settings').insert({ created_by: userId, role_payment_methods: current });
     if (error) throw new Error(error.message);
   }
-  // tabela opcional payment_account
-  try {
-    await admin.from('payment_account').upsert({
-      user_id: userId,
-      provider: 'mercadopago',
-      provider_user_id: payload.provider_user_id,
-      access_token_encrypted: payload.access_token_encrypted,
-      refresh_token_encrypted: payload.refresh_token_encrypted,
-      public_key: payload.public_key,
-      token_expires_at: payload.token_expires_at,
-      status: payload.status,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'user_id,provider' });
-  } catch (_) { /* tabela pode não existir */ }
-  return payload;
 }
 
 async function loadMpAccount(userId) {
   if (!userId) return null;
-  // tenta payment_account
   try {
     const { data } = await admin
       .from('payment_account')
@@ -118,34 +135,42 @@ async function loadMpAccount(userId) {
       };
     }
   } catch (_) {}
+
   const { data: rows } = await admin
     .from('app_settings')
-    .select('mercadopago')
+    .select('role_payment_methods')
     .eq('created_by', userId)
     .order('created_at', { ascending: false })
     .limit(5);
+
   for (const r of rows || []) {
-    if (r?.mercadopago?.access_token_encrypted || r?.mercadopago?.status === 'connected') {
-      return r.mercadopago;
+    const mp = r?.role_payment_methods?.__darocha_mp || r?.mercadopago;
+    if (mp?.access_token_encrypted || mp?.status === 'connected') {
+      return mp;
     }
   }
   return null;
 }
 
 async function clearMpAccount(userId) {
-  const { data: rows } = await admin
-    .from('app_settings')
-    .select('id,mercadopago')
-    .eq('created_by', userId)
-    .limit(10);
-  for (const r of rows || []) {
-    if (r.mercadopago) {
-      await admin.from('app_settings').update({ mercadopago: { status: 'disconnected' } }).eq('id', r.id);
-    }
-  }
   try {
     await admin.from('payment_account').delete().eq('user_id', userId).eq('provider', 'mercadopago');
   } catch (_) {}
+  const { data: rows } = await admin
+    .from('app_settings')
+    .select('id,role_payment_methods')
+    .eq('created_by', userId)
+    .limit(10);
+  for (const r of rows || []) {
+    if (!r?.id) continue;
+    const current = (r.role_payment_methods && typeof r.role_payment_methods === 'object' && !Array.isArray(r.role_payment_methods))
+      ? { ...r.role_payment_methods }
+      : {};
+    if (current.__darocha_mp) {
+      current.__darocha_mp = { status: 'disconnected' };
+      await admin.from('app_settings').update({ role_payment_methods: current }).eq('id', r.id);
+    }
+  }
 }
 
 async function refreshAccessTokenIfNeeded(userId, account) {
