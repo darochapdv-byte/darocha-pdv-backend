@@ -971,6 +971,121 @@ functions.post('/sales-revenue-summary', async (c) => {
   }
 });
 
+// ─── top-products-month: ranking real de produtos vendidos no mês ───────────
+// Varre todas as vendas da loja no período e soma qty por product_id (e por nome).
+functions.post('/top-products-month', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+
+    const body = await c.req.json().catch(() => ({}));
+    const limit = Math.min(Math.max(Number(body.limit) || 30, 5), 100);
+
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Sao_Paulo',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    const nowParts = Object.fromEntries(fmt.formatToParts(new Date()).map((p) => [p.type, p.value]));
+    const year = Number(body.year) || Number(nowParts.year);
+    const month = body.month != null ? Number(body.month) : Number(nowParts.month) - 1;
+    const pad = (n) => String(n).padStart(2, '0');
+    const lastDay = new Date(year, month + 1, 0).getDate();
+    const start = new Date(`${year}-${pad(month + 1)}-01T00:00:00.000-03:00`);
+    const end = new Date(`${year}-${pad(month + 1)}-${pad(lastDay)}T23:59:59.999-03:00`);
+    const startMs = start.getTime();
+    const endMs = end.getTime();
+
+    function isCounted(s) {
+      const st = String(s.status || '')
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '');
+      if (st.includes('cancel')) return false;
+      if (st === 'orcamento' || st === 'pedido_aberto') return false;
+      return true;
+    }
+
+    const byId = Object.create(null);
+    const byName = Object.create(null);
+    let salesScanned = 0;
+    let itemsCounted = 0;
+    const pageSize = 500;
+    let offset = 0;
+
+    for (let guard = 0; guard < 80; guard++) {
+      const { data, error } = await admin
+        .from('sale')
+        .select('id,status,created_at,items')
+        .eq('created_by', user.id)
+        .gte('created_at', start.toISOString())
+        .lte('created_at', end.toISOString())
+        .order('created_at', { ascending: false })
+        .range(offset, offset + pageSize - 1);
+
+      if (error) {
+        console.warn('top-products-month page', error.message);
+        break;
+      }
+      const rows = data || [];
+      if (!rows.length) break;
+
+      for (const s of rows) {
+        salesScanned += 1;
+        if (!isCounted(s)) continue;
+        const t = s.created_at ? new Date(s.created_at).getTime() : null;
+        if (t == null || t < startMs || t > endMs) continue;
+        const items = Array.isArray(s.items) ? s.items : [];
+        for (const it of items) {
+          const qty = Number(it.qty) || Number(it.quantity) || 0;
+          if (qty <= 0) continue;
+          itemsCounted += 1;
+          const pid = it.product_id || it.id || null;
+          const name = String(it.name || it.product_name || 'Produto').trim() || 'Produto';
+          if (pid) {
+            if (!byId[pid]) byId[pid] = { product_id: pid, name, qty: 0 };
+            byId[pid].qty += qty;
+            if (name && name !== 'Produto') byId[pid].name = name;
+          }
+          const nk = name.toLowerCase();
+          if (!byName[nk]) byName[nk] = { name, qty: 0 };
+          byName[nk].qty += qty;
+        }
+      }
+
+      if (rows.length < pageSize) break;
+      offset += pageSize;
+    }
+
+    const products = Object.values(byId)
+      .sort((a, b) => b.qty - a.qty)
+      .slice(0, limit)
+      .map((p) => ({ product_id: p.product_id, name: p.name, qty: Math.round(p.qty * 1000) / 1000 }));
+
+    // Fallback: se nenhuma venda tem product_id, usa agregação por nome
+    const byNameList = Object.values(byName)
+      .sort((a, b) => b.qty - a.qty)
+      .slice(0, limit)
+      .map((p) => ({ product_id: null, name: p.name, qty: Math.round(p.qty * 1000) / 1000 }));
+
+    return c.json({
+      ok: true,
+      year,
+      month,
+      month_start: start.toISOString(),
+      month_end: end.toISOString(),
+      products: products.length ? products : byNameList,
+      sales_scanned: salesScanned,
+      items_counted: itemsCounted,
+    });
+  } catch (e) {
+    console.error('top-products-month', e);
+    return c.json({ error: e.message || 'failed', ok: false }, 500);
+  }
+});
+
 // ─── app-bootstrap: 1 request = dados iniciais do app ───────────────────────
 // Reduz 6–10 round-trips do front para 1 (bem mais rápido no celular/3G).
 
@@ -1084,7 +1199,7 @@ functions.post('/:name', async (c) => {
   'barcode-lookup','product-name-lookup','enrich-product','save-product','repair-product-ownership','refresh-products-catalog',
   'start-stock-count','stock-count-search','stock-count-apply','sync-pdv-reservations',
   'admin-stats','cleanup-cash-sessions','purge-account','init-help-content',
-  'check-vale-due','sales-revenue-summary','app-bootstrap','create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','get-access-status','access-status','referral-panel','master-code-status','ensure-referral-code','cancel-subscription','resume-subscription',
+  'check-vale-due','sales-revenue-summary','top-products-month','app-bootstrap','create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','get-access-status','access-status','referral-panel','master-code-status','ensure-referral-code','cancel-subscription','resume-subscription',
   'fetch-nfe-xml','import-nfe','address-search',
 ];
   if (implemented.includes(name)) return c.json({ error: 'routing_error' }, 500);
