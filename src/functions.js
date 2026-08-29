@@ -395,6 +395,49 @@ functions.post("/finalize-sale", async (c) => {
       return c.json({ error: 'Carrinho vazio. Nenhuma alteração foi realizada.' }, 400);
     }
 
+    // Vale (fiado/a prazo): exige nome + telefone para cobrança e notificações
+    {
+      const pm = String(sale.payment_method || '').toLowerCase();
+      const payments = Array.isArray(sale.payments) ? sale.payments : [];
+      const hasVale =
+        pm === 'vale' ||
+        (pm === 'misto' &&
+          payments.some(
+            (p) => String(p?.method || p?.payment_method || '').toLowerCase() === 'vale'
+          ));
+      if (hasVale) {
+        const name = String(
+          sale.customer_name || sale.client_name || sale.delivery_person || ''
+        ).trim();
+        const phoneRaw = String(
+          sale.customer_phone || sale.client_phone || sale.delivery_phone || ''
+        );
+        const phoneDigits = phoneRaw.replace(/\D/g, '');
+        if (name.length < 2) {
+          return c.json(
+            {
+              error:
+                'No pagamento em vale, informe o nome do cliente para registrar a pendência e cobrar depois.',
+              code: 'vale_customer_name_required',
+            },
+            400
+          );
+        }
+        if (phoneDigits.length < 8) {
+          return c.json(
+            {
+              error:
+                'No pagamento em vale, informe o telefone do cliente (com DDD) para notificar a cobrança.',
+              code: 'vale_customer_phone_required',
+            },
+            400
+          );
+        }
+        sale.customer_name = name;
+        sale.customer_phone = phoneDigits;
+      }
+    }
+
     // Cada caixa específico só pode ser usado por UM dispositivo por vez (e só da própria loja)
     if (session_id) {
       const { data: cashSession } = await admin
@@ -732,7 +775,10 @@ functions.post('/check-vale-due', async (c) => {
             : kind === 'vence_hoje'
               ? `Vale vence hoje · parcela ${p.n}`
               : `Vale em ${diffDays} dia(s) · parcela ${p.n}`;
-        const message = `${sale.customer_name || 'Cliente'} · R$ ${Number(p.amount || 0).toFixed(2)} · venc. ${p.due_date} · pedido #${String(sale.id).slice(-6).toUpperCase()}`;
+        const phoneLabel = sale.customer_phone
+          ? ` · ${String(sale.customer_phone).replace(/\D/g, '')}`
+          : '';
+        const message = `${sale.customer_name || 'Cliente'}${phoneLabel} · R$ ${Number(p.amount || 0).toFixed(2)} · venc. ${p.due_date} · pedido #${String(sale.id).slice(-6).toUpperCase()}`;
 
         // evita spam: mesma sale+parcela+kind no dia
         const { data: existing } = await admin
