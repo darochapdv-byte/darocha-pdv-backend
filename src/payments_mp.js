@@ -10,7 +10,7 @@ import { requireUser } from './helpers.js';
 const payments = new Hono();
 
 const MP_API = 'https://api.mercadopago.com';
-const MP_AUTH = 'https://auth.mercadopago.com.br/authorization';
+const MP_AUTH = 'https://auth.mercadopago.com/authorization';
 
 function env(name, fallback = '') {
   return String(process.env[name] || fallback).trim();
