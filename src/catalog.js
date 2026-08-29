@@ -614,7 +614,6 @@ catalog.post('/catalog-checkout', async (c) => {
       // Retirada no balcão pode ser tratada como pedido em aberto até retirada;
       // entrega começa em orçamento/aguardando e só conclui na entrega + prestação.
       status: payOnline ? 'pending_payment' : 'orcamento',
-      payment_status: payOnline ? 'pending' : null,
       source: 'catalog',
       cash_session_id: openSession?.id || null,
       created_by: saleOwnerId,

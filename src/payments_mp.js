@@ -246,16 +246,17 @@ async function saveTransaction(row) {
     const { data, error } = await admin.from('payment_transaction').insert(row).select().single();
     if (!error && data) return data;
   } catch (_) {}
-  // fallback: grava no sale.payment_meta
+  // fallback: grava no (readOnlinePayment(sale).payment_meta)
   if (row.order_id) {
     try {
-      const { data: sale } = await admin.from('sale').select('payment_meta').eq('id', row.order_id).maybeSingle();
-      const meta = { ...(sale?.payment_meta || {}), last_tx: row };
-      await admin.from('sale').update({
-        payment_meta: meta,
-        mp_payment_id: row.provider_payment_id || null,
+      const { data: sale } = await admin.from('sale').select('payments,client_ref,status').eq('id', row.order_id).maybeSingle();
+      const prev = (sale?.payments && typeof sale.payments === 'object' && !Array.isArray(sale.payments)) ? sale.payments : {};
+      await admin.from('sale').update(encodeOnlinePaymentFields({
         payment_status: row.status,
-      }).eq('id', row.order_id);
+        mp_payment_id: row.provider_payment_id || null,
+        payment_meta: { ...prev, last_tx: row },
+        status: sale?.status,
+      })).eq('id', row.order_id);
     } catch (e) {
       console.warn('saveTransaction fallback', e.message);
     }
@@ -264,12 +265,28 @@ async function saveTransaction(row) {
 }
 
 async function updateSalePaid(saleId, patch = {}) {
-  const updates = {
+  const base = encodeOnlinePaymentFields({
     payment_status: 'paid',
-    status: 'orcamento',
+    status: patch.status || 'orcamento',
     paid_at: new Date().toISOString(),
-    ...patch,
-  };
+    mp_payment_id: patch.mp_payment_id,
+    payment_meta: patch.payment_meta,
+  });
+  // patch may still try to set invalid cols — strip them
+  const { payment_status, paid_at, payment_meta, mp_payment_id, ...rest } = patch || {};
+  const updates = { ...base, ...rest };
+  delete updates.payment_status;
+  delete updates.paid_at;
+  delete updates.payment_meta;
+  delete updates.mp_payment_id;
+  // re-apply encoded
+  Object.assign(updates, encodeOnlinePaymentFields({
+    payment_status: 'paid',
+    status: updates.status || 'orcamento',
+    paid_at: new Date().toISOString(),
+    mp_payment_id: mp_payment_id || base.client_ref,
+    payment_meta: payment_meta,
+  }));
   await admin.from('sale').update(updates).eq('id', saleId);
 }
 
@@ -453,7 +470,7 @@ payments.post('/catalog-checkout-pix', async (c) => {
     const { data: sale } = await admin.from('sale').select('*').eq('id', saleId).maybeSingle();
     if (!sale) return c.json({ error: 'Pedido não encontrado' }, 404);
     if (sale.source !== 'catalog') return c.json({ error: 'Pedido inválido' }, 400);
-    if (sale.payment_status === 'paid' || sale.status === 'concluida') {
+    if ((readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida') || sale.status === 'concluida') {
       return c.json({ ok: true, already_paid: true, status: 'approved' });
     }
 
@@ -493,16 +510,18 @@ payments.post('/catalog-checkout-pix', async (c) => {
     const txData = data.point_of_interaction?.transaction_data || {};
     await admin.from('sale').update({
       payment_method: 'pix',
-      payment_status: 'pending',
-      status: 'pending_payment',
-      mp_payment_id: String(data.id),
-      payment_meta: {
-        provider: 'mercadopago',
-        payment_id: data.id,
-        status: data.status,
-        qr_code: txData.qr_code || null,
-        ticket_url: txData.ticket_url || null,
-      },
+      ...encodeOnlinePaymentFields({
+        payment_status: 'pending',
+        status: 'pending_payment',
+        mp_payment_id: String(data.id),
+        payment_meta: {
+          provider: 'mercadopago',
+          payment_id: data.id,
+          status: data.status,
+          qr_code: txData.qr_code || null,
+          ticket_url: txData.ticket_url || null,
+        },
+      }),
     }).eq('id', saleId);
 
     await saveTransaction({
@@ -550,7 +569,7 @@ payments.post('/catalog-checkout-card', async (c) => {
     const { data: sale } = await admin.from('sale').select('*').eq('id', saleId).maybeSingle();
     if (!sale) return c.json({ error: 'Pedido não encontrado' }, 404);
     if (sale.source !== 'catalog') return c.json({ error: 'Pedido inválido' }, 400);
-    if (sale.payment_status === 'paid') {
+    if ((readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida')) {
       return c.json({ ok: true, already_paid: true, status: 'approved' });
     }
 
@@ -592,8 +611,11 @@ payments.post('/catalog-checkout-card', async (c) => {
     if (!ok) {
       console.error('mp card create', data);
       await admin.from('sale').update({
-        payment_status: 'payment_failed',
-        payment_meta: { last_error: data },
+        ...encodeOnlinePaymentFields({
+          payment_status: 'payment_failed',
+          payment_meta: { last_error: data },
+          status: 'cancelada',
+        }),
       }).eq('id', saleId);
       return c.json({
         ok: false,
@@ -619,7 +641,7 @@ payments.post('/catalog-checkout-card', async (c) => {
 
     if (status === 'approved') {
       // baixa estoque se ainda não baixou
-      if (sale.payment_status === 'pending' || sale.status === 'pending_payment') {
+      if ((readOnlinePayment(sale).payment_status === 'pending' || sale.status === 'pending_payment') || sale.status === 'pending_payment') {
         await deductStockForSale(sale);
       }
       await updateSalePaid(saleId, {
@@ -627,6 +649,7 @@ payments.post('/catalog-checkout-card', async (c) => {
         installments: catalogPayMethod === 'cartao_debito' ? 1 : installments,
         mp_payment_id: String(data.id),
         payment_meta: { provider: 'mercadopago', payment_id: data.id, status },
+        status: 'orcamento',
       });
       const { data: fresh } = await admin.from('sale').select('*').eq('id', saleId).maybeSingle();
       if (fresh) await notifyNewPaidOrder(fresh);
@@ -635,20 +658,25 @@ payments.post('/catalog-checkout-card', async (c) => {
 
     if (status === 'rejected' || status === 'cancelled') {
       await admin.from('sale').update({
-        payment_status: 'payment_failed',
-        mp_payment_id: String(data.id),
-        payment_meta: { provider: 'mercadopago', payment_id: data.id, status, status_detail: data.status_detail },
+        ...encodeOnlinePaymentFields({
+          payment_status: 'payment_failed',
+          mp_payment_id: String(data.id),
+          payment_meta: { provider: 'mercadopago', payment_id: data.id, status, status_detail: data.status_detail },
+          status: 'cancelada',
+        }),
       }).eq('id', saleId);
       return c.json({ ok: false, status, status_detail: data.status_detail, payment_id: data.id });
     }
 
     // pending (ex: revisão)
     await admin.from('sale').update({
-      payment_status: 'pending',
-      status: 'pending_payment',
       payment_method: catalogPayMethod,
-      mp_payment_id: String(data.id),
-      payment_meta: { provider: 'mercadopago', payment_id: data.id, status },
+      ...encodeOnlinePaymentFields({
+        payment_status: 'pending',
+        status: 'pending_payment',
+        mp_payment_id: String(data.id),
+        payment_meta: { provider: 'mercadopago', payment_id: data.id, status },
+      }),
     }).eq('id', saleId);
 
     return c.json({ ok: true, status: status || 'pending', payment_id: data.id });
@@ -671,17 +699,17 @@ payments.post('/catalog-checkout-status', async (c) => {
     if (!sale) return c.json({ error: 'Pedido não encontrado' }, 404);
 
     // Se ainda pending e tem mp_payment_id, consulta MP
-    if (sale.mp_payment_id && sale.payment_status !== 'paid' && sale.created_by) {
+    if ((readOnlinePayment(sale).mp_payment_id) && (readOnlinePayment(sale).payment_status !== 'paid' && sale.status !== 'concluida') && sale.created_by) {
       const { token } = await getAccessTokenForStore(sale.created_by);
       if (token) {
-        const { ok, data } = await mpFetch(token, `/v1/payments/${sale.mp_payment_id}`);
-        if (ok && data.status === 'approved' && sale.payment_status !== 'paid') {
-          if (sale.status === 'pending_payment' || sale.payment_status === 'pending') {
+        const { ok, data } = await mpFetch(token, `/v1/payments/${(readOnlinePayment(sale).mp_payment_id)}`);
+        if (ok && data.status === 'approved' && (readOnlinePayment(sale).payment_status !== 'paid' && sale.status !== 'concluida')) {
+          if (sale.status === 'pending_payment' || (readOnlinePayment(sale).payment_status === 'pending' || sale.status === 'pending_payment')) {
             await deductStockForSale(sale);
           }
           await updateSalePaid(saleId, {
             mp_payment_id: String(data.id),
-            payment_meta: { ...(sale.payment_meta || {}), status: 'approved', payment_id: data.id },
+            payment_meta: { ...((readOnlinePayment(sale).payment_meta) || {}), status: 'approved', payment_id: data.id },
           });
           const { data: fresh } = await admin.from('sale').select('*').eq('id', saleId).maybeSingle();
           if (fresh) await notifyNewPaidOrder(fresh);
@@ -689,8 +717,8 @@ payments.post('/catalog-checkout-status', async (c) => {
         }
         return c.json({
           ok: true,
-          status: data.status || sale.payment_status,
-          payment_status: sale.payment_status,
+          status: data.status || readOnlinePayment(sale).payment_status,
+          payment_status: readOnlinePayment(sale).payment_status,
           sale_id: saleId,
         });
       }
@@ -698,8 +726,8 @@ payments.post('/catalog-checkout-status', async (c) => {
 
     return c.json({
       ok: true,
-      status: sale.payment_status === 'paid' ? 'approved' : (sale.payment_status || sale.status),
-      payment_status: sale.payment_status || null,
+      status: (readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida') ? 'approved' : (readOnlinePayment(sale).payment_status || sale.status),
+      payment_status: readOnlinePayment(sale).payment_status || null,
       sale_status: sale.status,
       sale_id: saleId,
     });
@@ -733,7 +761,7 @@ payments.post('/mercadopago-webhook', async (c) => {
     const { data: byMp } = await admin
       .from('sale')
       .select('*')
-      .eq('mp_payment_id', String(paymentId))
+      .eq('client_ref', String(paymentId))
       .maybeSingle();
     sale = byMp;
 
@@ -743,10 +771,13 @@ payments.post('/mercadopago-webhook', async (c) => {
         .from('sale')
         .select('*')
         .eq('source', 'catalog')
-        .in('payment_status', ['pending', 'payment_failed'])
+        .in('status', ['pending_payment', 'orcamento', 'cancelada'])
         .order('created_at', { ascending: false })
         .limit(50);
-      sale = (recent || []).find((s) => String(s.mp_payment_id) === String(paymentId) || String(s.payment_meta?.payment_id) === String(paymentId));
+      sale = (recent || []).find((s) => {
+        const op = readOnlinePayment(s);
+        return String(op.mp_payment_id) === String(paymentId) || String(op.payment_meta?.payment_id) === String(paymentId);
+      });
     }
 
     if (!sale?.created_by) {
@@ -755,7 +786,7 @@ payments.post('/mercadopago-webhook', async (c) => {
     }
 
     // Idempotência: já pago
-    if (sale.payment_status === 'paid') {
+    if ((readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida')) {
       return c.json({ ok: true, already_paid: true });
     }
 
@@ -775,15 +806,15 @@ payments.post('/mercadopago-webhook', async (c) => {
     }
 
     if (data.status === 'approved') {
-      if (sale.payment_status !== 'paid') {
-        if (sale.status === 'pending_payment' || sale.payment_status === 'pending') {
+      if ((readOnlinePayment(sale).payment_status !== 'paid' && sale.status !== 'concluida')) {
+        if (sale.status === 'pending_payment' || (readOnlinePayment(sale).payment_status === 'pending' || sale.status === 'pending_payment')) {
           await deductStockForSale(sale);
         }
         await updateSalePaid(sale.id, {
           mp_payment_id: String(data.id),
           payment_method: data.payment_method_id === 'pix' ? 'pix' : (sale.payment_method || 'cartao_credito'),
           payment_meta: {
-            ...(sale.payment_meta || {}),
+            ...((readOnlinePayment(sale).payment_meta) || {}),
             status: 'approved',
             payment_id: data.id,
             status_detail: data.status_detail,
@@ -794,24 +825,28 @@ payments.post('/mercadopago-webhook', async (c) => {
         if (fresh) await notifyNewPaidOrder(fresh);
       }
     } else if (data.status === 'rejected' || data.status === 'cancelled') {
-      await admin.from('sale').update({
+      await admin.from('sale').update(encodeOnlinePaymentFields({
         payment_status: 'payment_failed',
+        status: 'cancelada',
         payment_meta: {
-          ...(sale.payment_meta || {}),
+          ...((readOnlinePayment(sale).payment_meta) || {}),
           status: data.status,
           status_detail: data.status_detail,
           webhook_at: new Date().toISOString(),
         },
-      }).eq('id', sale.id);
+      })).eq('id', sale.id);
     } else {
-      await admin.from('sale').update({
+      await admin.from('sale').update(encodeOnlinePaymentFields({
+        payment_status: readOnlinePayment(sale).payment_status || 'pending',
+        status: sale.status,
+        mp_payment_id: readOnlinePayment(sale).mp_payment_id,
         payment_meta: {
-          ...(sale.payment_meta || {}),
+          ...((readOnlinePayment(sale).payment_meta) || {}),
           status: data.status,
           status_detail: data.status_detail,
           webhook_at: new Date().toISOString(),
         },
-      }).eq('id', sale.id);
+      })).eq('id', sale.id);
     }
 
     return c.json({ ok: true, status: data.status });
