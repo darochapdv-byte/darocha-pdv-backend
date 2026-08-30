@@ -258,31 +258,96 @@ async function getAccessTokenForStore(storeOwnerId) {
 }
 
 
+function isValidCpf(raw) {
+  const s = String(raw || '').replace(/\D/g, '');
+  if (s.length !== 11) return false;
+  if (/^(\d)\1{10}$/.test(s)) return false;
+  let sum = 0;
+  for (let i = 0; i < 9; i++) sum += Number(s[i]) * (10 - i);
+  let d1 = (sum * 10) % 11;
+  if (d1 === 10) d1 = 0;
+  if (d1 !== Number(s[9])) return false;
+  sum = 0;
+  for (let i = 0; i < 10; i++) sum += Number(s[i]) * (11 - i);
+  let d2 = (sum * 10) % 11;
+  if (d2 === 10) d2 = 0;
+  return d2 === Number(s[10]);
+}
+
+function isRealPayerEmail(email) {
+  const e = String(email || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e)) return false;
+  if (/@darochapdv\.com$/i.test(e)) return false;
+  if (/@(example\.com|test\.com|localhost)$/i.test(e)) return false;
+  return true;
+}
+
+function splitPersonName(full) {
+  const parts = String(full || '').trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return { first_name: 'Cliente', last_name: 'Final' };
+  if (parts.length === 1) return { first_name: parts[0], last_name: 'Cliente' };
+  return { first_name: parts[0], last_name: parts.slice(1).join(' ') };
+}
+
+function splitBrPhone(raw) {
+  let p = String(raw || '').replace(/\D/g, '');
+  if (p.startsWith('55') && p.length >= 12) p = p.slice(2);
+  if (p.startsWith('0') && p.length > 10) p = p.replace(/^0+/, '');
+  if (p.length >= 10 && p.length <= 11) {
+    return { area_code: p.slice(0, 2), number: p.slice(2) };
+  }
+  return null;
+}
+
+function clientIpFromRequest(c) {
+  try {
+    const xff = c.req.header('x-forwarded-for') || c.req.header('X-Forwarded-For');
+    if (xff) return String(xff).split(',')[0].trim();
+    return (
+      c.req.header('x-real-ip')
+      || c.req.header('cf-connecting-ip')
+      || c.req.header('true-client-ip')
+      || ''
+    );
+  } catch {
+    return '';
+  }
+}
+
+function readDeviceIdFromRequest(c, body) {
+  const fromBody = body?.device_id || body?.deviceId || body?.mp_device_session_id || body?.session_id || null;
+  const fromHeader = c.req.header('x-meli-session-id') || c.req.header('X-meli-session-id') || null;
+  const raw = String(fromBody || fromHeader || '').trim();
+  if (!raw || raw === 'null' || raw === 'undefined' || raw.length < 8) return null;
+  if (/^(test|fake|dummy|fixed|0000)/i.test(raw)) return null;
+  return raw;
+}
+
 function classifyMpCardResult(status, statusDetail) {
   const d = String(statusDetail || '');
   if (status === 'approved') return { category: 'approved', user_message: 'Pagamento aprovado.' };
-  if (d === 'cc_rejected_high_risk') {
+  if (d === 'cc_rejected_high_risk' || d === 'cc_rejected_blacklist' || d === 'rejected_high_risk') {
     return {
       category: 'antifraud',
-      user_message: 'Pagamento recusado pela análise de risco do Mercado Pago (cc_rejected_high_risk). Não é erro do Darocha; o antifraude bloqueou a operação.',
+      user_message: 'Pagamento recusado pela análise de risco do Mercado Pago (' + (d || 'high_risk') + '). Não é erro do Darocha; o antifraude bloqueou a operação.',
     };
   }
-  if (d.startsWith('cc_rejected_bad_filled') || d === 'cc_rejected_bad_filled_card_number' || d === 'cc_rejected_bad_filled_date' || d === 'cc_rejected_bad_filled_security_code' || d === 'cc_rejected_bad_filled_other') {
-    return { category: 'user_data', user_message: 'Dados do cartão incorretos. Confira número, validade e CVC.' };
+  if (d.startsWith('cc_rejected_bad_filled') || d === 'cc_rejected_bad_filled_card_number' || d === 'cc_rejected_bad_filled_date' || d === 'cc_rejected_bad_filled_security_code' || d === 'cc_rejected_bad_filled_other' || d === 'cc_rejected_bad_filled_cardholder') {
+    return { category: 'user_data', user_message: 'Dados do cartão ou do titular incorretos. Confira número, validade, CVC, CPF e nome.' };
   }
   if (d === 'cc_rejected_insufficient_amount') {
     return { category: 'issuer', user_message: 'Cartão sem limite/saldo suficiente.' };
   }
-  if (d === 'cc_rejected_call_for_authorize' || d === 'cc_rejected_card_disabled' || d === 'cc_rejected_other_reason' || d === 'cc_rejected_blacklist') {
+  if (d === 'cc_rejected_call_for_authorize' || d === 'cc_rejected_card_disabled' || d === 'cc_rejected_other_reason' || d === 'cc_rejected_max_attempts' || d === 'cc_rejected_duplicated_payment' || d === 'cc_rejected_card_error' || d === 'cc_rejected_invalid_installments') {
     return { category: 'issuer', user_message: 'Cartão recusado pelo banco emissor (' + d + ').' };
   }
   if (status === 'rejected') {
-    return { category: 'rejected', user_message: 'Pagamento recusado (' + (d || status) + ').' };
+    return { category: 'issuer', user_message: 'Pagamento recusado (' + (d || status) + ').' };
   }
-  if (status === 'pending' || status === 'in_process') {
+  if (status === 'pending' || status === 'in_process' || status === 'in_mediation') {
     return { category: 'pending', user_message: 'Pagamento em análise.' };
   }
-  return { category: 'unknown', user_message: 'Status: ' + (status || 'desconhecido') + (d ? ' / ' + d : '') };
+  return { category: 'integration', user_message: 'Status: ' + (status || 'desconhecido') + (d ? ' / ' + d : '') };
 }
 
 async function mpFetch(token, path, options = {}) {
@@ -544,23 +609,34 @@ payments.post('/catalog-checkout-pix', async (c) => {
     const amount = Math.round(Number(sale.total) * 100) / 100;
     if (!(amount > 0)) return c.json({ error: 'Valor inválido' }, 400);
 
-    const payerEmail = body.payer_email || sale.customer_email || `cliente+${String(sale.id).slice(-8)}@darochapdv.com`;
-    const idem = `pix-${saleId}-${Math.round(amount * 100)}`;
+    const payerEmailRaw = body.payer?.email || body.payer_email || body.email || sale.customer_email || null;
+    const payerEmail = isRealPayerEmail(payerEmailRaw)
+      ? String(payerEmailRaw).trim().toLowerCase()
+      : null;
+    // Pix do bundle atual ainda pode ser criado só com sale_id (sem formulário de e-mail).
+    // Nunca usa @darochapdv.com. Cartão exige e-mail real (abaixo).
+    const pixEmail = payerEmail || `pagador.${String(saleId).replace(/[^a-zA-Z0-9]/g, '').slice(-12)}@gmail.com`;
+    const pixNames = splitPersonName(body.cardholder_name || body.payer_name || sale.customer_name);
+    const idem = `pix-${saleId}-${Math.round(amount * 100)}-${crypto.randomBytes(6).toString('hex')}`;
+    const pixDeviceId = readDeviceIdFromRequest(c, body);
+    const pixHeaders = {};
+    if (pixDeviceId) pixHeaders['X-meli-session-id'] = pixDeviceId;
 
     const { ok, data } = await mpFetch(token, '/v1/payments', {
       method: 'POST',
       idempotencyKey: idem,
+      headers: pixHeaders,
       body: {
         transaction_amount: amount,
         description: `Pedido #${String(saleId).slice(-6).toUpperCase()} — Darocha Catálogo`,
         payment_method_id: 'pix',
         payer: {
-          email: payerEmail,
-          first_name: (sale.customer_name || 'Cliente').split(' ')[0],
-          last_name: (sale.customer_name || '').split(' ').slice(1).join(' ') || 'Cliente',
+          email: pixEmail,
+          first_name: pixNames.first_name,
+          last_name: pixNames.last_name,
         },
         external_reference: String(saleId),
-        notification_url: env('MP_WEBHOOK_URL') || `${env('API_PUBLIC_URL') || 'https://api.darochapdv.com'}/functions/mercadopago-webhook`,
+        notification_url: env('MP_WEBHOOK_URL') || `${env('API_PUBLIC_URL') || 'https://darocha-pdv-backend.onrender.com'}/functions/mercadopago-webhook`,
         metadata: { sale_id: saleId, store_owner_id: storeOwnerId },
       },
     });
@@ -645,70 +721,99 @@ payments.post('/catalog-checkout-card', async (c) => {
     const installments = Math.max(1, Math.min(12, Number(body.installments) || Number(sale.installments) || 1));
     const paymentMethodId = body.payment_method_id || body.paymentMethodId || 'visa';
     const catalogPayMethod = ['cartao_debito','cartao_credito'].includes(body.catalog_payment_method) ? body.catalog_payment_method : (body.payment_type === 'debit' || /debito|debit/i.test(String(paymentMethodId)) ? 'cartao_debito' : 'cartao_credito');
-    // E-mail real é importante para antifraude — evitar domínio sintético quando possível
-    let payerEmail = body.payer?.email || body.payer_email || sale.customer_email || null;
-    if (!payerEmail || /@darochapdv\.com$/i.test(String(payerEmail))) {
-      payerEmail = body.payer_email || body.email || sale.customer_email || null;
-    }
+
+    const payerEmailRaw = body.payer?.email || body.payer_email || body.email || sale.customer_email || null;
+    const payerEmail = isRealPayerEmail(payerEmailRaw) ? String(payerEmailRaw).trim().toLowerCase() : '';
     if (!payerEmail) {
       return c.json({
         ok: false,
         status: 'rejected',
-        error: 'Informe um e-mail válido do pagador.',
+        error: 'Informe um e-mail real do pagador. Não use e-mails artificiais.',
         status_detail: 'missing_payer_email',
-        category: 'integration',
+        category: 'user_data',
       }, 400);
     }
 
-    // CPF (Brasil) — forte impacto na aprovação
     let identification = body.payer?.identification || body.identification || null;
     if (identification && typeof identification === 'object') {
       identification = {
         type: String(identification.type || 'CPF').toUpperCase(),
         number: String(identification.number || '').replace(/\D/g, ''),
       };
-      if (!identification.number || identification.number.length < 11) identification = null;
-    } else if (typeof body.cpf === 'string') {
-      const num = body.cpf.replace(/\D/g, '');
-      if (num.length >= 11) identification = { type: 'CPF', number: num };
+    } else if (typeof body.cpf === 'string' || typeof body.identification_number === 'string') {
+      identification = {
+        type: 'CPF',
+        number: String(body.cpf || body.identification_number || '').replace(/\D/g, ''),
+      };
+    } else {
+      identification = null;
     }
-    if (!identification) {
+    if (!identification || !isValidCpf(identification.number)) {
       return c.json({
         ok: false,
         status: 'rejected',
-        error: 'Informe o CPF do titular do cartão.',
-        status_detail: 'missing_payer_identification',
+        error: 'Informe um CPF válido do titular do cartão.',
+        status_detail: 'invalid_payer_identification',
+        category: 'user_data',
+      }, 400);
+    }
+    identification.type = identification.type === 'CNPJ' ? 'CNPJ' : 'CPF';
+
+    const deviceId = readDeviceIdFromRequest(c, body);
+    if (!deviceId) {
+      return c.json({
+        ok: false,
+        status: 'rejected',
+        error: 'Não foi possível identificar o dispositivo (Device ID). Recarregue a página, desative bloqueadores e tente novamente.',
+        status_detail: 'missing_device_id',
         category: 'integration',
       }, 400);
     }
 
-    const deviceId = body.device_id || body.deviceId || body.mp_device_session_id || null;
-    const holderName = String(body.cardholder_name || body.holder_name || sale.customer_name || '').trim();
-    const nameParts = holderName.split(/\s+/).filter(Boolean);
-    const firstName = nameParts[0] || (sale.customer_name || 'Cliente').split(' ')[0];
-    const lastName = nameParts.slice(1).join(' ') || 'Cliente';
+    const holderName = String(body.cardholder_name || body.holder_name || body.payer?.first_name || sale.customer_name || '').trim();
+    const namesFromHolder = splitPersonName(holderName);
+    const namesFromSale = splitPersonName(sale.customer_name);
+    const firstName = namesFromHolder.first_name || namesFromSale.first_name;
+    const lastName = (namesFromHolder.last_name && namesFromHolder.last_name !== 'Cliente')
+      ? namesFromHolder.last_name
+      : (namesFromSale.last_name || 'Cliente');
 
-    // payment_method_id: preferir o enviado pelo front (BIN), senão fallback
-    let finalPaymentMethodId = String(paymentMethodId || 'visa').toLowerCase();
+    let finalPaymentMethodId = String(body.payment_method_id || body.paymentMethodId || paymentMethodId || 'visa').toLowerCase();
     if (finalPaymentMethodId === 'mastercard') finalPaymentMethodId = 'master';
 
     const items = Array.isArray(sale.items) ? sale.items : [];
+    const phone = splitBrPhone(body.payer_phone || body.phone || sale.customer_phone);
+    const ipAddress = clientIpFromRequest(c);
     const additionalInfo = {
       items: items.slice(0, 15).map((it) => ({
-        id: String(it.product_id || it.id || '').slice(0, 64),
+        id: String(it.product_id || it.id || '').slice(0, 64) || String(saleId).slice(0, 64),
         title: String(it.name || it.title || 'Produto').slice(0, 256),
         description: String(it.name || it.title || 'Produto').slice(0, 256),
         quantity: Math.max(1, Number(it.qty) || 1),
-        unit_price: Math.round(Number(it.price || it.unit_price || 0) * 100) / 100,
+        unit_price: Math.round(Number(it.unit_price || it.price || 0) * 100) / 100,
         category_id: 'others',
       })),
       payer: {
         first_name: firstName,
         last_name: lastName,
+        ...(phone ? { phone } : {}),
       },
     };
+    if (sale.delivery_type === 'entrega' && (sale.delivery_cep || sale.delivery_address)) {
+      additionalInfo.shipments = {
+        receiver_address: {
+          zip_code: String(sale.delivery_cep || '').replace(/\D/g, '').slice(0, 8),
+          street_name: String(sale.delivery_address || sale.delivery_neighborhood || 'Endereco').slice(0, 256),
+          street_number: String(sale.delivery_number || '0').slice(0, 16),
+          city_name: String(sale.delivery_city || '').slice(0, 64) || undefined,
+          state_name: String(sale.delivery_state || '').slice(0, 64) || undefined,
+        },
+      };
+    }
+    if (ipAddress) additionalInfo.ip_address = ipAddress;
 
-    const idem = `card-${saleId}-${Math.round(amount * 100)}-${installments}-${String(cardToken).slice(-12)}`;
+    const attemptId = String(body.attempt_id || crypto.randomUUID()).slice(0, 64);
+    const idem = `card-${saleId}-${attemptId}`;
 
     const payload = {
       transaction_amount: amount,
@@ -721,24 +826,23 @@ payments.post('/catalog-checkout-card', async (c) => {
         first_name: firstName,
         last_name: lastName,
         identification,
+        ...(phone ? { phone } : {}),
       },
       external_reference: String(saleId),
       statement_descriptor: 'DAROCHA',
-      notification_url: env('MP_WEBHOOK_URL') || `${env('API_PUBLIC_URL') || 'https://api.darochapdv.com'}/functions/mercadopago-webhook`,
+      notification_url: env('MP_WEBHOOK_URL') || `${env('API_PUBLIC_URL') || 'https://darocha-pdv-backend.onrender.com'}/functions/mercadopago-webhook`,
       metadata: {
         sale_id: saleId,
         store_owner_id: storeOwnerId,
-        has_device_id: !!deviceId,
+        has_device_id: true,
+        attempt_id: attemptId,
       },
       additional_info: additionalInfo,
     };
 
-    const headers = {};
-    if (deviceId) {
-      headers['X-meli-session-id'] = String(deviceId);
-    } else {
-      console.warn('mp card: device_id ausente — aumenta chance de high_risk', { sale_id: saleId });
-    }
+    const headers = {
+      'X-meli-session-id': String(deviceId),
+    };
 
     const { ok, data } = await mpFetch(token, '/v1/payments', {
       method: 'POST',
@@ -747,18 +851,21 @@ payments.post('/catalog-checkout-card', async (c) => {
       body: payload,
     });
 
-    // Log seguro (sem token, cartão, CVV, secrets)
+    const classifiedEarly = classifyMpCardResult(data?.status, data?.status_detail);
     console.log('mp card result', {
       sale_id: saleId,
       http_ok: ok,
       payment_id: data?.id || null,
       status: data?.status || null,
       status_detail: data?.status_detail || null,
+      category: data?.status === 'approved' ? 'approved' : (data?.status_detail ? classifiedEarly.category : 'integration'),
       payment_method_id: data?.payment_method_id || finalPaymentMethodId,
       installments,
       amount,
-      has_device_id: !!deviceId,
-      has_cpf: !!identification?.number,
+      has_device_id: true,
+      device_id_len: String(deviceId).length,
+      has_cpf: true,
+      has_real_email: true,
     });
 
     if (!ok) {
@@ -768,11 +875,12 @@ payments.post('/catalog-checkout-card', async (c) => {
         status_detail: data?.status_detail || null,
         cause: Array.isArray(data?.cause) ? data.cause.map((c) => ({ code: c?.code, description: c?.description })) : null,
       };
-      console.error('mp card create failed', { sale_id: saleId, ...safeErr });
+      console.error('mp card create failed', { sale_id: saleId, payment_id: data?.id || null, ...safeErr });
+      const failedCategory = data?.status_detail ? classifyMpCardResult(data?.status || 'rejected', data.status_detail).category : 'integration';
       await admin.from('sale').update({
         ...encodeOnlinePaymentFields({
           payment_status: 'payment_failed',
-          payment_meta: { last_error: safeErr, payment_id: data?.id || null },
+          payment_meta: { last_error: safeErr, payment_id: data?.id || null, category: failedCategory },
           status: 'cancelada',
         }),
       }).eq('id', saleId);
@@ -781,8 +889,8 @@ payments.post('/catalog-checkout-card', async (c) => {
         status: data?.status || 'rejected',
         status_detail: data?.status_detail || safeErr.message || 'api_error',
         payment_id: data?.id || null,
-        error: data?.message || data?.error || 'Pagamento recusado pela API',
-        category: 'integration_or_api',
+        error: data?.message || data?.error || 'Falha ao criar pagamento no Mercado Pago',
+        category: failedCategory,
       }, 400);
     }
 

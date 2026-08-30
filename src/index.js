@@ -51,7 +51,7 @@ app.use(
   '*',
   cors({
     origin: (origin) => (isAllowedOrigin(origin) ? origin || '*' : ''),
-    allowHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'stripe-signature'],
+    allowHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'stripe-signature', 'X-meli-session-id', 'x-meli-session-id'],
     allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     credentials: true,
   })
