@@ -350,6 +350,57 @@ function classifyMpCardResult(status, statusDetail) {
   return { category: 'integration', user_message: 'Status: ' + (status || 'desconhecido') + (d ? ' / ' + d : '') };
 }
 
+/**
+ * A loja já embute a taxa em sale.total (card_installment_rates).
+ * No "parcelado cliente" o MP soma juros no cartão (10,20 → 11,18).
+ * Só envia N parcelas se houver plano sem juros com total ≈ sale.total.
+ */
+async function resolveChargeInstallments(token, {
+  amount,
+  wantedInstallments,
+  bin,
+  paymentMethodId,
+  isDebit,
+}) {
+  const wanted = isDebit ? 1 : Math.max(1, Math.min(12, Number(wantedInstallments) || 1));
+  if (wanted <= 1) {
+    return { installments: 1, issuer_id: null, plan: 'avista', mp_total: amount };
+  }
+  const binDigits = String(bin || '').replace(/\D/g, '').slice(0, 8);
+  if (binDigits.length < 6) {
+    return { installments: 1, issuer_id: null, plan: 'fallback_avista_sem_bin', mp_total: amount };
+  }
+  try {
+    const params = new URLSearchParams({
+      amount: String(amount),
+      bin: binDigits,
+    });
+    if (paymentMethodId) params.set('payment_method_id', String(paymentMethodId));
+    const { ok, data } = await mpFetch(token, `/v1/payment_methods/installments?${params.toString()}`);
+    const list = ok && Array.isArray(data) ? data : [];
+    for (const issuer of list) {
+      const costs = Array.isArray(issuer?.payer_costs) ? issuer.payer_costs : [];
+      const cost = costs.find((c) => Number(c.installments) === wanted);
+      if (!cost) continue;
+      const rate = Number(cost.installment_rate) || 0;
+      const total = Number(cost.total_amount);
+      const sameTotal = !Number.isFinite(total) || Math.abs(total - amount) <= 0.05;
+      if (rate === 0 && sameTotal) {
+        const issuerId = issuer?.issuer?.id ?? issuer?.issuer_id ?? null;
+        return {
+          installments: wanted,
+          issuer_id: issuerId != null ? String(issuerId) : null,
+          plan: 'sem_juros',
+          mp_total: Number.isFinite(total) ? total : amount,
+        };
+      }
+    }
+  } catch (e) {
+    console.warn('mp installments lookup', e.message || e);
+  }
+  return { installments: 1, issuer_id: null, plan: 'fallback_avista_mp_juros', mp_total: amount };
+}
+
 async function mpFetch(token, path, options = {}) {
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -718,9 +769,12 @@ payments.post('/catalog-checkout-card', async (c) => {
 
     // Valor SEMPRE do banco (nunca confiar no frontend)
     const amount = Math.round(Number(sale.total) * 100) / 100;
-    const installments = Math.max(1, Math.min(12, Number(body.installments) || Number(sale.installments) || 1));
     const paymentMethodId = body.payment_method_id || body.paymentMethodId || 'visa';
     const catalogPayMethod = ['cartao_debito','cartao_credito'].includes(body.catalog_payment_method) ? body.catalog_payment_method : (body.payment_type === 'debit' || /debito|debit/i.test(String(paymentMethodId)) ? 'cartao_debito' : 'cartao_credito');
+    const isDebit = catalogPayMethod === 'cartao_debito';
+    // Parcelas cobradas = as que já foram precificadas na venda. Não aceitar troca no overlay.
+    const pricedInstallments = isDebit ? 1 : Math.max(1, Math.min(12, Number(sale.installments) || Number(body.installments) || 1));
+    const cardBin = String(body.card_bin || body.bin || body.first_six_digits || '').replace(/\D/g, '').slice(0, 8);
 
     const payerEmailRaw = body.payer?.email || body.payer_email || body.email || sale.customer_email || null;
     const payerEmail = isRealPayerEmail(payerEmailRaw) ? String(payerEmailRaw).trim().toLowerCase() : '';
@@ -815,6 +869,15 @@ payments.post('/catalog-checkout-card', async (c) => {
     const attemptId = String(body.attempt_id || crypto.randomUUID()).slice(0, 64);
     const idem = `card-${saleId}-${attemptId}`;
 
+    const chargePlan = await resolveChargeInstallments(token, {
+      amount,
+      wantedInstallments: pricedInstallments,
+      bin: cardBin,
+      paymentMethodId: finalPaymentMethodId,
+      isDebit,
+    });
+    const installments = chargePlan.installments;
+
     const payload = {
       transaction_amount: amount,
       token: cardToken,
@@ -836,9 +899,12 @@ payments.post('/catalog-checkout-card', async (c) => {
         store_owner_id: storeOwnerId,
         has_device_id: true,
         attempt_id: attemptId,
+        priced_installments: pricedInstallments,
+        charge_plan: chargePlan.plan,
       },
       additional_info: additionalInfo,
     };
+    if (chargePlan.issuer_id) payload.issuer_id = chargePlan.issuer_id;
 
     const headers = {
       'X-meli-session-id': String(deviceId),
@@ -861,7 +927,10 @@ payments.post('/catalog-checkout-card', async (c) => {
       category: data?.status === 'approved' ? 'approved' : (data?.status_detail ? classifiedEarly.category : 'integration'),
       payment_method_id: data?.payment_method_id || finalPaymentMethodId,
       installments,
+      priced_installments: pricedInstallments,
+      charge_plan: chargePlan.plan,
       amount,
+      mp_total_paid: data?.transaction_details?.total_paid_amount || null,
       has_device_id: true,
       device_id_len: String(deviceId).length,
       has_cpf: true,
@@ -915,9 +984,16 @@ payments.post('/catalog-checkout-card', async (c) => {
       }
       await updateSalePaid(saleId, {
         payment_method: catalogPayMethod,
-        installments: catalogPayMethod === 'cartao_debito' ? 1 : installments,
+        installments: catalogPayMethod === 'cartao_debito' ? 1 : (Number(sale.installments) || pricedInstallments),
         mp_payment_id: String(data.id),
-        payment_meta: { provider: 'mercadopago', payment_id: data.id, status },
+        payment_meta: {
+          provider: 'mercadopago',
+          payment_id: data.id,
+          status,
+          charge_plan: chargePlan.plan,
+          charged_amount: amount,
+          mp_total_paid: data?.transaction_details?.total_paid_amount || null,
+        },
         status: 'orcamento',
       });
       const { data: fresh } = await admin.from('sale').select('*').eq('id', saleId).maybeSingle();
