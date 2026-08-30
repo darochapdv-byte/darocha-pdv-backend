@@ -9,6 +9,41 @@ import { requireUser } from './helpers.js';
 
 const payments = new Hono();
 
+/** Campos extras de pagamento online sem colunas novas no banco */
+function encodeOnlinePaymentFields({ payment_status, mp_payment_id, payment_meta, paid_at, status } = {}) {
+  const out = {};
+  if (status) out.status = status;
+  else if (payment_status === 'paid') out.status = 'concluida';
+  else if (payment_status === 'pending' || payment_status === 'pending_payment') out.status = 'pending_payment';
+  else if (payment_status === 'payment_failed') out.status = 'cancelada';
+  const paymentsBlob = {
+    online: true,
+    provider: 'mercadopago',
+    payment_status: payment_status || null,
+    mp_payment_id: mp_payment_id || null,
+    paid_at: paid_at || null,
+    ...(payment_meta && typeof payment_meta === 'object' ? payment_meta : {}),
+  };
+  out.payments = paymentsBlob;
+  if (mp_payment_id) out.client_ref = String(mp_payment_id);
+  return out;
+}
+
+function readOnlinePayment(sale) {
+  if (!sale) return {};
+  const p = sale.payments && typeof sale.payments === 'object' && !Array.isArray(sale.payments) ? sale.payments : {};
+  return {
+    payment_status: p.payment_status
+      || (sale.status === 'concluida' ? 'paid' : null)
+      || (sale.status === 'pending_payment' ? 'pending' : null),
+    mp_payment_id: p.mp_payment_id || sale.client_ref || null,
+    payment_meta: p,
+    paid_at: p.paid_at || null,
+  };
+}
+
+
+
 const MP_API = 'https://api.mercadopago.com';
 const MP_AUTH = 'https://auth.mercadopago.com/authorization';
 
