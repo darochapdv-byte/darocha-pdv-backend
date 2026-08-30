@@ -461,4 +461,64 @@ catalogExtra.post('/address-search', async (c) => {
   }
 });
 
+function escapeHtml(v) {
+  return String(v || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+export async function renderCatalogSharePage(c, slug, productId) {
+  try {
+    if (!admin) return c.text('Serviço indisponível', 503);
+    slug = String(slug || c.req.query('slug') || '').trim().toLowerCase();
+    productId = String(productId || c.req.query('id') || '').trim();
+    if (!slug || !productId) return c.text('Produto não informado', 400);
+    const resolved = await resolveStoreBySlug(slug);
+    if (!resolved) return c.text('Loja não encontrada', 404);
+    const { data: product } = await admin.from('product').select('*').eq('id', productId).maybeSingle();
+    if (!product || String(product.created_by || '') !== String(resolved.userId)) {
+      return c.text('Produto não encontrado', 404);
+    }
+    const name = product.name || 'Produto';
+    const price = Number(product.sale_price || product.price || 0);
+    const priceTxt = price.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+    const desc = String(product.description || product.catalog_description || `${name} por ${priceTxt}`).slice(0, 180);
+    let img = String(product.image_url || product.photo_url || '').trim();
+    if (img && img.startsWith('//')) img = 'https:' + img;
+    if (img && img.startsWith('/')) img = 'https://darochapdv.com' + img;
+    const catalogUrl = `https://${slug}.darochapdv.com/catalogo?p=${encodeURIComponent(productId)}`;
+    const shareUrl = `https://darochapdv.com/s/${encodeURIComponent(slug)}/${encodeURIComponent(productId)}`;
+    const title = `${name} · ${priceTxt}`;
+    const html = `<!doctype html><html lang="pt-BR"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>${escapeHtml(title)}</title>
+<meta name="description" content="${escapeHtml(desc)}"/>
+<meta property="og:type" content="product"/>
+<meta property="og:title" content="${escapeHtml(title)}"/>
+<meta property="og:description" content="${escapeHtml(desc)}"/>
+<meta property="og:url" content="${escapeHtml(shareUrl)}"/>
+${img ? `<meta property="og:image" content="${escapeHtml(img)}"/>
+<meta property="og:image:secure_url" content="${escapeHtml(img)}"/>
+<meta name="twitter:image" content="${escapeHtml(img)}"/>` : ''}
+<meta property="og:site_name" content="Darocha PDV"/>
+<meta name="twitter:card" content="summary_large_image"/>
+<meta name="twitter:title" content="${escapeHtml(title)}"/>
+<meta name="twitter:description" content="${escapeHtml(desc)}"/>
+<meta http-equiv="refresh" content="0;url=${escapeHtml(catalogUrl)}"/>
+</head><body style="font-family:sans-serif;padding:24px;text-align:center">
+<p>Abrindo ${escapeHtml(name)}…</p>
+<p><a href="${escapeHtml(catalogUrl)}">Ir para o produto</a></p>
+<script>location.replace(${JSON.stringify(catalogUrl)});</script>
+</body></html>`;
+    return c.html(html);
+  } catch (e) {
+    return c.text(e.message || 'Erro', 500);
+  }
+}
+
+catalogExtra.get('/catalog-share', (c) => renderCatalogSharePage(c, c.req.query('slug'), c.req.query('id')));
+
 export default catalogExtra;

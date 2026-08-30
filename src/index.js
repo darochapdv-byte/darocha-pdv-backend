@@ -10,7 +10,7 @@ import auth from './auth.js';
 import entities from './entities.js';
 import functions from './functions.js';
 import catalog from './catalog.js';
-import catalogExtra from './catalog_extra.js';
+import catalogExtra, { renderCatalogSharePage } from './catalog_extra.js';
 import paymentsMp from './payments_mp.js';
 import products from './products.js';
 import stock from './stock.js';
@@ -115,6 +115,8 @@ app.onError((err, c) => {
   return c.json({ error: 'internal_error', message: err?.message || 'Erro interno' }, 500);
 });
 
+app.get('/share/:slug/:id', (c) => renderCatalogSharePage(c, c.req.param('slug'), c.req.param('id')));
+app.get('/s/:slug/:id', (c) => renderCatalogSharePage(c, c.req.param('slug'), c.req.param('id')));
 app.notFound((c) => c.json({ error: 'not_found' }, 404));
 
 app.route('/auth', auth);
