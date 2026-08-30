@@ -457,9 +457,16 @@ catalog.post('/catalog-checkout', async (c) => {
     if (paymentMethod === 'cartao_credito') {
       installments = Math.max(1, Math.min(12, Number(body.installments) || 1));
       const rates = settings?.card_installment_rates || [];
-      const rateEntry = rates.find((r) => r.installments === installments);
-      cardRatePercent = rateEntry ? Number(rateEntry.rate) || 0 : 0;
-      feeAmount = Math.round(((baseTotal * cardRatePercent) / 100) * 100) / 100;
+      const rateEntry = Array.isArray(rates) ? rates.find((r) => Number(r.installments) === installments) : null;
+      cardRatePercent = rateEntry ? Number(rateEntry.rate) || 0 : (Number(body.card_rate_percent) || 0);
+      // se frontend mandou fee já calculado, respeita (com teto de sanidade)
+      const bodyFee = Number(body.fee_amount);
+      if (Number.isFinite(bodyFee) && bodyFee >= 0 && bodyFee <= baseTotal) {
+        feeAmount = Math.round(bodyFee * 100) / 100;
+        cardRatePercent = baseTotal > 0 ? Math.round((feeAmount / baseTotal) * 10000) / 100 : cardRatePercent;
+      } else {
+        feeAmount = Math.round(((baseTotal * cardRatePercent) / 100) * 100) / 100;
+      }
       total = Math.round((baseTotal + feeAmount) * 100) / 100;
     }
 
@@ -675,7 +682,7 @@ catalog.post('/catalog-checkout', async (c) => {
       try {
         const { loadMpAccount } = await import('./payments_mp.js');
         const acc = await loadMpAccount(saleOwnerId);
-        mp_public_key = acc?.public_key || process.env.MP_PUBLIC_KEY || null;
+        mp_public_key = process.env.MP_PUBLIC_KEY || acc?.public_key || null;
       } catch (_) {}
     }
     return c.json({
