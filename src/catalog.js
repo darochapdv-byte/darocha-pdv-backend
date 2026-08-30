@@ -210,6 +210,7 @@ catalog.post('/catalog-data', async (c) => {
       card_rates: cfg?.card_installment_rates || [],
       max_qty_per_product: maxQtyLimit,
       store_open: (openSessions || []).length > 0,
+      sell_when_closed: !!(cfg?.catalog_sell_when_closed === true || cfg?.catalog_sell_when_closed === 'true' || cfg?.role_payment_methods?.__catalog_sell_when_closed),
       delivery_paused: pauseStatus.paused,
       delivery_pause_message: pauseStatus.message,
       slug: catalogSlug,
@@ -308,6 +309,7 @@ catalog.post('/catalog-store-status', async (c) => {
     return c.json({
       store_open: (openSessions || []).length > 0,
       open: (openSessions || []).length > 0,
+      sell_when_closed: !!(cfg?.catalog_sell_when_closed === true || cfg?.catalog_sell_when_closed === 'true' || cfg?.role_payment_methods?.__catalog_sell_when_closed),
       catalog_enabled: cfg?.catalog_enabled !== false,
       whatsapp: cfg?.catalog_whatsapp || '',
       delivery_paused: pauseStatus.paused,
@@ -365,7 +367,8 @@ catalog.post('/catalog-checkout', async (c) => {
     let sessionsQuery = admin.from('cash_session').select('id,created_by').eq('status', 'aberto').limit(5);
     if (storeOwnerId) sessionsQuery = sessionsQuery.eq('created_by', storeOwnerId);
     const { data: openSessions } = await sessionsQuery;
-    if (!openSessions?.length && !payOnline) {
+    const sellWhenClosed = !!(settings?.catalog_sell_when_closed === true || settings?.catalog_sell_when_closed === 'true' || settings?.role_payment_methods?.__catalog_sell_when_closed);
+    if (!openSessions?.length && !payOnline && !sellWhenClosed) {
       return c.json({
         error: 'Nossa loja está fechada no momento. Você pode montar seu carrinho normalmente e finalizar seu pedido assim que houver um caixa aberto. Agradecemos sua compreensão!',
         store_closed: true,
@@ -624,7 +627,7 @@ catalog.post('/catalog-checkout', async (c) => {
       source: 'catalog',
       cash_session_id: openSession?.id || null,
       created_by: saleOwnerId,
-      notes: customer.notes || '',
+      notes: [!openSession ? '[PEDIDO FORA DO HORÁRIO — separar quando o caixa abrir]' : '', customer.notes || ''].filter(Boolean).join(' '),
 
       delivery_address: deliveryType === 'entrega' ? (body.street || '') : '',
       delivery_number: deliveryType === 'entrega' ? (body.number || '') : '',

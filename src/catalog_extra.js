@@ -521,4 +521,31 @@ ${img ? `<meta property="og:image" content="${escapeHtml(img)}"/>
 
 catalogExtra.get('/catalog-share', (c) => renderCatalogSharePage(c, c.req.query('slug'), c.req.query('id')));
 
+catalogExtra.post('/catalog-sell-closed', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Faça login no PDV.' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const body = await c.req.json().catch(() => ({}));
+    const enabled = body.enabled === true || body.enabled === 'true' || body.enabled === 1;
+    const { data: row } = await admin.from('app_settings').select('id,role_payment_methods,catalog_sell_when_closed')
+      .eq('created_by', user.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    const rpm = (row?.role_payment_methods && typeof row.role_payment_methods === 'object') ? { ...row.role_payment_methods } : {};
+    rpm.__catalog_sell_when_closed = enabled;
+    const patch = { role_payment_methods: rpm, catalog_sell_when_closed: enabled };
+    if (row?.id) {
+      const { error } = await admin.from('app_settings').update(patch).eq('id', row.id);
+      if (error) {
+        const { error: e2 } = await admin.from('app_settings').update({ role_payment_methods: rpm }).eq('id', row.id);
+        if (e2) return c.json({ error: e2.message }, 500);
+      }
+    } else {
+      await admin.from('app_settings').insert({ created_by: user.id, role_payment_methods: rpm });
+    }
+    return c.json({ ok: true, enabled });
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
+  }
+});
+
 export default catalogExtra;
