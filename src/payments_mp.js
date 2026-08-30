@@ -1293,7 +1293,11 @@ payments.post('/mp-point-charge', async (c) => {
           print_on_terminal: 'seller_ticket',
         },
         payment_method: {
-          default_type: payType === 'debit' || payType === 'debit_card' ? 'debit_card' : 'credit_card',
+          default_type: (payType === 'debit' || payType === 'debit_card')
+            ? 'debit_card'
+            : (payType === 'pix' || payType === 'qr' || payType === 'bank_transfer')
+              ? 'qr'
+              : 'credit_card',
           default_installments: installments,
         },
       },
@@ -1362,6 +1366,69 @@ payments.post('/mp-point-cancel', async (c) => {
     });
     if (!ok) return c.json({ error: data?.message || 'Não foi possível cancelar.', detail: data }, status || 400);
     return c.json({ ok: true, status: pointOrderStatus(data), raw_status: data.status });
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
+  }
+});
+
+payments.post('/pdv-pix-create', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Faça login no PDV.' }, 401);
+    const body = await c.req.json().catch(() => ({}));
+    const amount = Math.round(Number(body.amount || body.total || 0) * 100) / 100;
+    if (!(amount > 0)) return c.json({ error: 'Valor inválido' }, 400);
+    const { error, token } = await getAccessTokenForStore(user.id);
+    if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
+    const names = splitPersonName(body.payer_name || body.name || 'Cliente PDV');
+    const email = isRealPayerEmail(body.email) ? String(body.email).trim().toLowerCase() : `pdv.${String(user.id).replace(/-/g, '').slice(0, 10)}@gmail.com`;
+    const idem = `pdvpix-${user.id.slice(0, 8)}-${Math.round(amount * 100)}-${Date.now()}`;
+    const { ok, data } = await mpFetch(token, '/v1/payments', {
+      method: 'POST',
+      idempotencyKey: idem,
+      body: {
+        transaction_amount: amount,
+        description: body.description || `Venda PDV ${amount.toFixed(2)}`,
+        payment_method_id: 'pix',
+        payer: { email, first_name: names.first_name, last_name: names.last_name },
+        external_reference: String(body.external_reference || `pdv-pix-${Date.now()}`),
+        notification_url: env('MP_WEBHOOK_URL') || 'https://darocha-pdv-backend.onrender.com/functions/mercadopago-webhook',
+      },
+    });
+    if (!ok) return c.json({ error: data.message || data.error || 'Falha ao criar Pix', details: data }, 400);
+    const tx = data.point_of_interaction?.transaction_data || {};
+    return c.json({
+      ok: true,
+      payment_id: data.id,
+      status: data.status,
+      qr_code: tx.qr_code || null,
+      qr_code_base64: tx.qr_code_base64 || null,
+      ticket_url: tx.ticket_url || null,
+      amount,
+    });
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
+  }
+});
+
+payments.post('/pdv-pix-status', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Faça login no PDV.' }, 401);
+    const body = await c.req.json().catch(() => ({}));
+    const paymentId = String(body.payment_id || body.id || '').trim();
+    if (!paymentId) return c.json({ error: 'payment_id obrigatório' }, 400);
+    const { error, token } = await getAccessTokenForStore(user.id);
+    if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
+    const { ok, data, status } = await mpFetch(token, `/v1/payments/${paymentId}`);
+    if (!ok) return c.json({ error: data.message || 'Falha ao consultar Pix', details: data }, status || 400);
+    const st = String(data.status || '').toLowerCase();
+    return c.json({
+      ok: true,
+      payment_id: data.id,
+      status: st === 'approved' ? 'approved' : (st === 'cancelled' || st === 'rejected' ? 'rejected' : 'pending'),
+      raw_status: data.status,
+    });
   } catch (e) {
     return c.json({ error: e.message }, 500);
   }
