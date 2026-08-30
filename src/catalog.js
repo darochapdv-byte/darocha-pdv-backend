@@ -551,13 +551,13 @@ catalog.post('/catalog-checkout', async (c) => {
             updates.phone = phoneDigits;
           }
           if (deliveryType === 'entrega') {
-            if (body.street && !match.street) updates.street = body.street;
-            if (body.number && !match.number) updates.number = body.number;
-            if (body.complement && !match.complement) updates.complement = body.complement;
-            if (body.neighborhood && !match.neighborhood) updates.neighborhood = body.neighborhood;
-            if (body.city && !match.city) updates.city = body.city;
-            if (body.state && !match.state) updates.state = body.state;
-            if (body.cep && !match.cep) updates.cep = String(body.cep || '').replace(/\D/g, '');
+            if (body.street) updates.street = body.street;
+            if (body.number) updates.number = body.number;
+            if (body.complement) updates.complement = body.complement;
+            if (body.neighborhood) updates.neighborhood = body.neighborhood;
+            if (body.city) updates.city = body.city;
+            if (body.state) updates.state = body.state;
+            if (body.cep) updates.cep = String(body.cep || '').replace(/\D/g, '');
           }
           if (Object.keys(updates).length) {
             await admin.from('customer').update(updates).eq('id', match.id);
