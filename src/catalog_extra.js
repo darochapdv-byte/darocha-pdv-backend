@@ -41,62 +41,89 @@ function normalizePhoneDigits(raw) {
   return phoneDigits;
 }
 
+function mapCatalogOrder(s) {
+  const items = Array.isArray(s.items) ? s.items : [];
+  const paid = s.status === 'concluida' || s.status === 'orcamento' || s.payments?.payment_status === 'paid' || s.payments?.status === 'approved';
+  const pending = s.status === 'pending_payment';
+  const canceled = s.status === 'cancelada' || s.status === 'cancelado';
+  return {
+    sale_id: s.id,
+    number: String(s.id).slice(-6).toUpperCase(),
+    created_at: s.created_at,
+    total: Number(s.total) || 0,
+    status: canceled ? 'cancelado' : (pending ? 'aguardando_pagamento' : (paid ? 'registrado' : s.status)),
+    payment_method: s.payment_method,
+    delivery_type: s.delivery_type,
+    installments: s.installments || 1,
+    items: items.map((it) => ({
+      name: it.name || it.title || 'Item',
+      qty: Number(it.qty) || 1,
+    })),
+  };
+}
+
+function phonesMatch(salePhone, phoneDigits) {
+  let p = String(salePhone || '').replace(/\D/g, '');
+  if (p.startsWith('55') && p.length >= 12) p = p.slice(2);
+  if (p.startsWith('0') && p.length > 10) p = p.replace(/^0+/, '');
+  return p === phoneDigits;
+}
+
 catalogExtra.post('/catalog-history', async (c) => {
   try {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const body = await c.req.json().catch(() => ({}));
-    const phoneDigits = normalizePhoneDigits(body.phone || body.telefone || body.customer_phone);
-    if (phoneDigits.length < 10) {
-      return c.json({ error: 'Informe um telefone válido com DDD.' }, 400);
-    }
 
     let storeOwnerId = body.store_owner_id || body.created_by || null;
     const slug = String(body.slug || body.loja || body.store || '').trim();
     if (!storeOwnerId && slug) {
       const resolved = await resolveStoreBySlug(slug);
-      storeOwnerId = resolved?.userId || resolved?.created_by || resolved || null;
-      if (resolved && typeof resolved === 'object') storeOwnerId = resolved.userId || resolved.id || storeOwnerId;
+      storeOwnerId = resolved?.userId || null;
     }
     if (!storeOwnerId) return c.json({ error: 'Loja não identificada.' }, 400);
 
-    const variants = [phoneDigits, '55' + phoneDigits].filter(Boolean);
-    let query = admin
+    const selectCols = 'id,created_at,total,status,payment_method,delivery_type,items,customer_name,customer_phone,installments,payments';
+    const deviceIds = Array.isArray(body.sale_ids) ? body.sale_ids.map((id) => String(id)).filter(Boolean).slice(0, 20) : [];
+    const orderNumber = String(body.order_number || body.pedido || body.number || '').replace(/[^a-zA-Z0-9]/g, '').slice(-6).toUpperCase();
+    const phoneDigits = normalizePhoneDigits(body.phone || body.telefone || body.customer_phone);
+
+    // 1) Pedidos deste aparelho (IDs guardados no dispositivo)
+    if (deviceIds.length) {
+      const { data: rows, error } = await admin
+        .from('sale')
+        .select(selectCols)
+        .eq('source', 'catalog')
+        .eq('created_by', storeOwnerId)
+        .in('id', deviceIds)
+        .order('created_at', { ascending: false });
+      if (error) return c.json({ error: error.message }, 500);
+      return c.json({ ok: true, source: 'device', count: (rows || []).length, orders: (rows || []).map(mapCatalogOrder) });
+    }
+
+    // 2) Outro aparelho: telefone + número do pedido (nunca só telefone)
+    if (phoneDigits.length < 10 || orderNumber.length < 6) {
+      return c.json({
+        error: 'Para consultar em outro aparelho, informe o telefone e o número do pedido (6 caracteres).',
+        need: ['phone', 'order_number'],
+      }, 400);
+    }
+
+    const { data: recent, error } = await admin
       .from('sale')
-      .select('id,created_at,total,status,payment_method,delivery_type,items,customer_name,customer_phone,installments,pickup_status,delivery_status,payments,client_ref')
+      .select(selectCols)
       .eq('source', 'catalog')
       .eq('created_by', storeOwnerId)
       .order('created_at', { ascending: false })
-      .limit(40);
-    const { data: rows, error } = await query;
+      .limit(80);
     if (error) return c.json({ error: error.message }, 500);
 
-    const orders = (rows || []).filter((s) => {
-      let p = String(s.customer_phone || '').replace(/\D/g, '');
-      if (p.startsWith('55') && p.length >= 12) p = p.slice(2);
-      if (p.startsWith('0') && p.length > 10) p = p.replace(/^0+/, '');
-      return p === phoneDigits || variants.includes(p);
-    }).map((s) => {
-      const items = Array.isArray(s.items) ? s.items : [];
-      const paid = s.status === 'concluida' || s.status === 'orcamento' || s.payments?.payment_status === 'paid' || s.payments?.status === 'approved';
-      const pending = s.status === 'pending_payment';
-      const canceled = s.status === 'cancelada' || s.status === 'cancelado';
-      return {
-        sale_id: s.id,
-        number: String(s.id).slice(-6).toUpperCase(),
-        created_at: s.created_at,
-        total: Number(s.total) || 0,
-        status: canceled ? 'cancelado' : (pending ? 'aguardando_pagamento' : (paid ? 'registrado' : s.status)),
-        payment_method: s.payment_method,
-        delivery_type: s.delivery_type,
-        installments: s.installments || 1,
-        items: items.map((it) => ({
-          name: it.name || it.title || 'Item',
-          qty: Number(it.qty) || 1,
-        })),
-      };
-    });
+    const match = (recent || []).find((s) => String(s.id).slice(-6).toUpperCase() === orderNumber && phonesMatch(s.customer_phone, phoneDigits));
+    if (!match) {
+      return c.json({ ok: true, source: 'lookup', count: 0, orders: [], error: 'Pedido não encontrado. Confira o telefone e o número.' });
+    }
 
-    return c.json({ ok: true, phone: phoneDigits, count: orders.length, orders });
+    // Só devolve ESTE pedido — não a lista inteira do telefone
+    return c.json({ ok: true, source: 'lookup', count: 1, orders: [mapCatalogOrder(match)] });
   } catch (error) {
     return c.json({ error: error.message }, 500);
   }
