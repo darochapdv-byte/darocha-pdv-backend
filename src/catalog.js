@@ -195,6 +195,12 @@ catalog.post('/catalog-data', async (c) => {
       .eq('created_by', storeOwnerId).limit(5);
 
     const pauseStatus = getDeliveryPauseStatus(cfg);
+    let mpConnected = false;
+    try {
+      const { loadMpAccount } = await import('./payments_mp.js');
+      const mpAcc = await loadMpAccount(storeOwnerId);
+      mpConnected = !!(mpAcc && mpAcc.status === 'connected' && mpAcc.access_token_encrypted);
+    } catch {}
 
     return c.json({
       enabled: true,
@@ -211,6 +217,7 @@ catalog.post('/catalog-data', async (c) => {
       max_qty_per_product: maxQtyLimit,
       store_open: (openSessions || []).length > 0,
       sell_when_closed: !!(cfg?.catalog_sell_when_closed === true || cfg?.catalog_sell_when_closed === 'true' || cfg?.role_payment_methods?.__catalog_sell_when_closed),
+      mp_connected: mpConnected,
       delivery_paused: pauseStatus.paused,
       delivery_pause_message: pauseStatus.message,
       slug: catalogSlug,
@@ -361,7 +368,7 @@ catalog.post('/catalog-checkout', async (c) => {
       return c.json({ error: 'Vendedor inválido ou inativo' }, 400);
     }
 
-    const payOnline = body.pay_online === true || body.online_payment === true
+    let payOnline = body.pay_online === true || body.online_payment === true
       || body.payment_flow === 'online'
       || (['pix','cartao_credito','cartao_debito'].includes(String(body.payment_method||'')) && body.pay_online === true);
     let sessionsQuery = admin.from('cash_session').select('id,created_by').eq('status', 'aberto').limit(5);
@@ -379,10 +386,11 @@ catalog.post('/catalog-checkout', async (c) => {
         const { loadMpAccount } = await import('./payments_mp.js');
         const mpAcc = await loadMpAccount(storeOwnerId);
         if (!(mpAcc && mpAcc.status === 'connected' && mpAcc.access_token_encrypted)) {
-          return c.json({ error: 'Esta loja ainda não ativou pagamento online (Mercado Pago).', mp_required: true }, 400);
+          payOnline = false;
         }
       } catch (e) {
         console.warn('mp check', e.message);
+        payOnline = false;
       }
     }
 
