@@ -1217,6 +1217,156 @@ payments.post('/mercadopago-webhook', async (c) => {
   }
 });
 
+function pointOrderStatus(order) {
+  const st = String(order?.status || order?.status_detail || '').toLowerCase();
+  const pay = order?.transactions?.payments?.[0] || order?.transactions?.payments?.[0] || {};
+  const paySt = String(pay.status || '').toLowerCase();
+  if (st === 'processed' || paySt === 'processed' || paySt === 'approved') return 'approved';
+  if (st === 'canceled' || st === 'cancelled' || paySt === 'cancelled') return 'cancelled';
+  if (st === 'expired' || st === 'failed' || paySt === 'rejected' || paySt === 'failed') return 'rejected';
+  return 'pending';
+}
+
+payments.post('/mp-point-devices', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Faça login no PDV.' }, 401);
+    const { error, token } = await getAccessTokenForStore(user.id);
+    if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
+
+    let devices = [];
+    const modern = await mpFetch(token, '/terminals/v1/list');
+    if (modern.ok) {
+      const list = modern.data?.terminals || modern.data?.results || modern.data?.data || modern.data?.devices || [];
+      devices = (Array.isArray(list) ? list : []).map((d) => ({
+        id: d.id || d.terminal_id || d.device_id,
+        serial: d.serial_number || d.serial || '',
+        name: d.name || d.model || d.id,
+        operating_mode: d.operating_mode || d.mode || '',
+        store_id: d.store_id || null,
+      })).filter((d) => d.id);
+    }
+    if (!devices.length) {
+      const legacy = await mpFetch(token, '/point/integration-api/devices?offset=0&limit=50');
+      const list = legacy.data?.devices || [];
+      devices = (Array.isArray(list) ? list : []).map((d) => ({
+        id: d.id,
+        serial: String(d.id || '').split('__').pop() || '',
+        name: d.id,
+        operating_mode: d.operating_mode || '',
+        store_id: d.store_id || null,
+        pos_id: d.pos_id || null,
+      })).filter((d) => d.id);
+    }
+    return c.json({ ok: true, connected: true, devices });
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
+  }
+});
+
+payments.post('/mp-point-charge', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Faça login no PDV.' }, 401);
+    const body = await c.req.json().catch(() => ({}));
+    const amount = Math.round(Number(body.amount || body.total || 0) * 100) / 100;
+    const terminalId = String(body.terminal_id || body.device_id || '').trim();
+    if (!(amount > 0)) return c.json({ error: 'Informe o valor da cobrança.' }, 400);
+    if (!terminalId) return c.json({ error: 'Selecione a maquininha.' }, 400);
+
+    const { error, token } = await getAccessTokenForStore(user.id);
+    if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
+
+    const payType = String(body.payment_type || body.type || 'credit_card');
+    const installments = Math.max(1, Math.min(12, Number(body.installments) || 1));
+    const idem = (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`);
+
+    const payload = {
+      type: 'point',
+      external_reference: String(body.sale_id || body.external_reference || `pdv-${Date.now()}`),
+      expiration_time: 'PT10M',
+      description: body.description || 'Venda Darocha PDV',
+      transactions: { payments: [{ amount: amount.toFixed(2) }] },
+      config: {
+        point: {
+          terminal_id: terminalId,
+          print_on_terminal: 'seller_ticket',
+        },
+        payment_method: {
+          default_type: payType === 'debit' || payType === 'debit_card' ? 'debit_card' : 'credit_card',
+          default_installments: installments,
+        },
+      },
+    };
+
+    const created = await mpFetch(token, '/v1/orders', {
+      method: 'POST',
+      body: payload,
+      idempotencyKey: idem,
+    });
+    if (!created.ok) {
+      return c.json({
+        error: created.data?.message || created.data?.error || 'Não foi possível enviar a cobrança para a maquininha.',
+        detail: created.data,
+      }, created.status || 400);
+    }
+    const order = created.data || {};
+    return c.json({
+      ok: true,
+      order_id: order.id,
+      status: pointOrderStatus(order),
+      raw_status: order.status,
+      terminal_id: terminalId,
+      amount,
+    });
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
+  }
+});
+
+payments.post('/mp-point-status', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Faça login no PDV.' }, 401);
+    const body = await c.req.json().catch(() => ({}));
+    const orderId = String(body.order_id || body.id || '').trim();
+    if (!orderId) return c.json({ error: 'order_id obrigatório' }, 400);
+    const { error, token } = await getAccessTokenForStore(user.id);
+    if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
+    const { ok, data, status } = await mpFetch(token, `/v1/orders/${orderId}`);
+    if (!ok) return c.json({ error: data?.message || 'Não foi possível consultar a maquininha.', detail: data }, status || 400);
+    return c.json({
+      ok: true,
+      order_id: data.id,
+      status: pointOrderStatus(data),
+      raw_status: data.status,
+      amount: data.transactions?.payments?.[0]?.amount || null,
+    });
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
+  }
+});
+
+payments.post('/mp-point-cancel', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Faça login no PDV.' }, 401);
+    const body = await c.req.json().catch(() => ({}));
+    const orderId = String(body.order_id || body.id || '').trim();
+    if (!orderId) return c.json({ error: 'order_id obrigatório' }, 400);
+    const { error, token } = await getAccessTokenForStore(user.id);
+    if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
+    const { ok, data, status } = await mpFetch(token, `/v1/orders/${orderId}/cancel`, {
+      method: 'POST',
+      idempotencyKey: `cancel-${orderId}`,
+    });
+    if (!ok) return c.json({ error: data?.message || 'Não foi possível cancelar.', detail: data }, status || 400);
+    return c.json({ ok: true, status: pointOrderStatus(data), raw_status: data.status });
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
+  }
+});
+
 export {
   loadMpAccount,
   getAccessTokenForStore,
