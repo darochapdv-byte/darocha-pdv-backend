@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { createHash } from 'crypto';
 import { admin } from './db.js';
 import { requireUser, resolveStoreBySlug } from './helpers.js';
 
@@ -43,15 +44,17 @@ function normalizePhoneDigits(raw) {
 
 function mapCatalogOrder(s) {
   const items = Array.isArray(s.items) ? s.items : [];
-  const paid = s.status === 'concluida' || s.status === 'orcamento' || s.payments?.payment_status === 'paid' || s.payments?.status === 'approved';
-  const pending = s.status === 'pending_payment';
+  const payStatus = String(s.payments?.status || s.payments?.payment_status || '').toLowerCase();
   const canceled = s.status === 'cancelada' || s.status === 'cancelado';
+  const pending = s.status === 'pending_payment' || payStatus === 'pending' || payStatus === 'in_process';
+  const paid = !canceled && (payStatus === 'approved' || payStatus === 'paid' || s.status === 'concluida');
   return {
     sale_id: s.id,
     number: String(s.id).slice(-6).toUpperCase(),
     created_at: s.created_at,
     total: Number(s.total) || 0,
-    status: canceled ? 'cancelado' : (pending ? 'aguardando_pagamento' : (paid ? 'registrado' : s.status)),
+    status: canceled ? 'cancelado' : (paid ? 'pago' : (pending ? 'aguardando_pagamento' : (s.status || 'registrado'))),
+    paid: !!paid,
     payment_method: s.payment_method,
     delivery_type: s.delivery_type,
     installments: s.installments || 1,
@@ -60,6 +63,57 @@ function mapCatalogOrder(s) {
       qty: Number(it.qty) || 1,
     })),
   };
+}
+
+function hashPin(pin, phone) {
+  return createHash('sha256').update(`darocha-cat:${phone}:${pin}`).digest('hex');
+}
+
+function readStoredPin(customer) {
+  if (customer?.catalog_pin_hash) return String(customer.catalog_pin_hash);
+  const notes = String(customer?.notes || '');
+  const m = notes.match(/\[\[CATPIN:([a-f0-9]{64})\]\]/);
+  return m ? m[1] : '';
+}
+
+function writePinNotes(notes, hash) {
+  const clean = String(notes || '').replace(/\[\[CATPIN:[a-f0-9]{64}\]\]/g, '').trim();
+  return `${clean} [[CATPIN:${hash}]]`.trim();
+}
+
+function publicCustomer(cu) {
+  if (!cu) return null;
+  return {
+    id: cu.id,
+    name: cu.name || '',
+    phone: cu.phone || '',
+    street: cu.street || '',
+    number: cu.number || '',
+    complement: cu.complement || '',
+    neighborhood: cu.neighborhood || '',
+    city: cu.city || '',
+    state: cu.state || '',
+    cep: cu.cep || '',
+  };
+}
+
+async function resolveStoreId(body) {
+  let storeOwnerId = body.store_owner_id || body.created_by || null;
+  const slug = String(body.slug || body.loja || body.store || '').trim();
+  if (!storeOwnerId && slug) {
+    const resolved = await resolveStoreBySlug(slug);
+    storeOwnerId = resolved?.userId || null;
+  }
+  return storeOwnerId;
+}
+
+async function findCustomerByPhone(storeOwnerId, phoneDigits) {
+  const { data: rows } = await admin
+    .from('customer')
+    .select('*')
+    .eq('created_by', storeOwnerId)
+    .limit(3000);
+  return (rows || []).find((cu) => phonesMatch(cu.phone || cu.whatsapp, phoneDigits)) || null;
 }
 
 function phonesMatch(salePhone, phoneDigits) {
@@ -86,6 +140,25 @@ catalogExtra.post('/catalog-history', async (c) => {
     const deviceIds = Array.isArray(body.sale_ids) ? body.sale_ids.map((id) => String(id)).filter(Boolean).slice(0, 20) : [];
     const orderNumber = String(body.order_number || body.pedido || body.number || '').replace(/[^a-zA-Z0-9]/g, '').slice(-6).toUpperCase();
     const phoneDigits = normalizePhoneDigits(body.phone || body.telefone || body.customer_phone);
+    const pin = String(body.pin || body.senha || '').replace(/\D/g, '');
+
+    if (phoneDigits.length >= 10 && pin.length >= 4) {
+      const customer = await findCustomerByPhone(storeOwnerId, phoneDigits);
+      const stored = customer ? readStoredPin(customer) : '';
+      if (!customer || !stored || stored !== hashPin(pin, phoneDigits)) {
+        return c.json({ error: 'Telefone ou senha inválidos.' }, 401);
+      }
+      const { data: rows, error } = await admin
+        .from('sale')
+        .select(selectCols)
+        .eq('source', 'catalog')
+        .eq('created_by', storeOwnerId)
+        .order('created_at', { ascending: false })
+        .limit(40);
+      if (error) return c.json({ error: error.message }, 500);
+      const orders = (rows || []).filter((s) => phonesMatch(s.customer_phone, phoneDigits)).map(mapCatalogOrder);
+      return c.json({ ok: true, source: 'account', count: orders.length, orders });
+    }
 
     // 1) Pedidos deste aparelho (IDs guardados no dispositivo)
     if (deviceIds.length) {
@@ -124,6 +197,100 @@ catalogExtra.post('/catalog-history', async (c) => {
 
     // Só devolve ESTE pedido — não a lista inteira do telefone
     return c.json({ ok: true, source: 'lookup', count: 1, orders: [mapCatalogOrder(match)] });
+  } catch (error) {
+    return c.json({ error: error.message }, 500);
+  }
+});
+
+catalogExtra.post('/catalog-account-register', async (c) => {
+  try {
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const body = await c.req.json().catch(() => ({}));
+    const storeOwnerId = await resolveStoreId(body);
+    if (!storeOwnerId) return c.json({ error: 'Loja não identificada.' }, 400);
+    const phoneDigits = normalizePhoneDigits(body.phone);
+    const name = String(body.name || body.nome || '').trim();
+    const pin = String(body.pin || body.senha || '').replace(/\D/g, '');
+    if (name.length < 3) return c.json({ error: 'Informe seu nome completo.' }, 400);
+    if (phoneDigits.length < 10) return c.json({ error: 'Informe um telefone com DDD.' }, 400);
+    if (pin.length < 4 || pin.length > 6) return c.json({ error: 'Crie uma senha numérica de 4 a 6 dígitos.' }, 400);
+
+    const hash = hashPin(pin, phoneDigits);
+    let customer = await findCustomerByPhone(storeOwnerId, phoneDigits);
+    const addr = {
+      name,
+      phone: phoneDigits,
+      whatsapp: phoneDigits,
+      street: body.street || body.rua || '',
+      number: body.number || body.numero || '',
+      complement: body.complement || '',
+      neighborhood: body.neighborhood || body.bairro || '',
+      city: body.city || body.cidade || '',
+      state: body.state || body.uf || '',
+      cep: String(body.cep || '').replace(/\D/g, ''),
+    };
+
+    if (customer) {
+      if (readStoredPin(customer)) return c.json({ error: 'Já existe conta neste telefone. Entre com a senha.' }, 409);
+      const updates = { ...addr, notes: writePinNotes(customer.notes, hash) };
+      const { error } = await admin.from('customer').update(updates).eq('id', customer.id);
+      if (error) return c.json({ error: error.message }, 500);
+      customer = { ...customer, ...updates };
+    } else {
+      const row = { ...addr, person_type: 'fisica', active: true, created_by: storeOwnerId, notes: writePinNotes('', hash) };
+      const { data: created, error } = await admin.from('customer').insert(row).select('*').maybeSingle();
+      if (error) return c.json({ error: error.message }, 500);
+      customer = created;
+    }
+    return c.json({ ok: true, customer: publicCustomer(customer) });
+  } catch (error) {
+    return c.json({ error: error.message }, 500);
+  }
+});
+
+catalogExtra.post('/catalog-account-login', async (c) => {
+  try {
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const body = await c.req.json().catch(() => ({}));
+    const storeOwnerId = await resolveStoreId(body);
+    if (!storeOwnerId) return c.json({ error: 'Loja não identificada.' }, 400);
+    const phoneDigits = normalizePhoneDigits(body.phone);
+    const pin = String(body.pin || body.senha || '').replace(/\D/g, '');
+    if (phoneDigits.length < 10 || pin.length < 4) return c.json({ error: 'Informe telefone e senha.' }, 400);
+    const customer = await findCustomerByPhone(storeOwnerId, phoneDigits);
+    const stored = customer ? readStoredPin(customer) : '';
+    if (!customer || !stored || stored !== hashPin(pin, phoneDigits)) {
+      return c.json({ error: 'Telefone ou senha inválidos.' }, 401);
+    }
+    return c.json({ ok: true, customer: publicCustomer(customer) });
+  } catch (error) {
+    return c.json({ error: error.message }, 500);
+  }
+});
+
+catalogExtra.post('/catalog-account-update', async (c) => {
+  try {
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const body = await c.req.json().catch(() => ({}));
+    const storeOwnerId = await resolveStoreId(body);
+    if (!storeOwnerId) return c.json({ error: 'Loja não identificada.' }, 400);
+    const phoneDigits = normalizePhoneDigits(body.phone);
+    const pin = String(body.pin || body.senha || '').replace(/\D/g, '');
+    const customer = await findCustomerByPhone(storeOwnerId, phoneDigits);
+    const stored = customer ? readStoredPin(customer) : '';
+    if (!customer || !stored || stored !== hashPin(pin, phoneDigits)) {
+      return c.json({ error: 'Telefone ou senha inválidos.' }, 401);
+    }
+    const updates = {};
+    if (body.name) updates.name = String(body.name).trim();
+    ['street','number','complement','neighborhood','city','state'].forEach((k) => {
+      if (body[k] != null) updates[k] = String(body[k]);
+    });
+    if (body.cep != null) updates.cep = String(body.cep).replace(/\D/g, '');
+    if (Object.keys(updates).length) {
+      await admin.from('customer').update(updates).eq('id', customer.id);
+    }
+    return c.json({ ok: true, customer: publicCustomer({ ...customer, ...updates }) });
   } catch (error) {
     return c.json({ error: error.message }, 500);
   }
