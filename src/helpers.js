@@ -336,8 +336,28 @@ export async function resolveStoreBySlug(slug) {
     const es = normalizeSlug(e.slug);
     return es === normalized || es.replace(/-/g, '') === compact || String(e.slug).toLowerCase() === compact;
   });
-  if (!hit) return null;
-  return { userId: hit.user_id, slug: hit.slug };
+  if (hit) return { userId: hit.user_id, slug: hit.slug };
+
+  try {
+    const { data: byCol } = await admin
+      .from('app_settings')
+      .select('created_by,catalog_slug')
+      .eq('catalog_slug', normalized)
+      .limit(5);
+    const row = (byCol || []).find((r) => r.created_by);
+    if (row) return { userId: row.created_by, slug: normalizeSlug(row.catalog_slug) || normalized };
+  } catch { /* coluna catalog_slug pode não existir */ }
+
+  try {
+    const { data: settings } = await admin
+      .from('app_settings')
+      .select('created_by,company_name')
+      .limit(200);
+    const row = (settings || []).find((r) => normalizeSlug(r.company_name) === normalized || normalizeSlug(r.company_name).replace(/-/g, '') === compact);
+    if (row?.created_by) return { userId: row.created_by, slug: normalized };
+  } catch { /* ignore */ }
+
+  return null;
 }
 
 /** Lê a política "vender sem estoque" (PDV + catálogo). Opcionalmente por loja (userId). */

@@ -97,7 +97,7 @@ catalog.post('/catalog-data', async (c) => {
           sellers: [],
           error: 'Loja não encontrada. Verifique o link do catálogo.',
           slug: slugParam,
-        }, 404);
+        }, 200);
       }
       storeOwnerId = resolved.userId;
       catalogSlug = resolved.slug;
