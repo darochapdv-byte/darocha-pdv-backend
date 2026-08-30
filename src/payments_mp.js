@@ -402,17 +402,18 @@ async function resolveChargeInstallments(token, {
 }
 
 async function mpFetch(token, path, options = {}) {
+  const method = options.method || 'GET';
   const headers = {
     Authorization: `Bearer ${token}`,
-    'Content-Type': 'application/json',
     Accept: 'application/json',
     ...(options.headers || {}),
   };
+  if (method !== 'GET' && method !== 'HEAD') headers['Content-Type'] = 'application/json';
   if (options.idempotencyKey) {
     headers['X-Idempotency-Key'] = options.idempotencyKey;
   }
   const res = await fetch(`${MP_API}${path}`, {
-    method: options.method || 'GET',
+    method,
     headers,
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
@@ -1420,14 +1421,25 @@ payments.post('/pdv-pix-status', async (c) => {
     if (!paymentId) return c.json({ error: 'payment_id obrigatório' }, 400);
     const { error, token } = await getAccessTokenForStore(user.id);
     if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
-    const { ok, data, status } = await mpFetch(token, `/v1/payments/${paymentId}`);
+    let { ok, data, status } = await mpFetch(token, `/v1/payments/${paymentId}`, { method: 'GET' });
+    if (!ok) {
+      const searched = await mpFetch(token, `/v1/payments/search?id=${encodeURIComponent(paymentId)}`, { method: 'GET' });
+      const hit = searched.data?.results?.[0] || searched.data?.elements?.[0];
+      if (searched.ok && hit) {
+        ok = true;
+        data = hit;
+      }
+    }
     if (!ok) return c.json({ error: data.message || 'Falha ao consultar Pix', details: data }, status || 400);
-    const st = String(data.status || '').toLowerCase();
+    const st = String(data.status || data.status_detail || '').toLowerCase();
+    const approved = st === 'approved' || st === 'accredited' || st.includes('accredited');
+    const rejected = st === 'cancelled' || st === 'rejected' || st === 'refunded';
     return c.json({
       ok: true,
       payment_id: data.id,
-      status: st === 'approved' ? 'approved' : (st === 'cancelled' || st === 'rejected' ? 'rejected' : 'pending'),
-      raw_status: data.status,
+      status: approved ? 'approved' : (rejected ? 'rejected' : 'pending'),
+      raw_status: data.status || null,
+      status_detail: data.status_detail || null,
     });
   } catch (e) {
     return c.json({ error: e.message }, 500);
