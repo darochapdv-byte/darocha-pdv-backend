@@ -752,56 +752,41 @@ functions.post('/check-vale-due', async (c) => {
       .order('created_at', { ascending: false })
       .limit(500);
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
     let created = 0;
 
     for (const sale of sales || []) {
-      const plan = Array.isArray(sale.installment_plan) ? sale.installment_plan : [];
-      for (const p of plan) {
-        if (p.paid) continue;
-        if (!p.due_date) continue;
-        const due = new Date(p.due_date + 'T12:00:00');
-        const diffDays = Math.round((due.getTime() - today.getTime()) / 86400000);
-        let kind = null;
-        if (diffDays < 0) kind = 'vencida';
-        else if (diffDays === 0) kind = 'vence_hoje';
-        else if (diffDays <= warnDays) kind = 'proxima';
-        if (!kind) continue;
-
-        const title =
-          kind === 'vencida'
-            ? `Vale vencido · parcela ${p.n}`
-            : kind === 'vence_hoje'
-              ? `Vale vence hoje · parcela ${p.n}`
-              : `Vale em ${diffDays} dia(s) · parcela ${p.n}`;
-        const phoneLabel = sale.customer_phone
-          ? ` · ${String(sale.customer_phone).replace(/\D/g, '')}`
-          : '';
-        const message = `${sale.customer_name || 'Cliente'}${phoneLabel} · R$ ${Number(p.amount || 0).toFixed(2)} · venc. ${p.due_date} · pedido #${String(sale.id).slice(-6).toUpperCase()}`;
-
-        // evita spam: mesma sale+parcela+kind no dia
-        const { data: existing } = await admin
-          .from('notification')
-          .select('id')
-          .eq('created_by', user.id)
-          .eq('sale_id', sale.id)
-          .eq('type', `vale_${kind}`)
-          .ilike('message', `%parcela ${p.n}%`)
-          .limit(1);
-
-        if (existing?.length) continue;
-
-        await admin.from('notification').insert({
-          title,
-          message,
-          sale_id: sale.id,
-          type: `vale_${kind}`,
-          read: false,
-          created_by: user.id,
-        });
-        created += 1;
+      const raw = sale.installment_plan;
+      let remaining = Number(sale.total || 0);
+      if (raw && !Array.isArray(raw) && typeof raw === 'object') {
+        remaining = Number(raw.remaining != null ? raw.remaining : remaining);
+      } else if (Array.isArray(raw)) {
+        const paid = raw.filter((p) => p.paid).reduce((s, p) => s + Number(p.amount || 0), 0);
+        remaining = Math.round((Number(sale.total || 0) - paid) * 100) / 100;
       }
+      if (!(remaining > 0.009)) continue;
+
+      const title = `Vale em aberto · R$ ${remaining.toFixed(2)}`;
+      const phoneLabel = sale.customer_phone ? ` · ${String(sale.customer_phone).replace(/\D/g, '')}` : '';
+      const message = `${sale.customer_name || 'Cliente'}${phoneLabel} ainda deve R$ ${remaining.toFixed(2)} · pedido #${String(sale.id).slice(-6).toUpperCase()}`;
+
+      const { data: existing } = await admin
+        .from('notification')
+        .select('id')
+        .eq('created_by', user.id)
+        .eq('sale_id', sale.id)
+        .eq('type', 'vale_aberto')
+        .limit(1);
+      if (existing?.length) continue;
+
+      await admin.from('notification').insert({
+        title,
+        message,
+        sale_id: sale.id,
+        type: 'vale_aberto',
+        read: false,
+        created_by: user.id,
+      });
+      created += 1;
     }
 
     return c.json({ ok: true, notifications_created: created, warn_days: warnDays });
