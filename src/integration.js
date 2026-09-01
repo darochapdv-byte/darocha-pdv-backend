@@ -706,8 +706,8 @@ integration.post('/edit-concluded-sale', async (c) => {
 });
 
 /**
- * Marca parcela de vale como paga
- * body: { sale_id, parcel_n, paid?: true }
+ * Baixa de vale por valor (saldo), não por parcela de calendário.
+ * body: { sale_id, amount }  ou legado { sale_id, parcel_n }
  */
 integration.post('/mark-vale-paid', async (c) => {
   try {
@@ -717,22 +717,67 @@ integration.post('/mark-vale-paid', async (c) => {
 
     const body = await c.req.json().catch(() => ({}));
     const sale_id = body.sale_id;
-    const parcel_n = Number(body.parcel_n);
-    if (!sale_id || !parcel_n) return c.json({ error: 'sale_id e parcel_n obrigatórios' }, 400);
+    if (!sale_id) return c.json({ error: 'sale_id obrigatório' }, 400);
 
     const { data: sale } = await admin.from('sale').select('*').eq('id', sale_id).maybeSingle();
     if (!sale) return c.json({ error: 'Venda não encontrada' }, 404);
+    if (sale.created_by && user.id && sale.created_by !== user.id) {
+      return c.json({ error: 'forbidden' }, 403);
+    }
 
-    const plan = Array.isArray(sale.installment_plan) ? [...sale.installment_plan] : [];
-    const idx = plan.findIndex((p) => Number(p.n) === parcel_n);
-    if (idx < 0) return c.json({ error: 'Parcela não encontrada' }, 404);
+    const total = Number(sale.total || 0);
+    let plan = sale.installment_plan;
 
-    plan[idx] = {
-      ...plan[idx],
-      paid: body.paid !== false,
-      paid_at: body.paid === false ? null : new Date().toISOString(),
-      paid_by: body.paid === false ? null : (user.full_name || user.email || user.id),
+    const asBalance = (raw) => {
+      if (raw && !Array.isArray(raw) && typeof raw === 'object') {
+        const payments = Array.isArray(raw.payments) ? raw.payments : [];
+        const paid = payments.reduce((s, p) => s + Number(p.amount || 0), 0);
+        return {
+          mode: 'balance',
+          total: Number(raw.total || total),
+          payments,
+          paid_total: Math.round(paid * 100) / 100,
+          remaining: Math.round((Number(raw.total || total) - paid) * 100) / 100,
+        };
+      }
+      const parcels = Array.isArray(raw) ? raw : [];
+      const payments = parcels.filter((p) => p.paid).map((p) => ({
+        amount: Number(p.amount || 0),
+        at: p.paid_at || null,
+        by: p.paid_by || null,
+        from_parcel: p.n,
+      }));
+      const paid = payments.reduce((s, p) => s + Number(p.amount || 0), 0);
+      return {
+        mode: 'balance',
+        total,
+        payments,
+        paid_total: Math.round(paid * 100) / 100,
+        remaining: Math.round((total - paid) * 100) / 100,
+      };
     };
+
+    plan = asBalance(plan);
+
+    if (body.parcel_n && !(Number(body.amount) > 0)) {
+      const parcels = Array.isArray(sale.installment_plan) ? sale.installment_plan : [];
+      const found = parcels.find((p) => Number(p.n) === Number(body.parcel_n));
+      if (found && !found.paid) body.amount = Number(found.amount || 0);
+    }
+
+    const pay = Math.round(Number(body.amount || 0) * 100) / 100;
+    if (!(pay > 0)) return c.json({ error: 'Informe o valor recebido.' }, 400);
+    if (pay > plan.remaining + 0.009) {
+      return c.json({ error: `Valor maior que o saldo (R$ ${plan.remaining.toFixed(2)}).` }, 400);
+    }
+
+    plan.payments.push({
+      amount: pay,
+      at: new Date().toISOString(),
+      by: user.full_name || user.email || user.id,
+    });
+    plan.paid_total = Math.round((plan.paid_total + pay) * 100) / 100;
+    plan.remaining = Math.round((plan.total - plan.paid_total) * 100) / 100;
 
     const { data: updated, error } = await admin
       .from('sale')
