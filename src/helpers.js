@@ -396,6 +396,25 @@ export async function resolveStoreBySlug(slug) {
         slugMatches(r.company_name, normalized, compact)
       );
       if (row?.created_by) return { userId: row.created_by, slug: normalizeSlug(row.catalog_slug) || normalized };
+
+      const contains = (txt) => {
+        const es = normalizeSlug(txt || '');
+        const c = es.replace(/-/g, '');
+        return !!es && (es.includes(normalized) || c.includes(compact) || normalized.includes(es) || compact.includes(c));
+      };
+      const softLogs = existing.filter((e) => contains(e.slug));
+      const softSet = (settings || []).filter((r) => contains(r.catalog_slug) || contains(r.company_name));
+      const ids = [...new Set([
+        ...softLogs.map((e) => e.user_id),
+        ...softSet.map((r) => r.created_by).filter(Boolean),
+      ])];
+      if (ids.length === 1) {
+        const id = ids[0];
+        const sl = softLogs.find((e) => e.user_id === id)?.slug
+          || normalizeSlug(softSet.find((r) => r.created_by === id)?.catalog_slug)
+          || normalized;
+        return { userId: id, slug: sl };
+      }
     } catch { /* ignore */ }
   }
 
