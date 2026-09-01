@@ -18,6 +18,7 @@ import adminOps from './admin_ops.js';
 import stripeOps from './stripe_ops.js';
 import nfe from './nfe.js';
 import fiscal from './fiscal.js';
+import aiAssist from './ai_assist.js';
 import integration from './integration.js';
 import { admin, useLocal } from './db.js';
 
@@ -131,6 +132,7 @@ app.route('/functions', adminOps);
 app.route('/functions', stripeOps);
 app.route('/functions', nfe);
 app.route('/functions', fiscal);
+app.route('/functions', aiAssist);
 app.route('/functions', integration);
 app.route('/functions', functions);
 
