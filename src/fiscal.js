@@ -25,6 +25,7 @@ function publicSettings(raw) {
   if (!raw || typeof raw !== 'object') return null;
   return {
     status: raw.status || 'incomplete',
+    enabled: raw.enabled === true,
     environment: raw.environment || 'homologacao',
     cnpj: raw.cnpj ? onlyDigits(raw.cnpj) : '',
     legal_name: raw.legal_name || '',
@@ -45,7 +46,7 @@ function publicSettings(raw) {
     },
     provider: PROVIDER,
     provider_company_id: raw.provider_company_id || null,
-    connected: !!(raw.provider_company_id && raw.certificate_uploaded),
+    connected: raw.enabled === true && !!(raw.provider_company_id && raw.certificate_uploaded),
     has_csc: !!raw.csc_encrypted,
   };
 }
@@ -218,6 +219,23 @@ function canManageFiscal(user) {
   return role === 'admin' || role === 'owner' || role === 'gerente' || role === 'administrador';
 }
 
+fiscal.post('/fiscal-disconnect', async (c) => {
+  const user = await requireUser(c);
+  if (!user?.id) return c.json({ error: 'unauthorized' }, 401);
+  if (!canManageFiscal(user)) return c.json({ error: 'forbidden' }, 403);
+  const saved = await saveSettings(user.id, { enabled: false, status: 'disabled' });
+  return c.json({ ok: true, settings: publicSettings(saved) });
+});
+
+fiscal.post('/fiscal-connect-toggle', async (c) => {
+  const user = await requireUser(c);
+  if (!user?.id) return c.json({ error: 'unauthorized' }, 401);
+  if (!canManageFiscal(user)) return c.json({ error: 'forbidden' }, 403);
+  const body = await c.req.json().catch(() => ({}));
+  const saved = await saveSettings(user.id, { enabled: body.enabled === true, status: body.enabled ? 'configured' : 'disabled' });
+  return c.json({ ok: true, settings: publicSettings(saved) });
+});
+
 fiscal.post('/fiscal-settings', async (c) => {
   const user = await requireUser(c);
   if (!user?.id) return c.json({ error: 'unauthorized' }, 401);
@@ -313,6 +331,7 @@ fiscal.post('/fiscal-test', async (c) => {
   const user = await requireUser(c);
   if (!user?.id) return c.json({ error: 'unauthorized' }, 401);
   const { fiscal: cfg, row } = await loadSettingsRow(user.id);
+  if (!cfg || cfg.enabled !== true) return c.json({ ok: false, kind: 'config', message: 'Emissão fiscal desconectada. Ligue em Configurações → Sistema → Fiscal.' }, 400);
   const miss = missingCompany(cfg, { ...user, ...row });
   if (miss.length) {
     return c.json({ ok: false, kind: 'config', message: 'Configuração incompleta.', missing: miss });
