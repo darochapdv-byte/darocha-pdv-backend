@@ -215,14 +215,17 @@ function rateLimit(userId, route, max = 20, windowMs = 60000) {
 }
 
 function canManageFiscal(user) {
-  const role = String(user?.role || user?.data?.role || 'admin').toLowerCase();
-  return role === 'admin' || role === 'owner' || role === 'gerente' || role === 'administrador';
+  if (!user?.id) return false;
+  const role = String(user?.role || user?.data?.role || '').toLowerCase().trim();
+  const blocked = new Set(['caixa', 'operador', 'vendedor', 'entregador', 'courier', 'employee', 'funcionario']);
+  if (blocked.has(role)) return false;
+  return true;
 }
 
 fiscal.post('/fiscal-disconnect', async (c) => {
   const user = await requireUser(c);
   if (!user?.id) return c.json({ error: 'unauthorized' }, 401);
-  if (!canManageFiscal(user)) return c.json({ error: 'forbidden' }, 403);
+  if (!canManageFiscal(user)) return c.json({ error: 'forbidden', message: 'Seu usuário não pode alterar o Fiscal.' }, 403);
   const saved = await saveSettings(user.id, { enabled: false, status: 'disabled' });
   return c.json({ ok: true, settings: publicSettings(saved) });
 });
@@ -230,7 +233,7 @@ fiscal.post('/fiscal-disconnect', async (c) => {
 fiscal.post('/fiscal-connect-toggle', async (c) => {
   const user = await requireUser(c);
   if (!user?.id) return c.json({ error: 'unauthorized' }, 401);
-  if (!canManageFiscal(user)) return c.json({ error: 'forbidden' }, 403);
+  if (!canManageFiscal(user)) return c.json({ error: 'forbidden', message: 'Seu usuário não pode alterar o Fiscal.' }, 403);
   const body = await c.req.json().catch(() => ({}));
   const saved = await saveSettings(user.id, { enabled: body.enabled === true, status: body.enabled ? 'configured' : 'disabled' });
   return c.json({ ok: true, settings: publicSettings(saved) });
