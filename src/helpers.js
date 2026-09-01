@@ -298,6 +298,12 @@ export async function setCatalogSlug(userId, slug) {
       description: JSON.stringify({ user_id: userId, slug: normalized }),
       operator_name: 'system',
     });
+    try {
+      await admin.from('profiles').update({ catalog_slug: normalized }).eq('id', userId);
+    } catch { /* coluna pode não existir */ }
+    try {
+      await admin.from('app_settings').update({ catalog_slug: normalized }).eq('created_by', userId);
+    } catch { /* coluna pode não existir */ }
     return true;
   } catch (e) {
     console.error('setCatalogSlug', e.message || e);
@@ -324,6 +330,11 @@ export async function ensureCatalogSlug(userId, companyName) {
   return slug;
 }
 
+function slugMatches(candidate, normalized, compact) {
+  const es = normalizeSlug(candidate || '');
+  return !!es && (es === normalized || es.replace(/-/g, '') === compact);
+}
+
 /** Resolve loja a partir do slug do catálogo. Retorna { userId, slug } ou null. */
 export async function resolveStoreBySlug(slug) {
   if (!slug) return null;
@@ -332,30 +343,61 @@ export async function resolveStoreBySlug(slug) {
   if (!normalized && !compact) return null;
   if (isReservedSlug(normalized)) return null;
   const existing = await listCatalogSlugs();
-  const hit = existing.find((e) => {
-    const es = normalizeSlug(e.slug);
-    return es === normalized || es.replace(/-/g, '') === compact || String(e.slug).toLowerCase() === compact;
-  });
+  const hit = existing.find((e) => slugMatches(e.slug, normalized, compact) || String(e.slug || '').toLowerCase() === compact);
   if (hit) return { userId: hit.user_id, slug: hit.slug };
 
-  try {
-    const { data: byCol } = await admin
-      .from('app_settings')
-      .select('created_by,catalog_slug')
-      .eq('catalog_slug', normalized)
-      .limit(5);
-    const row = (byCol || []).find((r) => r.created_by);
-    if (row) return { userId: row.created_by, slug: normalizeSlug(row.catalog_slug) || normalized };
-  } catch { /* coluna catalog_slug pode não existir */ }
+  if (admin) {
+    try {
+      const { data: logs } = await admin
+        .from('operational_log')
+        .select('description')
+        .eq('type', CATALOG_SLUG_TYPE)
+        .ilike('description', `%${normalized}%`)
+        .limit(50);
+      for (const row of logs || []) {
+        try {
+          const p = JSON.parse(row.description || '{}');
+          if (p?.user_id && slugMatches(p.slug, normalized, compact)) {
+            return { userId: p.user_id, slug: normalizeSlug(p.slug) || normalized };
+          }
+        } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
 
-  try {
-    const { data: settings } = await admin
-      .from('app_settings')
-      .select('created_by,company_name')
-      .limit(200);
-    const row = (settings || []).find((r) => normalizeSlug(r.company_name) === normalized || normalizeSlug(r.company_name).replace(/-/g, '') === compact);
-    if (row?.created_by) return { userId: row.created_by, slug: normalized };
-  } catch { /* ignore */ }
+    try {
+      const { data: byCol } = await admin
+        .from('app_settings')
+        .select('created_by,catalog_slug')
+        .eq('catalog_slug', normalized)
+        .limit(10);
+      const row = (byCol || []).find((r) => r.created_by);
+      if (row) return { userId: row.created_by, slug: normalizeSlug(row.catalog_slug) || normalized };
+    } catch { /* coluna catalog_slug pode não existir */ }
+
+    try {
+      const { data: prof } = await admin
+        .from('profiles')
+        .select('id,catalog_slug,company_name')
+        .limit(500);
+      const row = (prof || []).find((r) =>
+        slugMatches(r.catalog_slug, normalized, compact) ||
+        slugMatches(r.company_name, normalized, compact)
+      );
+      if (row?.id) return { userId: row.id, slug: normalizeSlug(row.catalog_slug) || normalized };
+    } catch { /* ignore */ }
+
+    try {
+      const { data: settings } = await admin
+        .from('app_settings')
+        .select('created_by,company_name,catalog_slug')
+        .limit(400);
+      const row = (settings || []).find((r) =>
+        slugMatches(r.catalog_slug, normalized, compact) ||
+        slugMatches(r.company_name, normalized, compact)
+      );
+      if (row?.created_by) return { userId: row.created_by, slug: normalizeSlug(row.catalog_slug) || normalized };
+    } catch { /* ignore */ }
+  }
 
   return null;
 }

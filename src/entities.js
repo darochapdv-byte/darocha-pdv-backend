@@ -344,8 +344,23 @@ entities.get('/:entity', async (c) => {
   }
   if (entity === 'AppSettings' && Array.isArray(rows)) {
     const allow = await getAllowZeroStock();
+    const score = (x) =>
+      ((x && (x.pin_hash || x.pin_set)) ? 16 : 0) +
+      ((x && x.card_installment_rates) ? 8 : 0) +
+      ((x && (x.company_address || x.company_name)) ? 4 : 0) +
+      ((x && x.catalog_slug) ? 2 : 0);
+    const merged = {};
+    const ordered = [...rows].sort((a, b) => score(b) - score(a));
+    for (const r of ordered) {
+      for (const [k, v] of Object.entries(r || {})) {
+        if (merged[k] == null || merged[k] === '' || merged[k] === false) {
+          if (v != null && v !== '') merged[k] = v;
+        }
+      }
+    }
+    const base = Object.keys(merged).length ? [merged, ...rows.filter((r) => r && r.id !== merged.id)] : rows;
     const enriched = [];
-    for (const r of rows) {
+    for (const r of base) {
       const ownerId = r.created_by || user?.id || null;
       let catalog_slug = r.catalog_slug || null;
       if (ownerId && !catalog_slug) {
@@ -569,6 +584,34 @@ entities.post('/:entity', async (c) => {
   // Em insert, deixa o banco gerar o id
   delete body.id;
   body = stripUnknownForEntity(entity, body);
+
+  if (normalizeEntityName(entity) === 'AppSettings' && user?.id && admin) {
+    try {
+      const { data: existingRows } = await admin
+        .from(table)
+        .select('*')
+        .eq('created_by', user.id)
+        .order('created_at', { ascending: false })
+        .limit(20);
+      const existing = (existingRows && existingRows[0]) || null;
+      if (existing?.id) {
+        const { data: updated, error: upErr } = await admin
+          .from(table)
+          .update(body)
+          .eq('id', existing.id)
+          .select()
+          .maybeSingle();
+        if (!upErr && updated) {
+          const row = toBase44Row(updated);
+          if (allowZeroStockSaved != null) row.allow_zero_stock = allowZeroStockSaved;
+          try { invalidateListCache(entity, user.id); } catch (_) {}
+          return c.json(row);
+        }
+      }
+    } catch (e) {
+      console.warn('AppSettings upsert-existing', e.message || e);
+    }
+  }
 
   const { data, error } = await insertRowBypass(table, body);
   if (error || !data) {
