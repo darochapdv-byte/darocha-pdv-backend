@@ -1207,6 +1207,7 @@ functions.post('/:name', async (c) => {
   'admin-stats','cleanup-cash-sessions','purge-account','init-help-content',
   'check-vale-due','sales-revenue-summary','top-products-month','app-bootstrap','create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','get-access-status','access-status','referral-panel','master-code-status','ensure-referral-code','cancel-subscription','resume-subscription',
   'fetch-nfe-xml','import-nfe','address-search',
+  'fiscal-settings','fiscal-settings-save','fiscal-certificate','fiscal-test','fiscal-nfce','fiscal-nfe','fiscal-documents','fiscal-document','fiscal-document-xml','fiscal-document-danfe','fiscal-cancel','fiscal-status','fiscal-webhook',
 ];
   if (implemented.includes(name)) return c.json({ error: 'routing_error' }, 500);
   return c.json({
