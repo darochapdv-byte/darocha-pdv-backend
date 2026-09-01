@@ -221,6 +221,10 @@ async function listCatalogSlugs() {
       try {
         const p = JSON.parse(row.description || '{}');
         if (p?.slug && p?.user_id) out.push({ slug: String(p.slug).toLowerCase(), user_id: p.user_id });
+        for (const a of p?.aliases || []) {
+          const s = normalizeSlug(a);
+          if (s && p?.user_id) out.push({ slug: s, user_id: p.user_id });
+        }
       } catch { /* ignore */ }
     }
     return out;
@@ -274,28 +278,37 @@ export async function setCatalogSlug(userId, slug) {
   }
 
   try {
-    // Remove registros antigos deste usuário
     const { data: old } = await admin
       .from('operational_log')
       .select('id,description')
       .eq('type', CATALOG_SLUG_TYPE)
       .limit(2000);
-    const toDelete = (old || []).filter((row) => {
+    const aliases = new Set();
+    const toDelete = [];
+    for (const row of old || []) {
       try {
         const p = JSON.parse(row.description || '{}');
-        return p?.user_id === userId;
-      } catch {
-        return false;
-      }
-    });
+        if (p?.user_id !== userId) continue;
+        toDelete.push(row.id);
+        if (p.slug && p.slug !== normalized) aliases.add(normalizeSlug(p.slug));
+        for (const a of p.aliases || []) {
+          const s = normalizeSlug(a);
+          if (s && s !== normalized) aliases.add(s);
+        }
+      } catch { /* ignore */ }
+    }
     if (toDelete.length) {
-      await admin.from('operational_log').delete().in('id', toDelete.map((r) => r.id));
+      await admin.from('operational_log').delete().in('id', toDelete);
     }
 
     await admin.from('operational_log').insert({
       type: CATALOG_SLUG_TYPE,
       level: 'info',
-      description: JSON.stringify({ user_id: userId, slug: normalized }),
+      description: JSON.stringify({
+        user_id: userId,
+        slug: normalized,
+        aliases: [...aliases],
+      }),
       operator_name: 'system',
     });
     try {
@@ -308,6 +321,33 @@ export async function setCatalogSlug(userId, slug) {
   } catch (e) {
     console.error('setCatalogSlug', e.message || e);
     throw e;
+  }
+}
+
+/** Grava apelido de slug sem trocar o endereço oficial da loja. */
+export async function addCatalogAlias(userId, alias, officialSlug) {
+  if (!admin || !userId || !alias) return false;
+  const a = normalizeSlug(alias);
+  const official = normalizeSlug(officialSlug || '');
+  if (!a || isReservedSlug(a) || a === official) return false;
+  const existing = await listCatalogSlugs();
+  if (existing.some((e) => e.slug === a && e.user_id !== userId)) return false;
+  if (existing.some((e) => e.slug === a && e.user_id === userId)) return true;
+  try {
+    await admin.from('operational_log').insert({
+      type: CATALOG_SLUG_TYPE,
+      level: 'info',
+      description: JSON.stringify({
+        user_id: userId,
+        slug: official || a,
+        aliases: [a],
+      }),
+      operator_name: 'system',
+    });
+    return true;
+  } catch (e) {
+    console.warn('addCatalogAlias', e.message || e);
+    return false;
   }
 }
 
@@ -413,6 +453,7 @@ export async function resolveStoreBySlug(slug) {
         const sl = softLogs.find((e) => e.user_id === id)?.slug
           || normalizeSlug(softSet.find((r) => r.created_by === id)?.catalog_slug)
           || normalized;
+        try { await addCatalogAlias(id, normalized, sl); } catch { /* ignore */ }
         return { userId: id, slug: sl };
       }
     } catch { /* ignore */ }
