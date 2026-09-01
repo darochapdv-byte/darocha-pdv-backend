@@ -32,7 +32,10 @@ function publicCfg(raw) {
     transfer_human: raw.transfer_human !== false,
     channels: { whatsapp: !!raw.wa_connected, instagram: !!raw.ig_connected },
     wa_number: raw.wa_number || '',
+    wa_phone_id: raw.wa_phone_id || '',
     ig_account: raw.ig_account || '',
+    ig_id: raw.ig_id || '',
+    webhook: '/functions/ai-webhook',
     has_key: !!raw.api_key_encrypted,
     key_hint: raw.key_hint || '',
     connected: !!(raw.enabled && raw.api_key_encrypted),
@@ -387,13 +390,34 @@ ai.post('/ai-webhook', async (c) => {
       const sender = ev.sender?.id;
       const pageId = ev.recipient?.id || entry.id;
       if (!text || !sender) continue;
-      const store = await findStoreByChannel(null, pageId);
+      const igFromChange = (entry.changes || []).map((x) => x.value?.metadata?.phone_number_id || x.value?.sender?.id).find(Boolean);
+      const store = await findStoreByChannel(null, pageId || igFromChange);
       if (!store) continue;
-      await handleIncoming(store.userId, store.cfg, 'instagram', sender, text);
+      await handleIncoming(store.userId, store.cfg, 'instagram', sender, typeof text === 'string' ? text : text?.body || '');
     }
   }
   return c.json({ ok: true });
 });
+
+async function loadHistory(userId, channel, customerId) {
+  if (!admin) return [];
+  try {
+    const { data } = await admin
+      .from('ai_message')
+      .select('role,body')
+      .eq('created_by', userId)
+      .eq('channel', channel)
+      .eq('customer_id', customerId)
+      .order('created_at', { ascending: false })
+      .limit(12);
+    return (data || []).reverse().map((m) => ({
+      role: m.role === 'assistant' ? 'assistant' : 'user',
+      content: String(m.body || '').slice(0, 800),
+    }));
+  } catch {
+    return [];
+  }
+}
 
 async function handleIncoming(userId, cfg, channel, customerId, text) {
   const conv = await upsertConversation(userId, channel, customerId, text);
@@ -408,7 +432,9 @@ async function handleIncoming(userId, cfg, channel, customerId, text) {
   }
   try {
     const system = await storeContext(userId, cfg);
-    const out = await runModel(cfg, system, [{ role: 'user', content: String(text).slice(0, 1000) }]);
+    const history = await loadHistory(userId, channel, customerId);
+    history.push({ role: 'user', content: String(text).slice(0, 1000) });
+    const out = await runModel(cfg, system, history);
     let reply = (out.text || '').trim();
     if (reply.includes('[[TRANSFERIR_HUMANO]]')) {
       await upsertConversation(userId, channel, customerId, reply, 'human');
@@ -425,5 +451,31 @@ async function handleIncoming(userId, cfg, channel, customerId, text) {
     await upsertConversation(userId, channel, customerId, text, 'human');
   }
 }
+
+ai.post('/ai-preview', async (c) => {
+  const user = await requireUser(c);
+  if (!user?.id) return c.json({ error: 'unauthorized' }, 401);
+  const body = await c.req.json().catch(() => ({}));
+  const { ai: cfg } = await loadRow(user.id);
+  if (!cfg?.api_key_encrypted) return c.json({ ok: false, message: 'Salve a chave da API da loja.' }, 400);
+  try {
+    const system = await storeContext(user.id, cfg);
+    const out = await runModel(cfg, system, [{ role: 'user', content: String(body.text || 'Olá').slice(0, 1000) }]);
+    return c.json({ ok: true, reply: out.text, model: out.model });
+  } catch (e) {
+    return c.json({ ok: false, message: 'Não foi possível gerar resposta. Confira a chave e o crédito no provedor.' }, 400);
+  }
+});
+
+ai.post('/ai-meta-info', async (c) => {
+  const user = await requireUser(c);
+  if (!user?.id) return c.json({ error: 'unauthorized' }, 401);
+  return c.json({
+    ok: true,
+    webhook: 'https://darocha-pdv-backend.onrender.com/functions/ai-webhook',
+    verify_token: process.env.META_VERIFY_TOKEN || 'darocha-ai',
+    app_configured: !!(process.env.META_APP_ID && process.env.META_APP_SECRET),
+  });
+});
 
 export default ai;
