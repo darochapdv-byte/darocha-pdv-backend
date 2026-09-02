@@ -807,7 +807,54 @@ functions.post('/check-vale-due', async (c) => {
 });
 
 
-functions.post('/sales-revenue-summary', async (c) => {
+functions.post('/vale-open', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const { data, error } = await admin.from('sale').select('*').eq('created_by', user.id).order('created_at', { ascending: false }).limit(800);
+    if (error) return c.json({ ok: true, vales: [], warning: error.message });
+    const now = Date.now();
+    const rows = [];
+    for (const sale of data || []) {
+      if (String(sale.status || '') === 'cancelada') continue;
+      const pm = String(sale.payment_method || '').toLowerCase();
+      const pays = Array.isArray(sale.payments) ? sale.payments : [];
+      const isVale = pm.includes('vale') || pays.some((p) => String(p?.method || p?.payment_method || '').toLowerCase().includes('vale')) || !!sale.installment_plan;
+      if (!isVale) continue;
+      const total = Number(sale.total || 0);
+      const raw = sale.installment_plan;
+      let remaining = total;
+      if (raw && !Array.isArray(raw) && typeof raw === 'object') {
+        const pp = Array.isArray(raw.payments) ? raw.payments : [];
+        const paid = pp.reduce((a, p) => a + Number(p.amount || 0), 0);
+        remaining = Math.round((Number(raw.total || total) - paid) * 100) / 100;
+      } else if (Array.isArray(raw)) {
+        const paid = raw.filter((p) => p.paid).reduce((a, p) => a + Number(p.amount || 0), 0);
+        remaining = Math.round((total - paid) * 100) / 100;
+      }
+      if (!(remaining > 0.009)) continue;
+      const lastPays = raw && !Array.isArray(raw) ? (raw.payments || []) : (Array.isArray(raw) ? raw.filter((p) => p.paid) : []);
+      const lastAt = lastPays.map((p) => p.at || p.paid_at).filter(Boolean).sort().slice(-1)[0] || sale.created_at || sale.created_date;
+      const days = Math.floor((now - new Date(lastAt || now).getTime()) / 86400000);
+      rows.push({
+        id: sale.id,
+        customer_name: sale.customer_name || 'Cliente',
+        customer_phone: sale.customer_phone || '',
+        total,
+        remaining,
+        due_label: 'sem data definida',
+        days_without_payment: days,
+        stale: days >= 30,
+      });
+    }
+    return c.json({ ok: true, vales: rows });
+  } catch (e) {
+    return c.json({ ok: true, vales: [], warning: e.message });
+  }
+});
+
+functions.post('/sales-revenue-summary, async (c) => {
   try {
     const user = await requireUser(c);
     if (!user?.id) return c.json({ error: 'Unauthorized' }, 401);

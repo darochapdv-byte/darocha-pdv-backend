@@ -741,7 +741,7 @@ integration.post('/vale-open', async (c) => {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const { data, error } = await admin
       .from('sale')
-      .select('id,customer_name,customer_phone,total,installment_plan,payment_method,payments,status,created_at,created_by')
+      .select('*')
       .eq('created_by', user.id)
       .order('created_at', { ascending: false })
       .limit(800);
