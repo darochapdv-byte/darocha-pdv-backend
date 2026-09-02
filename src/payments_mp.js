@@ -13,7 +13,7 @@ const payments = new Hono();
 function encodeOnlinePaymentFields({ payment_status, mp_payment_id, payment_meta, paid_at, status } = {}) {
   const out = {};
   if (status) out.status = status;
-  else if (payment_status === 'paid') out.status = 'concluida';
+  else if (payment_status === 'paid') out.status = 'pago';
   else if (payment_status === 'pending' || payment_status === 'pending_payment') out.status = 'pending_payment';
   else if (payment_status === 'payment_failed') out.status = 'cancelada';
   const paymentsBlob = {
@@ -34,7 +34,7 @@ function readOnlinePayment(sale) {
   const p = sale.payments && typeof sale.payments === 'object' && !Array.isArray(sale.payments) ? sale.payments : {};
   return {
     payment_status: p.payment_status
-      || (sale.status === 'concluida' ? 'paid' : null)
+      || (sale.status === 'concluida' || sale.status === 'pago' || sale.status === 'pago' ? 'paid' : null)
       || (sale.status === 'pending_payment' ? 'pending' : null),
     mp_payment_id: p.mp_payment_id || sale.client_ref || null,
     payment_meta: p,
@@ -447,7 +447,7 @@ async function saveTransaction(row) {
 async function updateSalePaid(saleId, patch = {}) {
   const base = encodeOnlinePaymentFields({
     payment_status: 'paid',
-    status: patch.status || 'orcamento',
+    status: patch.status || 'pago',
     paid_at: new Date().toISOString(),
     mp_payment_id: patch.mp_payment_id,
     payment_meta: patch.payment_meta,
@@ -462,7 +462,7 @@ async function updateSalePaid(saleId, patch = {}) {
   // re-apply encoded
   Object.assign(updates, encodeOnlinePaymentFields({
     payment_status: 'paid',
-    status: updates.status || 'orcamento',
+    status: updates.status || 'pago',
     paid_at: new Date().toISOString(),
     mp_payment_id: mp_payment_id || base.client_ref,
     payment_meta: payment_meta,
@@ -483,6 +483,14 @@ async function deductStockForSale(sale) {
 
 async function notifyNewPaidOrder(sale) {
   try {
+    if (!sale?.id) return;
+    const { data: existing } = await admin
+      .from('notification')
+      .select('id')
+      .eq('sale_id', sale.id)
+      .eq('type', 'novo_pedido')
+      .limit(1);
+    if (existing && existing.length) return;
     const orderNum = String(sale.id).slice(-6).toUpperCase();
     const modality = sale.delivery_type === 'entrega' ? 'Entrega' : 'Retirada';
     await admin.from('notification').insert({
@@ -650,7 +658,7 @@ payments.post('/catalog-checkout-pix', async (c) => {
     const { data: sale } = await admin.from('sale').select('*').eq('id', saleId).maybeSingle();
     if (!sale) return c.json({ error: 'Pedido não encontrado' }, 404);
     if (sale.source !== 'catalog') return c.json({ error: 'Pedido inválido' }, 400);
-    if ((readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida') || sale.status === 'concluida') {
+    if ((readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida' || sale.status === 'pago') || sale.status === 'concluida' || sale.status === 'pago') {
       return c.json({ ok: true, already_paid: true, status: 'approved' });
     }
 
@@ -760,7 +768,7 @@ payments.post('/catalog-checkout-card', async (c) => {
     const { data: sale } = await admin.from('sale').select('*').eq('id', saleId).maybeSingle();
     if (!sale) return c.json({ error: 'Pedido não encontrado' }, 404);
     if (sale.source !== 'catalog') return c.json({ error: 'Pedido inválido' }, 400);
-    if ((readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida')) {
+    if ((readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida' || sale.status === 'pago')) {
       return c.json({ ok: true, already_paid: true, status: 'approved' });
     }
 
@@ -995,7 +1003,7 @@ payments.post('/catalog-checkout-card', async (c) => {
           charged_amount: amount,
           mp_total_paid: data?.transaction_details?.total_paid_amount || null,
         },
-        status: 'orcamento',
+        status: 'pago',
       });
       const { data: fresh } = await admin.from('sale').select('*').eq('id', saleId).maybeSingle();
       if (fresh) await notifyNewPaidOrder(fresh);
@@ -1061,11 +1069,11 @@ payments.post('/catalog-checkout-status', async (c) => {
     if (!sale) return c.json({ error: 'Pedido não encontrado' }, 404);
 
     // Se ainda pending e tem mp_payment_id, consulta MP
-    if ((readOnlinePayment(sale).mp_payment_id) && (readOnlinePayment(sale).payment_status !== 'paid' && sale.status !== 'concluida') && sale.created_by) {
+    if ((readOnlinePayment(sale).mp_payment_id) && (readOnlinePayment(sale).payment_status !== 'paid' && sale.status !== 'concluida' && sale.status !== 'pago') && sale.created_by) {
       const { token } = await getAccessTokenForStore(sale.created_by);
       if (token) {
         const { ok, data } = await mpFetch(token, `/v1/payments/${(readOnlinePayment(sale).mp_payment_id)}`);
-        if (ok && data.status === 'approved' && (readOnlinePayment(sale).payment_status !== 'paid' && sale.status !== 'concluida')) {
+        if (ok && data.status === 'approved' && (readOnlinePayment(sale).payment_status !== 'paid' && sale.status !== 'concluida' && sale.status !== 'pago')) {
           if (sale.status === 'pending_payment' || (readOnlinePayment(sale).payment_status === 'pending' || sale.status === 'pending_payment')) {
             await deductStockForSale(sale);
           }
@@ -1088,7 +1096,7 @@ payments.post('/catalog-checkout-status', async (c) => {
 
     return c.json({
       ok: true,
-      status: (readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida') ? 'approved' : (readOnlinePayment(sale).payment_status || sale.status),
+      status: (readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida' || sale.status === 'pago') ? 'approved' : (readOnlinePayment(sale).payment_status || sale.status),
       payment_status: readOnlinePayment(sale).payment_status || null,
       sale_status: sale.status,
       sale_id: saleId,
@@ -1148,7 +1156,7 @@ payments.post('/mercadopago-webhook', async (c) => {
     }
 
     // Idempotência: já pago
-    if ((readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida')) {
+    if ((readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida' || sale.status === 'pago')) {
       return c.json({ ok: true, already_paid: true });
     }
 
@@ -1168,7 +1176,7 @@ payments.post('/mercadopago-webhook', async (c) => {
     }
 
     if (data.status === 'approved') {
-      if ((readOnlinePayment(sale).payment_status !== 'paid' && sale.status !== 'concluida')) {
+      if ((readOnlinePayment(sale).payment_status !== 'paid' && sale.status !== 'concluida' && sale.status !== 'pago')) {
         if (sale.status === 'pending_payment' || (readOnlinePayment(sale).payment_status === 'pending' || sale.status === 'pending_payment')) {
           await deductStockForSale(sale);
         }
