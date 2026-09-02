@@ -294,7 +294,25 @@ entities.get('/:entity', async (c) => {
   }
 
   q = q.order(column, { ascending }).limit(limit);
-  const { data, error } = await q;
+  let data, error;
+  if (entityNorm === 'Sale' && limit > 1000) {
+    const acc = [];
+    for (let from = 0; from < limit; from += 1000) {
+      const to = Math.min(from + 999, limit - 1);
+      const page = await db.from(table).select('*');
+      let pq = applyTenantFilter(page, entity, user);
+      pq = pq.order(column, { ascending }).range(from, to);
+      const r = await pq;
+      if (r.error) { error = r.error; break; }
+      acc.push(...(r.data || []));
+      if (!r.data || r.data.length < 1000) break;
+    }
+    data = acc;
+  } else {
+    const r = await q;
+    data = r.data;
+    error = r.error;
+  }
   if (error) return c.json({ error: error.message }, 400);
   let rows = toBase44Rows(data);
   // Wishlist: fallback rest se RLS do client esconder linhas

@@ -882,6 +882,17 @@ functions.post('/sales-revenue-summary', async (c) => {
     const prevStart = new Date(`${prevYear}-${pad(prevMonth + 1)}-01T00:00:00.000-03:00`);
     const prevEnd = new Date(`${prevYear}-${pad(prevMonth + 1)}-${pad(prevLast)}T23:59:59.999-03:00`);
 
+    async function pageQuery(makeQ) {
+      const acc = [];
+      for (let from = 0; from < 50000; from += 1000) {
+        const { data, error } = await makeQ().range(from, from + 999);
+        if (error) { console.warn('sales page', error.message); break; }
+        acc.push(...(data || []));
+        if (!data || data.length < 1000) break;
+      }
+      return acc;
+    }
+
     async function loadSales(from, to) {
       const ymdA = from.toISOString().slice(0, 10);
       const ymdB = to.toISOString().slice(0, 10);
@@ -889,38 +900,18 @@ functions.post('/sales-revenue-summary', async (c) => {
       const push = (rows) => {
         for (const r of rows || []) if (r?.id && !seen.has(r.id)) seen.set(r.id, r);
       };
+      const cols = 'id,total,status,net_amount,fee_amount,delivery_fee,created_at,created_date,seller_id,seller_name,operator_name,source,delivery_type,cash_session_id,items,payments,created_by';
 
-      const { data: sess } = await admin.from('cash_session').select('id').eq('created_by', user.id).limit(3000);
+      const { data: sess } = await admin.from('cash_session').select('id').eq('created_by', user.id).limit(5000);
       const sids = (sess || []).map((x) => x.id).filter(Boolean);
 
-      let q1 = admin
-        .from('sale')
-        .select('id,total,status,fee_amount,delivery_fee,created_at,created_date,seller_id,seller_name,operator_name,source,delivery_type,cash_session_id,items,payments,created_by')
-        .eq('created_by', user.id)
-        .gte('created_at', from.toISOString())
-        .lte('created_at', to.toISOString())
-        .limit(20000);
-      const a = await q1;
-      if (!a.error) push(a.data);
-
-      const q2 = await admin
-        .from('sale')
-        .select('id,total,status,fee_amount,delivery_fee,created_at,created_date,seller_id,seller_name,operator_name,source,delivery_type,cash_session_id,items,payments,created_by')
-        .eq('created_by', user.id)
-        .gte('created_date', ymdA)
-        .lte('created_date', ymdB)
-        .limit(20000);
-      if (!q2.error) push(q2.data);
+      push(await pageQuery(() => admin.from('sale').select(cols).eq('created_by', user.id).gte('created_at', from.toISOString()).lte('created_at', to.toISOString()).order('created_at', { ascending: false })));
+      push(await pageQuery(() => admin.from('sale').select(cols).eq('created_by', user.id).gte('created_date', ymdA).lte('created_date', ymdB).order('created_at', { ascending: false })));
 
       if (sids.length) {
         for (let i = 0; i < sids.length; i += 50) {
           const chunk = sids.slice(i, i + 50);
-          const q3 = await admin
-            .from('sale')
-            .select('id,total,status,fee_amount,delivery_fee,created_at,created_date,seller_id,seller_name,operator_name,source,delivery_type,cash_session_id,items,payments,created_by')
-            .in('cash_session_id', chunk)
-            .limit(20000);
-          if (!q3.error) push(q3.data);
+          push(await pageQuery(() => admin.from('sale').select(cols).in('cash_session_id', chunk).order('created_at', { ascending: false })));
         }
       }
       return [...seen.values()];
