@@ -854,15 +854,14 @@ functions.post('/vale-open', async (c) => {
   }
 });
 
-functions.post('/sales-revenue-summary, async (c) => {
+
+functions.post('/sales-revenue-summary', async (c) => {
   try {
     const user = await requireUser(c);
     if (!user?.id) return c.json({ error: 'Unauthorized' }, 401);
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
     const body = await c.req.json().catch(() => ({}));
-
-    // Mês em America/Sao_Paulo
     const fmt = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'America/Sao_Paulo',
       year: 'numeric',
@@ -875,7 +874,6 @@ functions.post('/sales-revenue-summary, async (c) => {
 
     const pad = (n) => String(n).padStart(2, '0');
     const lastDay = new Date(year, month + 1, 0).getDate();
-    // bounds BRT
     const start = new Date(`${year}-${pad(month + 1)}-01T00:00:00.000-03:00`);
     const end = new Date(`${year}-${pad(month + 1)}-${pad(lastDay)}T23:59:59.999-03:00`);
     const prevMonth = month === 0 ? 11 : month - 1;
@@ -884,99 +882,97 @@ functions.post('/sales-revenue-summary, async (c) => {
     const prevStart = new Date(`${prevYear}-${pad(prevMonth + 1)}-01T00:00:00.000-03:00`);
     const prevEnd = new Date(`${prevYear}-${pad(prevMonth + 1)}-${pad(prevLast)}T23:59:59.999-03:00`);
 
-    const startMs = start.getTime();
-    const endMs = end.getTime();
-    const prevStartMs = prevStart.getTime();
-    const prevEndMs = prevEnd.getTime();
+    async function loadSales(from, to) {
+      const ymdA = from.toISOString().slice(0, 10);
+      const ymdB = to.toISOString().slice(0, 10);
+      const seen = new Map();
+      const push = (rows) => {
+        for (const r of rows || []) if (r?.id && !seen.has(r.id)) seen.set(r.id, r);
+      };
+
+      const { data: sess } = await admin.from('cash_session').select('id').eq('created_by', user.id).limit(3000);
+      const sids = (sess || []).map((x) => x.id).filter(Boolean);
+
+      let q1 = admin
+        .from('sale')
+        .select('id,total,status,fee_amount,delivery_fee,created_at,created_date,seller_id,seller_name,operator_name,source,delivery_type,cash_session_id,items,payments,created_by')
+        .eq('created_by', user.id)
+        .gte('created_at', from.toISOString())
+        .lte('created_at', to.toISOString())
+        .limit(20000);
+      const a = await q1;
+      if (!a.error) push(a.data);
+
+      const q2 = await admin
+        .from('sale')
+        .select('id,total,status,fee_amount,delivery_fee,created_at,created_date,seller_id,seller_name,operator_name,source,delivery_type,cash_session_id,items,payments,created_by')
+        .eq('created_by', user.id)
+        .gte('created_date', ymdA)
+        .lte('created_date', ymdB)
+        .limit(20000);
+      if (!q2.error) push(q2.data);
+
+      if (sids.length) {
+        for (let i = 0; i < sids.length; i += 50) {
+          const chunk = sids.slice(i, i + 50);
+          const q3 = await admin
+            .from('sale')
+            .select('id,total,status,fee_amount,delivery_fee,created_at,created_date,seller_id,seller_name,operator_name,source,delivery_type,cash_session_id,items,payments,created_by')
+            .in('cash_session_id', chunk)
+            .limit(20000);
+          if (!q3.error) push(q3.data);
+        }
+      }
+      return [...seen.values()];
+    }
+
+    function saleAmt(s) {
+      let n = Number(s.total);
+      if (n > 0) return n;
+      n = Number(s.net_amount || s.amount || 0);
+      if (n > 0) return n;
+      const items = Array.isArray(s.items) ? s.items : [];
+      const itemSum = items.reduce((a, it) => a + Number(it.total || (Number(it.unit_price) || 0) * (Number(it.qty) || 0)), 0);
+      if (itemSum > 0) return itemSum;
+      const pays = Array.isArray(s.payments) ? s.payments : [];
+      return pays.reduce((a, p) => a + Number(p.amount || p.value || 0), 0);
+    }
 
     function saleTime(s) {
       const raw = s.created_at || s.created_date || s.updated_at;
       if (!raw) return null;
+      const str = String(raw);
+      const m = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (m && (str.length <= 10 || str.includes('T00:00:00'))) {
+        return new Date(`${m[1]}-${m[2]}-${m[3]}T12:00:00.000-03:00`).getTime();
+      }
       const t = new Date(raw).getTime();
       return Number.isNaN(t) ? null : t;
     }
 
     function isCounted(s) {
-      const st = String(s.status || '')
-        .toLowerCase()
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '');
+      const st = String(s.status || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
       if (st.includes('cancel')) return false;
       if (st === 'orcamento' || st === 'pedido_aberto') return false;
       return true;
     }
 
-    // Pagina TODAS as vendas da loja até passar o mês anterior (sem early-break agressivo)
-    const all = [];
-    const pageSize = 1000;
-    let offset = 0;
-    let pages = 0;
-    for (let guard = 0; guard < 100; guard++) {
-      const { data, error } = await admin
-        .from('sale')
-        .select('id,total,status,fee_amount,delivery_fee,created_at,seller_id,seller_name,operator_name,source,delivery_type')
-        .eq('created_by', user.id)
-        .order('created_at', { ascending: false })
-        .range(offset, offset + pageSize - 1);
-      if (error) {
-        console.warn('sales-revenue-summary', error.message);
-        break;
-      }
-      const rows = data || [];
-      pages += 1;
-      all.push(...rows);
-      if (rows.length < pageSize) break;
-      offset += pageSize;
-    }
-
-    function sumInRange(fromMs, toMs) {
-      let total = 0;
-      let count = 0;
-      let feeTotal = 0;
-      let deliveryTotal = 0;
-      let pendingTotal = 0;
-      let pendingCount = 0;
-      const byStatus = {};
-      const bySeller = {};
-      let presencial = 0;
-      let online = 0;
-      for (const s of all) {
+    function sumRows(rows, fromMs, toMs) {
+      let total = 0, count = 0, presencial = 0, online = 0;
+      for (const s of rows) {
         const ts = saleTime(s);
         if (ts == null || ts < fromMs || ts > toMs) continue;
-        const stKey = String(s.status || '(vazio)');
-        byStatus[stKey] = (byStatus[stKey] || 0) + (Number(s.total) || 0);
-        if (isCounted(s)) {
-          const amt = Number(s.total) || 0;
-          total += amt;
-          feeTotal += Number(s.fee_amount) || 0;
-          deliveryTotal += Number(s.delivery_fee) || 0;
-          count += 1;
-          const sName = String(s.seller_name || s.operator_name || '').trim();
-          const sid = String(s.seller_id || sName || '_sem_vendedor');
-          if (!bySeller[sid]) bySeller[sid] = { seller_id: s.seller_id || null, seller_name: sName || 'Sem vendedor', total: 0, count: 0 };
-          bySeller[sid].total += amt;
-          bySeller[sid].count += 1;
-          if (sName && !bySeller[sid].seller_name) bySeller[sid].seller_name = sName;
-          const isOnline = s.source === 'catalog' || s.delivery_type === 'entrega' || s.delivery_type === 'retirada';
-          if (isOnline) online += amt; else presencial += amt;
-        } else {
-          pendingTotal += Number(s.total) || 0;
-          pendingCount += 1;
-        }
-      }
-      for (const k of Object.keys(byStatus)) byStatus[k] = Math.round(byStatus[k] * 100) / 100;
-      for (const k of Object.keys(bySeller)) {
-        bySeller[k].total = Math.round(bySeller[k].total * 100) / 100;
+        if (!isCounted(s)) continue;
+        const amt = saleAmt(s);
+        if (!(amt > 0)) continue;
+        total += amt;
+        count += 1;
+        const isOnline = s.source === 'catalog' || s.delivery_type === 'entrega' || s.delivery_type === 'retirada';
+        if (isOnline) online += amt; else presencial += amt;
       }
       return {
         total: Math.round(total * 100) / 100,
         count,
-        fee_total: Math.round(feeTotal * 100) / 100,
-        delivery_total: Math.round(deliveryTotal * 100) / 100,
-        pending_total: Math.round(pendingTotal * 100) / 100,
-        pending_count: pendingCount,
-        by_status: byStatus,
-        by_seller: bySeller,
         by_channel: {
           presencial: Math.round(presencial * 100) / 100,
           online: Math.round(online * 100) / 100,
@@ -984,30 +980,24 @@ functions.post('/sales-revenue-summary, async (c) => {
       };
     }
 
-    const current = sumInRange(startMs, endMs);
-    const previous = sumInRange(prevStartMs, prevEndMs);
+    const curRows = await loadSales(start, end);
+    const prevRows = await loadSales(prevStart, prevEnd);
+    const current = sumRows(curRows, start.getTime(), end.getTime());
+    const previous = sumRows(prevRows, prevStart.getTime(), prevEnd.getTime());
     const pct = previous.total > 0 ? ((current.total - previous.total) / previous.total) * 100 : null;
 
     return c.json({
       ok: true,
       year,
       month,
-      month_start: start.toISOString(),
-      month_end: end.toISOString(),
       revenue: current.total,
       sales_count: current.count,
-      fee_total: current.fee_total,
-      delivery_total: current.delivery_total,
       prev_revenue: previous.total,
       prev_sales_count: previous.count,
       pct_vs_prev: pct,
-      pending_catalog: { total: current.pending_total, count: current.pending_count },
-      revenue_including_pending: Math.round((current.total + current.pending_total) * 100) / 100,
-      scanned: all.length,
-      pages,
-      by_status: current.by_status || {},
-      by_seller: current.by_seller || {},
-      by_channel: current.by_channel || { presencial: 0, online: 0 },
+      scanned: curRows.length + prevRows.length,
+      by_channel: current.by_channel,
+      prev_by_channel: previous.by_channel,
     });
   } catch (e) {
     console.error('sales-revenue-summary', e);
