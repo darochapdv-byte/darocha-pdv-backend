@@ -296,18 +296,25 @@ entities.get('/:entity', async (c) => {
   q = q.order(column, { ascending }).limit(limit);
   let data, error;
   if (entityNorm === 'Sale' && limit > 1000) {
-    const acc = [];
-    for (let from = 0; from < limit; from += 1000) {
-      const to = Math.min(from + 999, limit - 1);
-      const page = await db.from(table).select('*');
-      let pq = applyTenantFilter(page, entity, user);
-      pq = pq.order(column, { ascending }).range(from, to);
-      const r = await pq;
-      if (r.error) { error = r.error; break; }
-      acc.push(...(r.data || []));
-      if (!r.data || r.data.length < 1000) break;
+    try {
+      const acc = [];
+      const orderCol = (column === 'created_date' || !column) ? 'created_at' : column;
+      for (let from = 0; from < Math.min(limit, 8000); from += 1000) {
+        const to = Math.min(from + 999, limit - 1);
+        let pq = applyTenantFilter(db.from(table).select('*'), entity, user);
+        pq = pq.order(orderCol, { ascending }).range(from, to);
+        const r = await pq;
+        if (r.error) throw r.error;
+        acc.push(...(r.data || []));
+        if (!r.data || r.data.length < 1000) break;
+      }
+      data = acc;
+    } catch (e) {
+      console.warn('sale list paginate', e?.message || e);
+      const r = await applyTenantFilter(db.from(table).select('*'), entity, user).order('created_at', { ascending: false }).limit(1000);
+      data = r.data;
+      error = r.error;
     }
-    data = acc;
   } else {
     const r = await q;
     data = r.data;
