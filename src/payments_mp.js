@@ -445,29 +445,31 @@ async function saveTransaction(row) {
 }
 
 async function updateSalePaid(saleId, patch = {}) {
-  const base = encodeOnlinePaymentFields({
-    payment_status: 'paid',
-    status: patch.status || 'pago',
-    paid_at: new Date().toISOString(),
-    mp_payment_id: patch.mp_payment_id,
-    payment_meta: patch.payment_meta,
-  });
-  // patch may still try to set invalid cols — strip them
   const { payment_status, paid_at, payment_meta, mp_payment_id, ...rest } = patch || {};
-  const updates = { ...base, ...rest };
-  delete updates.payment_status;
-  delete updates.paid_at;
-  delete updates.payment_meta;
-  delete updates.mp_payment_id;
-  // re-apply encoded
-  Object.assign(updates, encodeOnlinePaymentFields({
+  const st = rest.status || patch.status || 'pago';
+  const { error: eStatus } = await admin.from('sale').update({ status: st }).eq('id', saleId);
+  if (eStatus) {
+    console.warn('updateSalePaid status pago', eStatus.message);
+    const { error: e2 } = await admin.from('sale').update({ status: 'concluida' }).eq('id', saleId);
+    if (e2) console.warn('updateSalePaid status concluida', e2.message);
+  }
+  const extra = encodeOnlinePaymentFields({
     payment_status: 'paid',
-    status: updates.status || 'pago',
+    status: st,
     paid_at: new Date().toISOString(),
-    mp_payment_id: mp_payment_id || base.client_ref,
+    mp_payment_id: mp_payment_id,
     payment_meta: payment_meta,
-  }));
-  await admin.from('sale').update(updates).eq('id', saleId);
+  });
+  if (rest.payment_method) extra.payment_method = rest.payment_method;
+  if (rest.installments != null) extra.installments = rest.installments;
+  const { error: eExtra } = await admin.from('sale').update(extra).eq('id', saleId);
+  if (eExtra) {
+    console.warn('updateSalePaid extra', eExtra.message);
+    await admin.from('sale').update({
+      status: st === 'pago' ? 'pago' : 'concluida',
+      client_ref: mp_payment_id ? String(mp_payment_id) : undefined,
+    }).eq('id', saleId);
+  }
 }
 
 async function deductStockForSale(sale) {
@@ -488,8 +490,7 @@ async function notifyNewPaidOrder(sale) {
       .from('notification')
       .select('id')
       .eq('sale_id', sale.id)
-      .eq('type', 'novo_pedido')
-      .limit(1);
+      .limit(3);
     if (existing && existing.length) return;
     const orderNum = String(sale.id).slice(-6).toUpperCase();
     const modality = sale.delivery_type === 'entrega' ? 'Entrega' : 'Retirada';
