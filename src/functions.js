@@ -746,11 +746,10 @@ functions.post('/check-vale-due', async (c) => {
 
     const { data: sales } = await admin
       .from('sale')
-      .select('id,customer_name,customer_phone,total,installment_plan,payment_method,status,created_by')
+      .select('id,customer_name,customer_phone,total,installment_plan,payment_method,status,created_by,created_at')
       .eq('created_by', user.id)
-      .eq('payment_method', 'vale')
       .order('created_at', { ascending: false })
-      .limit(500);
+      .limit(800);
 
     let created = 0;
 
@@ -764,8 +763,19 @@ functions.post('/check-vale-due', async (c) => {
         remaining = Math.round((Number(sale.total || 0) - paid) * 100) / 100;
       }
       if (!(remaining > 0.009)) continue;
+      const pm = String(sale.payment_method || '').toLowerCase();
+      if (!pm.includes('vale') && !sale.installment_plan) continue;
 
-      const title = `Vale em aberto · R$ ${remaining.toFixed(2)}`;
+      const lastPay = Array.isArray(sale.installment_plan?.payments)
+        ? sale.installment_plan.payments.map((p) => p.at).filter(Boolean).sort().slice(-1)[0]
+        : null;
+      const last = new Date(lastPay || sale.created_at || Date.now()).getTime();
+      const days = Math.floor((Date.now() - last) / 86400000);
+      const stale = days >= 30;
+
+      const title = stale
+        ? `Vale sem baixa há ${days} dia(s) · R$ ${remaining.toFixed(2)}`
+        : `Vale em aberto · R$ ${remaining.toFixed(2)}`;
       const phoneLabel = sale.customer_phone ? ` · ${String(sale.customer_phone).replace(/\D/g, '')}` : '';
       const message = `${sale.customer_name || 'Cliente'}${phoneLabel} ainda deve R$ ${remaining.toFixed(2)} · pedido #${String(sale.id).slice(-6).toUpperCase()}`;
 

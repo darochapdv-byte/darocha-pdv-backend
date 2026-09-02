@@ -709,7 +709,74 @@ integration.post('/edit-concluded-sale', async (c) => {
  * Baixa de vale por valor (saldo), não por parcela de calendário.
  * body: { sale_id, amount }  ou legado { sale_id, parcel_n }
  */
+
+function valeRemaining(sale) {
+  const total = Number(sale.total || 0);
+  const raw = sale.installment_plan;
+  if (raw && !Array.isArray(raw) && typeof raw === 'object') {
+    const pays = Array.isArray(raw.payments) ? raw.payments : [];
+    const paid = pays.reduce((s, p) => s + Number(p.amount || 0), 0);
+    return Math.round((Number(raw.total || total) - paid) * 100) / 100;
+  }
+  if (Array.isArray(raw)) {
+    const paid = raw.filter((p) => p.paid).reduce((s, p) => s + Number(p.amount || 0), 0);
+    return Math.round((total - paid) * 100) / 100;
+  }
+  return Math.round(total * 100) / 100;
+}
+
+function valeIsVale(sale) {
+  const pm = String(sale.payment_method || '').toLowerCase();
+  if (pm.includes('vale')) return true;
+  const pays = Array.isArray(sale.payments) ? sale.payments : [];
+  if (pays.some((p) => String(p?.method || p?.payment_method || '').toLowerCase().includes('vale'))) return true;
+  if (sale.installment_plan) return true;
+  return false;
+}
+
+integration.post('/vale-open', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const { data, error } = await admin
+      .from('sale')
+      .select('id,customer_name,customer_phone,total,installment_plan,payment_method,payments,status,created_at,created_by')
+      .eq('created_by', user.id)
+      .order('created_at', { ascending: false })
+      .limit(800);
+    if (error) return c.json({ error: error.message }, 500);
+    const now = Date.now();
+    const rows = [];
+    for (const sale of data || []) {
+      if (String(sale.status || '') === 'cancelada') continue;
+      if (!valeIsVale(sale)) continue;
+      const remaining = valeRemaining(sale);
+      if (!(remaining > 0.009)) continue;
+      const plan = sale.installment_plan;
+      const pays = plan && !Array.isArray(plan) ? (plan.payments || []) : (Array.isArray(plan) ? plan.filter((p) => p.paid) : []);
+      const lastAt = pays.map((p) => p.at || p.paid_at).filter(Boolean).sort().slice(-1)[0] || sale.created_at;
+      const days = Math.floor((now - new Date(lastAt).getTime()) / 86400000);
+      rows.push({
+        id: sale.id,
+        customer_name: sale.customer_name || 'Cliente',
+        customer_phone: sale.customer_phone || '',
+        total: Number(sale.total || 0),
+        remaining,
+        due_label: 'sem data definida',
+        last_activity: lastAt,
+        days_without_payment: days,
+        stale: days >= 30,
+      });
+    }
+    return c.json({ ok: true, vales: rows });
+  } catch (e) {
+    return c.json({ error: e.message || 'failed' }, 500);
+  }
+});
+
 integration.post('/mark-vale-paid', async (c) => {
+
   try {
     const user = await requireUser(c);
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
