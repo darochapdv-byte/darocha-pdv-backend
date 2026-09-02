@@ -368,9 +368,10 @@ catalog.post('/catalog-checkout', async (c) => {
       return c.json({ error: 'Vendedor inválido ou inativo' }, 400);
     }
 
+    const wantsCardPix = ['pix','cartao_credito','cartao_debito'].includes(String(body.payment_method||''));
     let payOnline = body.pay_online === true || body.online_payment === true
       || body.payment_flow === 'online'
-      || (['pix','cartao_credito','cartao_debito'].includes(String(body.payment_method||'')) && body.pay_online === true);
+      || wantsCardPix;
     let sessionsQuery = admin.from('cash_session').select('id,created_by').eq('status', 'aberto').limit(5);
     if (storeOwnerId) sessionsQuery = sessionsQuery.eq('created_by', storeOwnerId);
     const { data: openSessions } = await sessionsQuery;
@@ -657,6 +658,35 @@ catalog.post('/catalog-checkout', async (c) => {
       ...(pickupDeadline ? { pickup_deadline: pickupDeadline } : {}),
       ...(deliveryType === 'entrega' && paymentMethod === 'dinheiro' ? { cash_confirmed: false } : {}),
     };
+
+    try {
+      const since = new Date(Date.now() - 12 * 60 * 1000).toISOString();
+      let dq = admin.from('sale').select('*').eq('source', 'catalog').eq('total', total).gte('created_at', since).order('created_at', { ascending: false }).limit(15);
+      if (saleOwnerId) dq = dq.eq('created_by', saleOwnerId);
+      const { data: recent } = await dq;
+      const phoneKey = String(customer.phone || phoneDigits || '').replace(/\D/g, '').slice(-11);
+      const dup = (recent || []).find((row) => {
+        const p = String(row.customer_phone || '').replace(/\D/g, '').slice(-11);
+        return p && phoneKey && p === phoneKey && String(row.status || '') !== 'cancelada';
+      });
+      if (dup) {
+        if (payOnline && (dup.status === 'orcamento' || dup.status === 'orçamento')) {
+          await admin.from('sale').update({ status: 'pending_payment', payment_method: paymentMethod }).eq('id', dup.id);
+          dup.status = 'pending_payment';
+        }
+        return c.json({
+          success: true,
+          sale_id: dup.id,
+          total: dup.total,
+          need_payment: payOnline,
+          pay_online: payOnline,
+          reused: true,
+          mp_public_key: null,
+        });
+      }
+    } catch (e) {
+      console.warn('catalog checkout dedupe', e.message);
+    }
 
     const { data: sale, error: saleErr } = await admin.from('sale').insert(salePayload).select().single();
     if (saleErr) {
