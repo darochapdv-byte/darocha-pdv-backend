@@ -1237,9 +1237,8 @@ functions.post('/commission-summary', async (c) => {
     const user = await requireUser(c);
     if (!user?.id) return c.json({ error: 'Unauthorized' }, 401);
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
-    const { fromCents, commissionRate } = await import('./commission.js');
-    const { data } = await admin.from('platform_commission').select('*').eq('store_id', user.id).order('created_at', { ascending: false }).limit(500);
-    const rows = data || [];
+    const { fromCents, commissionRate, listCommissions } = await import('./commission.js');
+    const rows = await listCommissions(user.id, 500);
     const sum = (st) => rows.filter((r) => !st || r.status === st).reduce((a, r) => a + Number(r.fee_cents || 0), 0);
     return c.json({
       ok: true,

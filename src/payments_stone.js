@@ -42,10 +42,72 @@ function decrypt(payload) {
   return Buffer.concat([decipher.update(Buffer.from(dataB, 'base64')), decipher.final()]).toString('utf8');
 }
 
+async function saveStoneAccount(storeId, acc) {
+  const payload = {
+    provider: 'stone',
+    status: acc.status || 'connected',
+    access_token_encrypted: acc.secret_encrypted || null,
+    public_key: acc.terminal_serial || null,
+    provider_user_id: acc.recipient_id || null,
+    nickname: 'stone',
+    connected_at: new Date().toISOString(),
+  };
+  try {
+    const { data: existing } = await admin.from('payment_account').select('id').eq('user_id', storeId).eq('provider', 'stone').maybeSingle();
+    if (existing?.id) {
+      await admin.from('payment_account').update({ ...payload, updated_at: new Date().toISOString() }).eq('id', existing.id);
+    } else {
+      await admin.from('payment_account').insert({ user_id: storeId, ...payload });
+    }
+  } catch (e) {
+    console.warn('payment_account stone', e.message);
+  }
+  const { data: rows } = await admin.from('app_settings').select('id,role_payment_methods').eq('created_by', storeId).order('created_at', { ascending: false }).limit(1);
+  const row = rows?.[0];
+  const current = (row?.role_payment_methods && typeof row.role_payment_methods === 'object' && !Array.isArray(row.role_payment_methods))
+    ? { ...row.role_payment_methods } : {};
+  current.__darocha_stone = {
+    status: acc.status,
+    secret_encrypted: acc.secret_encrypted,
+    recipient_id: acc.recipient_id || null,
+    terminal_serial: acc.terminal_serial || null,
+    last_error: acc.last_error || null,
+  };
+  if (row?.id) await admin.from('app_settings').update({ role_payment_methods: current }).eq('id', row.id);
+  else await admin.from('app_settings').insert({ created_by: storeId, role_payment_methods: current });
+}
+
 async function loadStoneAccount(storeId) {
   if (!admin || !storeId) return null;
-  const { data } = await admin.from('stone_account').select('*').eq('store_id', storeId).maybeSingle();
-  return data || null;
+  try {
+    const { data } = await admin.from('stone_account').select('*').eq('store_id', storeId).maybeSingle();
+    if (data?.secret_encrypted) return data;
+  } catch (_) {}
+  try {
+    const { data } = await admin.from('payment_account').select('*').eq('user_id', storeId).eq('provider', 'stone').maybeSingle();
+    if (data?.access_token_encrypted) {
+      return {
+        store_id: storeId,
+        secret_encrypted: data.access_token_encrypted,
+        terminal_serial: data.public_key || null,
+        recipient_id: data.provider_user_id || null,
+        status: data.status || 'connected',
+      };
+    }
+  } catch (_) {}
+  const { data: rows } = await admin.from('app_settings').select('role_payment_methods').eq('created_by', storeId).order('created_at', { ascending: false }).limit(1);
+  const st = rows?.[0]?.role_payment_methods?.__darocha_stone;
+  if (st?.secret_encrypted) {
+    return {
+      store_id: storeId,
+      secret_encrypted: st.secret_encrypted,
+      terminal_serial: st.terminal_serial || null,
+      recipient_id: st.recipient_id || null,
+      status: st.status || 'connected',
+      last_error: st.last_error || null,
+    };
+  }
+  return null;
 }
 
 async function stoneFetch(secretKey, path, { method = 'GET', body } = {}) {
@@ -104,9 +166,12 @@ stone.post('/stone-connect', async (c) => {
       last_error: test.ok ? null : (test.data?.message || JSON.stringify(test.data).slice(0, 240)),
       updated_at: new Date().toISOString(),
     };
-    const { data: existing } = await admin.from('stone_account').select('id').eq('store_id', user.id).maybeSingle();
-    if (existing?.id) await admin.from('stone_account').update(row).eq('id', existing.id);
-    else await admin.from('stone_account').insert({ ...row, created_at: new Date().toISOString() });
+    try {
+      const { data: existing } = await admin.from('stone_account').select('id').eq('store_id', user.id).maybeSingle();
+      if (existing?.id) await admin.from('stone_account').update(row).eq('id', existing.id);
+      else await admin.from('stone_account').insert({ ...row, created_at: new Date().toISOString() });
+    } catch (_) {}
+    await saveStoneAccount(user.id, row);
     return c.json({
       ok: true,
       status: row.status,
@@ -142,7 +207,17 @@ stone.post('/stone-status', async (c) => {
 stone.post('/stone-disconnect', async (c) => {
   const user = await requireUser(c);
   if (!user?.id) return c.json({ error: 'Unauthorized' }, 401);
-  if (admin) await admin.from('stone_account').delete().eq('store_id', user.id);
+  if (admin) {
+    try { await admin.from('stone_account').delete().eq('store_id', user.id); } catch (_) {}
+    try { await admin.from('payment_account').delete().eq('user_id', user.id).eq('provider', 'stone'); } catch (_) {}
+    const { data: rows } = await admin.from('app_settings').select('id,role_payment_methods').eq('created_by', user.id).limit(1);
+    const row = rows?.[0];
+    if (row?.id && row.role_payment_methods && typeof row.role_payment_methods === 'object') {
+      const next = { ...row.role_payment_methods };
+      delete next.__darocha_stone;
+      await admin.from('app_settings').update({ role_payment_methods: next }).eq('id', row.id);
+    }
+  }
   return c.json({ ok: true });
 });
 
