@@ -718,6 +718,21 @@ functions.post("/finalize-sale", async (c) => {
         console.warn('cash movement on finalize-sale', e.message);
       }
     }
+    try {
+      const { recordSaleCommission, isElectronicMethod } = await import('./commission.js');
+      if (isElectronicMethod(createdSale.payment_method)) {
+        const viaStone = !!(createdSale.point_order_id || createdSale.client_ref);
+        await recordSaleCommission({
+          sale: createdSale,
+          provider: /stone/i.test(String(createdSale.payment_method||'')) ? 'stone' : 'mercadopago',
+          origin: createdSale.source || 'pdv',
+          externalId: createdSale.client_ref || createdSale.id,
+          status: 'due',
+          splitApplied: false,
+          extraMeta: { via: 'finalize-sale' },
+        });
+      }
+    } catch (ce) { console.warn('commission finalize', ce.message); }
     // Frontend espera response.data.sale
     return c.json({ ok: true, success: true, sale: toBase44Row(createdSale), sale_id: createdSale.id });
   } catch (error) {
@@ -1217,6 +1232,45 @@ functions.post('/app-bootstrap', async (c) => {
   }
 });
 
+functions.post('/commission-summary', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const { fromCents, commissionRate } = await import('./commission.js');
+    const { data } = await admin.from('platform_commission').select('*').eq('store_id', user.id).order('created_at', { ascending: false }).limit(500);
+    const rows = data || [];
+    const sum = (st) => rows.filter((r) => !st || r.status === st).reduce((a, r) => a + Number(r.fee_cents || 0), 0);
+    return c.json({
+      ok: true,
+      rate: commissionRate(),
+      monthly_fee_reais: 100,
+      count: rows.length,
+      due_reais: fromCents(sum('due') + sum('pending')),
+      received_reais: fromCents(sum('received')),
+      refunded_reais: fromCents(sum('refunded') + sum('partial_refund')),
+      by_provider: {
+        mercadopago: fromCents(rows.filter((r) => r.provider === 'mercadopago').reduce((a, r) => a + Number(r.fee_cents || 0), 0)),
+        stone: fromCents(rows.filter((r) => r.provider === 'stone').reduce((a, r) => a + Number(r.fee_cents || 0), 0)),
+      },
+      items: rows.slice(0, 80).map((r) => ({
+        id: r.id,
+        sale_id: r.sale_id,
+        provider: r.provider,
+        origin: r.origin,
+        method: r.payment_method,
+        gross: fromCents(r.gross_cents),
+        fee: fromCents(r.fee_cents),
+        status: r.status,
+        split_applied: r.split_applied,
+        created_at: r.created_at,
+      })),
+    });
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
+  }
+});
+
 // ─── catch-all ─────────────────────────────────────────────────────────────
 
 functions.post('/:name', async (c) => {
@@ -1224,7 +1278,7 @@ functions.post('/:name', async (c) => {
   const implemented = [
   'open-cash-session','takeover-cash-session','cash-session-heartbeat','list-open-cash-sessions','finalize-sale','delivery-assign','delivery-complete','settle-accountability','courier-balance',
   'release-pdv-reservations','product-inquiry',
-  'catalog-data','catalog-checkout','catalog-store-status','catalog-receipt','catalog-history','catalog-account-register','catalog-account-login','catalog-account-update','catalog-expire-pickups','mercadopago-connect','mercadopago-oauth-callback','mercadopago-status','mercadopago-disconnect','catalog-mp-status','catalog-checkout-pix','catalog-checkout-card','catalog-checkout-status','mercadopago-webhook','mp-point-devices','mp-point-charge','mp-point-status','mp-point-cancel',
+  'catalog-data','catalog-checkout','catalog-store-status','catalog-receipt','catalog-history','catalog-account-register','catalog-account-login','catalog-account-update','catalog-expire-pickups','mercadopago-connect','mercadopago-oauth-callback','mercadopago-status','mercadopago-disconnect','catalog-mp-status','catalog-checkout-pix','catalog-checkout-card','catalog-checkout-status','mercadopago-webhook','mp-point-devices','mp-point-charge','mp-point-status','mp-point-cancel','stone-connect','stone-status','stone-disconnect','stone-devices','stone-charge','stone-order-status','stone-webhook','commission-summary',
   'barcode-lookup','product-name-lookup','enrich-product','save-product','repair-product-ownership','refresh-products-catalog',
   'start-stock-count','stock-count-search','stock-count-apply','sync-pdv-reservations',
   'admin-stats','cleanup-cash-sessions','purge-account','init-help-content',

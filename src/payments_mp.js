@@ -6,6 +6,7 @@ import { Hono } from 'hono';
 import crypto from 'crypto';
 import { admin } from './db.js';
 import { requireUser } from './helpers.js';
+import { applicationFeeReais, recordSaleCommission, reverseCommission, isElectronicMethod } from './commission.js';
 
 const payments = new Hono();
 
@@ -401,6 +402,28 @@ async function resolveChargeInstallments(token, {
   return { installments: 1, issuer_id: null, plan: 'fallback_avista_mp_juros', mp_total: amount };
 }
 
+
+function attachMarketplaceFee(payload, amount) {
+  const fee = applicationFeeReais(amount);
+  if (fee > 0 && fee < Number(amount)) payload.application_fee = fee;
+  return payload;
+}
+
+async function mpPayWithFee(token, path, options, amount) {
+  const body = { ...(options.body || {}) };
+  attachMarketplaceFee(body, amount);
+  const first = await mpFetch(token, path, { ...options, body });
+  if (first.ok) return { ...first, split_applied: body.application_fee != null };
+  const msg = JSON.stringify(first.data || {});
+  if (body.application_fee != null && /2059|application_fee|cannot use/i.test(msg)) {
+    const retryBody = { ...body };
+    delete retryBody.application_fee;
+    const second = await mpFetch(token, path, { ...options, body: retryBody });
+    return { ...second, split_applied: false, split_error: 'application_fee_rejected' };
+  }
+  return { ...first, split_applied: false, split_error: first.data?.message || 'mp_error' };
+}
+
 async function mpFetch(token, path, options = {}) {
   const method = options.method || 'GET';
   const headers = {
@@ -683,7 +706,7 @@ payments.post('/catalog-checkout-pix', async (c) => {
     const pixHeaders = {};
     if (pixDeviceId) pixHeaders['X-meli-session-id'] = pixDeviceId;
 
-    const { ok, data } = await mpFetch(token, '/v1/payments', {
+    const { ok, data, split_applied, split_error } = await mpPayWithFee(token, '/v1/payments', {
       method: 'POST',
       idempotencyKey: idem,
       headers: pixHeaders,
@@ -700,7 +723,7 @@ payments.post('/catalog-checkout-pix', async (c) => {
         notification_url: env('MP_WEBHOOK_URL') || `${env('API_PUBLIC_URL') || 'https://darocha-pdv-backend.onrender.com'}/functions/mercadopago-webhook`,
         metadata: { sale_id: saleId, store_owner_id: storeOwnerId },
       },
-    });
+    }, amount);
 
     if (!ok) {
       console.error('mp pix create', data);
@@ -920,12 +943,12 @@ payments.post('/catalog-checkout-card', async (c) => {
       'X-meli-session-id': String(deviceId),
     };
 
-    const { ok, data } = await mpFetch(token, '/v1/payments', {
+    const { ok, data, split_applied, split_error } = await mpPayWithFee(token, '/v1/payments', {
       method: 'POST',
       idempotencyKey: idem,
       headers,
       body: payload,
-    });
+    }, amount);
 
     const classifiedEarly = classifyMpCardResult(data?.status, data?.status_detail);
     console.log('mp card result', {
@@ -1007,8 +1030,19 @@ payments.post('/catalog-checkout-card', async (c) => {
         status: 'pago',
       });
       const { data: fresh } = await admin.from('sale').select('*').eq('id', saleId).maybeSingle();
-      if (fresh) await notifyNewPaidOrder(fresh);
-      return c.json({ ok: true, status: 'approved', payment_id: data.id });
+      if (fresh) {
+        await notifyNewPaidOrder(fresh);
+        await recordSaleCommission({
+          sale: fresh,
+          provider: 'mercadopago',
+          origin: 'catalog',
+          externalId: data.id,
+          status: split_applied ? 'received' : 'due',
+          splitApplied: !!split_applied,
+          splitError: split_error || null,
+        });
+      }
+      return c.json({ ok: true, status: 'approved', payment_id: data.id, darocha_fee: applicationFeeReais(amount), split_applied: !!split_applied });
     }
 
     if (status === 'rejected' || status === 'cancelled') {
@@ -1193,7 +1227,18 @@ payments.post('/mercadopago-webhook', async (c) => {
           },
         });
         const { data: fresh } = await admin.from('sale').select('*').eq('id', sale.id).maybeSingle();
-        if (fresh) await notifyNewPaidOrder(fresh);
+        if (fresh) {
+          await notifyNewPaidOrder(fresh);
+          await recordSaleCommission({
+            sale: fresh,
+            provider: 'mercadopago',
+            origin: fresh.source || 'catalog',
+            externalId: data.id,
+            status: 'due',
+            splitApplied: false,
+            extraMeta: { via: 'webhook' },
+          });
+        }
       }
     } else if (data.status === 'rejected' || data.status === 'cancelled') {
       await admin.from('sale').update(encodeOnlinePaymentFields({
