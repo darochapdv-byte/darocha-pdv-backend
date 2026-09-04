@@ -1224,7 +1224,7 @@ functions.post('/:name', async (c) => {
   const implemented = [
   'open-cash-session','takeover-cash-session','cash-session-heartbeat','list-open-cash-sessions','finalize-sale','delivery-assign','delivery-complete','settle-accountability','courier-balance',
   'release-pdv-reservations','product-inquiry',
-  'catalog-data','catalog-checkout','catalog-store-status','catalog-receipt','catalog-history','catalog-account-register','catalog-account-login','catalog-account-update','catalog-expire-pickups','mercadopago-connect','mercadopago-oauth-callback','mercadopago-status','mercadopago-disconnect','catalog-mp-status','catalog-checkout-pix','catalog-checkout-card','catalog-checkout-status','mercadopago-webhook','mp-point-devices','mp-point-charge','mp-point-status','mp-point-cancel',
+  'catalog-data','catalog-checkout','catalog-store-status','catalog-receipt','catalog-history','catalog-account-register','catalog-account-login','catalog-account-update','catalog-expire-pickups','mercadopago-connect','mercadopago-oauth-callback','mercadopago-status','mercadopago-disconnect','catalog-mp-status','catalog-checkout-pix','catalog-checkout-card','catalog-checkout-status','mercadopago-webhook','mp-point-devices','mp-point-charge','mp-point-status','mp-point-cancel','melhorenvio-status','melhorenvio-save-origin','melhorenvio-connect','melhorenvio-oauth-callback','melhorenvio-disconnect','shipping-calculate',
   'barcode-lookup','product-name-lookup','enrich-product','save-product','repair-product-ownership','refresh-products-catalog',
   'start-stock-count','stock-count-search','stock-count-apply','sync-pdv-reservations',
   'admin-stats','cleanup-cash-sessions','purge-account','init-help-content',

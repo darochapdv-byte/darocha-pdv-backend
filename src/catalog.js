@@ -218,6 +218,8 @@ catalog.post('/catalog-data', async (c) => {
       store_open: (openSessions || []).length > 0,
       sell_when_closed: !!(cfg?.catalog_sell_when_closed === true || cfg?.catalog_sell_when_closed === 'true' || cfg?.role_payment_methods?.__catalog_sell_when_closed),
       mp_connected: mpConnected,
+      store_id: storeOwnerId,
+      shipping_connected: !!(cfg?.role_payment_methods?.__darocha_me?.status === 'connected'),
       delivery_paused: pauseStatus.paused,
       delivery_pause_message: pauseStatus.message,
       slug: catalogSlug,
@@ -322,6 +324,8 @@ catalog.post('/catalog-store-status', async (c) => {
       delivery_paused: pauseStatus.paused,
       delivery_pause_message: pauseStatus.message,
       slug: slugParam || null,
+      shipping_connected: !!(cfg?.role_payment_methods?.__darocha_me?.status === 'connected'),
+      shipping_origin_cep: cfg?.role_payment_methods?.__darocha_me?.origin_cep || '',
     });
   } catch (error) {
     return c.json({ error: error.message }, 500);
@@ -448,13 +452,19 @@ catalog.post('/catalog-checkout', async (c) => {
 
     let deliveryFee = 0;
     let neighborhoodName = '';
+    const ship = body.shipping && typeof body.shipping === 'object' ? body.shipping : null;
     if (deliveryType === 'entrega') {
-      const { data: fees } = await admin
-        .from('delivery_fee').select('*').eq('neighborhood', body.neighborhood).eq('active', true).limit(1);
-      const fee = fees?.[0];
-      if (!fee) return c.json({ error: 'Bairro sem taxa de entrega cadastrada' }, 400);
-      deliveryFee = Number(fee.fee) || 0;
-      neighborhoodName = fee.neighborhood;
+      if (ship && Number.isFinite(Number(ship.price)) && Number(ship.price) >= 0) {
+        deliveryFee = Math.round(Number(ship.price) * 100) / 100;
+        neighborhoodName = body.neighborhood || '';
+      } else {
+        const { data: fees } = await admin
+          .from('delivery_fee').select('*').eq('neighborhood', body.neighborhood).eq('active', true).limit(1);
+        const fee = fees?.[0];
+        if (!fee) return c.json({ error: 'Bairro sem taxa de entrega cadastrada' }, 400);
+        deliveryFee = Number(fee.fee) || 0;
+        neighborhoodName = fee.neighborhood;
+      }
     }
 
     const baseTotal = Math.round((subtotal + deliveryFee) * 100) / 100;
@@ -636,7 +646,13 @@ catalog.post('/catalog-checkout', async (c) => {
       source: 'catalog',
       cash_session_id: openSession?.id || null,
       created_by: saleOwnerId,
-      notes: [!openSession ? '[PEDIDO FORA DO HORÁRIO — separar quando o caixa abrir]' : '', customer.notes || ''].filter(Boolean).join(' '),
+      notes: [
+        !openSession ? '[PEDIDO FORA DO HORÁRIO — separar quando o caixa abrir]' : '',
+        ship && deliveryType === 'entrega'
+          ? `[FRETE ${ship.company || ''} ${ship.name || ''} R$${Number(ship.price || 0).toFixed(2)} ${ship.days || ''}d sid=${ship.service_id || ''}]`
+          : '',
+        customer.notes || '',
+      ].filter(Boolean).join(' '),
 
       delivery_address: deliveryType === 'entrega' ? (body.street || '') : '',
       delivery_number: deliveryType === 'entrega' ? (body.number || '') : '',
