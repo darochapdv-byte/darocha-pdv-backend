@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import Stripe from 'stripe';
 import { admin, restQuery } from './db.js';
 import { requireUser } from './helpers.js';
-import { cacheGet, cacheSet } from './cache.js';
+import { cacheGet, cacheSet, cacheDel } from './cache.js';
 
 const stripeOps = new Hono();
 
@@ -102,6 +102,16 @@ export async function getAccessStatus(userId) {
     .limit(1);
 
   const sub = subs?.[0];
+  let masterGranted = false;
+  try {
+    const { data: grants } = await admin
+      .from('subscription_log')
+      .select('id')
+      .eq('user_id', userId)
+      .in('action', ['master_code_used', 'dev_lifetime_granted'])
+      .limit(1);
+    masterGranted = !!(grants && grants.length);
+  } catch (_) {}
   let result;
   const priceOf = (s) =>
     s?.permanent_discount_active === true ? DISCOUNT_PRICE_BRL : MONTHLY_PRICE_BRL;
@@ -111,9 +121,20 @@ export async function getAccessStatus(userId) {
     return Number.isFinite(end) && end > Date.now();
   };
 
-  if (!sub) {
+  if (!sub && !masterGranted) {
     result = withFrontendAccessFields({ allowed: false, status: 'none', description: 'no_subscription' });
-  } else if (sub.permanent_free_access === true || sub.plan === 'lifetime' || sub.plan === 'dev_lifetime') {
+  } else if (!sub && masterGranted) {
+    result = withFrontendAccessFields({
+      allowed: true,
+      status: 'lifetime',
+      price_brl: 0,
+    });
+  } else if (
+    masterGranted ||
+    sub.permanent_free_access === true ||
+    sub.plan === 'lifetime' ||
+    sub.plan === 'dev_lifetime'
+  ) {
     result = withFrontendAccessFields({
       allowed: true,
       status: 'lifetime',
@@ -301,13 +322,8 @@ async function applyMasterCodeLifetime(userId, email) {
     return { ok: false, message: 'Usuário inválido.' };
   }
 
-  // Já é lifetime?
-  const access = await getAccessStatus(userId);
-  if (access?.status === 'lifetime' || access?.subscription?.permanent_free_access === true) {
-    return { ok: true, message: 'Esta conta já possui acesso vitalício.', already: true };
-  }
+  cacheDel(`access:${userId}`);
 
-  // Atualiza subscription existente ou cria
   const { data: subs } = await admin
     .from('subscription')
     .select('*')
@@ -323,6 +339,7 @@ async function applyMasterCodeLifetime(userId, email) {
         status: 'active',
         plan: 'lifetime',
         permanent_free_access: true,
+        cancel_at_period_end: false,
         trial_end: null,
       })
       .eq('id', prev.id);
@@ -338,6 +355,8 @@ async function applyMasterCodeLifetime(userId, email) {
       permanent_discount_active: false,
     });
   }
+
+  cacheDel(`access:${userId}`);
 
   await admin.from('subscription_log').insert({
     user_id: userId,
@@ -894,12 +913,20 @@ stripeOps.post('/stripe-webhook', async (c) => {
         userId = await findUserIdByStripeSub(obj?.id, null);
       }
       if (userId) {
+        const { data: curRows } = await admin
+          .from('subscription')
+          .select('permanent_free_access,plan')
+          .eq('user_id', userId)
+          .limit(1);
+        const cur = curRows?.[0];
+        const isLife = cur?.permanent_free_access === true || cur?.plan === 'lifetime' || cur?.plan === 'dev_lifetime';
         const updatePayload = {
-          status: newStatus,
           stripe_subscription_id: obj.id,
           ...periodFieldsFromStripeSub(obj),
         };
+        if (!isLife) updatePayload.status = newStatus;
         await admin.from('subscription').update(updatePayload).eq('user_id', userId);
+        cacheDel(`access:${userId}`);
 
         if (newStatus === 'canceled' && !periodFieldsFromStripeSub(obj).current_period_end) {
           // deleted sem período residual
@@ -1142,7 +1169,8 @@ stripeOps.post('/link-referral', async (c) => {
     // Código coringa da equipe (aceita também após o cadastro, enquanto houver usos)
     if (code === MASTER_CODE) {
       const result = await applyMasterCodeLifetime(user.id, user.email);
-      return c.json(result);
+      const access = await getAccessStatus(user.id);
+      return c.json({ ...result, access, hasAccess: true, allowed: true, status: 'lifetime' });
     }
 
     const result = await linkReferralInternal(user.id, user.email, code);
