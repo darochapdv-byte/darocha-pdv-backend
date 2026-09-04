@@ -12,7 +12,7 @@ const DISCOUNT_PRICE_BRL = 50;
 const DISCOUNT_MIN_REFERRALS = 6;
 const DISCOUNT_MIN_MONTHS_EACH = 6;
 const MASTER_CODE = 'DAROCHADEV';
-const MASTER_CODE_MAX_USES = 3;
+const MASTER_CODE_MAX_USES = Infinity;
 const ACCESS_CACHE_TTL_MS = 60_000;
 
 function getStripe() {
@@ -293,7 +293,7 @@ export async function ensureUserReferralCode(userId) {
 }
 
 /**
- * Aplica código coringa DAROCHADEV → lifetime (máx. MASTER_CODE_MAX_USES usos).
+ * Aplica código coringa DAROCHADEV → lifetime (usos ilimitados).
  * Pode ser chamado no registro ou depois (link-referral / conta já existente).
  */
 async function applyMasterCodeLifetime(userId, email) {
@@ -305,19 +305,6 @@ async function applyMasterCodeLifetime(userId, email) {
   const access = await getAccessStatus(userId);
   if (access?.status === 'lifetime' || access?.subscription?.permanent_free_access === true) {
     return { ok: true, message: 'Esta conta já possui acesso vitalício.', already: true };
-  }
-
-  const { data: usages } = await admin
-    .from('subscription_log')
-    .select('id')
-    .eq('action', 'master_code_used');
-  const count = usages?.length || 0;
-  if (count >= MASTER_CODE_MAX_USES) {
-    return {
-      ok: false,
-      message: 'Código coringa esgotado (limite de usos atingido).',
-      exhausted: true,
-    };
   }
 
   // Atualiza subscription existente ou cria
@@ -401,24 +388,15 @@ export async function bootstrapNewUserSubscription(userId, email, referralCodeUs
   const usedCode = String(referralCodeUsed || '').trim().toUpperCase();
   if (usedCode === MASTER_CODE) {
     // Conta usos via subscription_log (sem tabela extra)
-    const { data: usages } = await admin
-      .from('subscription_log')
-      .select('id')
-      .eq('action', 'master_code_used');
-    const count = usages?.length || 0;
-    if (count >= MASTER_CODE_MAX_USES) {
-      // código esgotado — segue como trial normal
-    } else {
-      plan = 'dev_lifetime';
-      status = 'active';
-      isLifetime = true;
-      masterUsed = true;
-      await admin.from('subscription_log').insert({
-        user_id: userId,
-        action: 'master_code_used',
-        description: JSON.stringify({ code: MASTER_CODE, user_email: email || null, used_at: new Date().toISOString() }),
-      });
-    }
+    plan = 'dev_lifetime';
+    status = 'active';
+    isLifetime = true;
+    masterUsed = true;
+    await admin.from('subscription_log').insert({
+      user_id: userId,
+      action: 'master_code_used',
+      description: JSON.stringify({ code: MASTER_CODE, user_email: email || null, used_at: new Date().toISOString() }),
+    });
   }
 
   const { data: sub, error } = await admin
@@ -1303,8 +1281,9 @@ stripeOps.post('/master-code-status', async (c) => {
     return c.json({
       code: MASTER_CODE,
       used: usages?.length || 0,
-      max: MASTER_CODE_MAX_USES,
-      remaining: Math.max(0, MASTER_CODE_MAX_USES - (usages?.length || 0)),
+      max: null,
+      remaining: null,
+      unlimited: true,
       usages: usages || [],
     });
   } catch (error) {
