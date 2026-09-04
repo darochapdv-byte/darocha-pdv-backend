@@ -454,16 +454,18 @@ catalog.post('/catalog-checkout', async (c) => {
     let neighborhoodName = '';
     const ship = body.shipping && typeof body.shipping === 'object' ? body.shipping : null;
     if (deliveryType === 'entrega') {
-      if (ship && Number.isFinite(Number(ship.price)) && Number(ship.price) >= 0) {
+      let feeQuery = admin.from('delivery_fee').select('*').eq('active', true).eq('neighborhood', body.neighborhood).limit(1);
+      if (storeOwnerId) feeQuery = feeQuery.eq('created_by', storeOwnerId);
+      const { data: fees } = await feeQuery;
+      const fee = fees?.[0];
+      if (fee) {
+        deliveryFee = Number(fee.fee) || 0;
+        neighborhoodName = fee.neighborhood;
+      } else if (ship && Number.isFinite(Number(ship.price)) && Number(ship.price) >= 0) {
         deliveryFee = Math.round(Number(ship.price) * 100) / 100;
         neighborhoodName = body.neighborhood || '';
       } else {
-        const { data: fees } = await admin
-          .from('delivery_fee').select('*').eq('neighborhood', body.neighborhood).eq('active', true).limit(1);
-        const fee = fees?.[0];
-        if (!fee) return c.json({ error: 'Bairro sem taxa de entrega cadastrada' }, 400);
-        deliveryFee = Number(fee.fee) || 0;
-        neighborhoodName = fee.neighborhood;
+        return c.json({ error: 'Calcule o frete ou escolha um bairro com taxa cadastrada.' }, 400);
       }
     }
 

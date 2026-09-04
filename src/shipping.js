@@ -6,7 +6,7 @@
 import { Hono } from 'hono';
 import crypto from 'crypto';
 import { admin } from './db.js';
-import { requireUser } from './helpers.js';
+import { requireUser, resolveStoreBySlug } from './helpers.js';
 
 const shipping = new Hono();
 
@@ -243,8 +243,9 @@ shipping.post('/melhorenvio-connect', async (c) => {
       'shipping-checkout', 'shipping-generate', 'shipping-print', 'shipping-tracking',
       'cart-read', 'cart-write', 'users-read',
     ].join(' ');
-    const url = `${meBase()}/oauth/authorize?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirect)}&response_type=code&state=${encodeURIComponent(state)}&scope=${encodeURIComponent(scope)}`;
-    return c.json({ ok: true, url });
+    const authorize = `${meBase()}/oauth/authorize?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirect)}&response_type=code&state=${encodeURIComponent(state)}&scope=${encodeURIComponent(scope)}&prompt=login`;
+    const url = `${meBase()}/login?redirect=${encodeURIComponent(authorize)}`;
+    return c.json({ ok: true, url, authorize, force_login: true });
   } catch (e) {
     return c.json({ error: e.message }, 500);
   }
@@ -306,8 +307,41 @@ shipping.post('/shipping-calculate', async (c) => {
     if (toCep.length !== 8) {
       return c.json({ error: 'CEP inválido', message: 'Não foi possível calcular o frete para este CEP. Verifique o CEP e tente novamente.' }, 400);
     }
-    const storeId = body.store_id || body.owner_id;
-    if (!storeId) return c.json({ error: 'Loja não identificada' }, 400);
+    let storeId = body.store_id || body.owner_id || '';
+    const slug = String(body.slug || body.loja || '').trim();
+    if (!storeId && slug) {
+      const resolved = await resolveStoreBySlug(slug);
+      if (resolved?.userId) storeId = resolved.userId;
+    }
+    if (!storeId) {
+      const ref = c.req.header('Referer') || c.req.header('Referrer') || '';
+      const m = ref.match(/[?&]loja=([a-zA-Z0-9-]+)/) || ref.match(/\/catalogo\/([a-zA-Z0-9-]+)/);
+      if (m) {
+        const resolved = await resolveStoreBySlug(m[1]);
+        if (resolved?.userId) storeId = resolved.userId;
+      }
+    }
+    if (!storeId) return c.json({ error: 'store_missing', message: 'Não foi possível calcular o frete para este CEP. Verifique o CEP e tente novamente.' }, 200);
+
+    const neighborhood = String(body.neighborhood || body.bairro || '').trim();
+    if (neighborhood) {
+      const { data: fees } = await admin
+        .from('delivery_fee')
+        .select('id,fee,neighborhood')
+        .eq('created_by', storeId)
+        .eq('active', true)
+        .ilike('neighborhood', neighborhood)
+        .limit(1);
+      if (fees?.[0]) {
+        return c.json({
+          ok: true,
+          use_store_fee: true,
+          options: [],
+          store_fee: Number(fees[0].fee) || 0,
+          message: 'Este bairro já tem taxa da loja. O Melhor Envio não é usado neste caso.',
+        });
+      }
+    }
 
     let cfg = await loadShipCfg(storeId);
     cfg = await refreshIfNeeded(storeId, cfg);
