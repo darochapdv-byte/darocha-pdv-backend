@@ -18,6 +18,46 @@ function invalidateListCache(entityName, userId) {
   cacheDelPrefix(`list:${n}:${userId}:`);
 }
 
+function isIntegrationKey(key) {
+  const k = String(key || '');
+  return k.startsWith('__darocha') || k.startsWith('__catalog') || k === 'mercadopago' || k === 'melhorenvio' || k === 'fiscal';
+}
+
+async function preserveAppSettingsIntegrations(id, body) {
+  if (!admin || !body || typeof body !== 'object') return body;
+  if (!Object.prototype.hasOwnProperty.call(body, 'role_payment_methods') && !Object.prototype.hasOwnProperty.call(body, 'mercadopago')) {
+    return body;
+  }
+  try {
+    const { data: prev } = await admin
+      .from('app_settings')
+      .select('role_payment_methods,mercadopago')
+      .eq('id', id)
+      .maybeSingle();
+    const prevRpm = (prev?.role_payment_methods && typeof prev.role_payment_methods === 'object' && !Array.isArray(prev.role_payment_methods))
+      ? prev.role_payment_methods
+      : {};
+    if (body.role_payment_methods && typeof body.role_payment_methods === 'object' && !Array.isArray(body.role_payment_methods)) {
+      const incoming = body.role_payment_methods;
+      const merged = { ...prevRpm, ...incoming };
+      Object.keys(prevRpm).forEach((key) => {
+        if (isIntegrationKey(key) && (incoming[key] == null || incoming[key] === '')) {
+          merged[key] = prevRpm[key];
+        }
+      });
+      body.role_payment_methods = merged;
+    } else if (prevRpm && Object.keys(prevRpm).length) {
+      body.role_payment_methods = prevRpm;
+    }
+    if ((body.mercadopago == null || body.mercadopago === '') && prev?.mercadopago) {
+      body.mercadopago = prev.mercadopago;
+    }
+  } catch (e) {
+    console.warn('preserveAppSettingsIntegrations', e.message || e);
+  }
+  return body;
+}
+
 // Entidades de negócio isoladas por usuário (multi-tenant)
 const TENANT_ENTITIES = new Set([
   'Product', 'Customer', 'Seller', 'Supplier', 'Courier',
@@ -620,6 +660,7 @@ entities.post('/:entity', async (c) => {
         .limit(20);
       const existing = (existingRows && existingRows[0]) || null;
       if (existing?.id) {
+        body = await preserveAppSettingsIntegrations(existing.id, body);
         const { data: updated, error: upErr } = await admin
           .from(table)
           .update(body)
@@ -868,6 +909,10 @@ entities.patch("/:entity/:id", async (c) => {
       const { data: prev } = await pq.maybeSingle();
       if (prev) prevStock = Number(prev.stock) || 0;
     } catch (_) {}
+  }
+
+  if (normalizeEntityName(entity) === 'AppSettings') {
+    body = await preserveAppSettingsIntegrations(c.req.param('id'), body);
   }
 
   // AppSettings e afins: preferir admin + maybeSingle (evita "Cannot coerce... single JSON object")
