@@ -128,7 +128,6 @@ function missingProducts(items) {
   for (const it of items || []) {
     const name = it.name || it.product_name || 'item';
     if (!String(it.ncm || it.NCM || '').replace(/\D/g, '')) out.push(`Não é possível emitir a NFC-e porque o produto "${name}" está sem NCM.`);
-    if (!String(it.cfop || it.CFOP || '').replace(/\D/g, '')) out.push(`Não é possível emitir a NFC-e porque o produto "${name}" está sem CFOP.`);
   }
   return out;
 }
@@ -260,6 +259,15 @@ fiscal.post('/fiscal-settings-save', async (c) => {
   if (!canManageFiscal(user)) return c.json({ error: 'forbidden', message: 'Só o administrador da loja altera a configuração fiscal.' }, 403);
   if (!rateLimit(user.id, 'save', 30)) return c.json({ error: 'rate_limited' }, 429);
   const body = await c.req.json().catch(() => ({}));
+  const { fiscal: prevFiscal } = await loadSettingsRow(user.id);
+  if (body.product_codes && typeof body.product_codes === 'object') {
+    const mergedCodes = { ...(prevFiscal?.product_codes || {}), ...body.product_codes };
+    if (body.only_codes) {
+      const saved = await saveSettings(user.id, { product_codes: mergedCodes });
+      return c.json({ ok: true, settings: publicSettings(saved) });
+    }
+    body._merged_codes = mergedCodes;
+  }
   const patch = {
     status: 'configured',
     environment: body.environment === 'producao' ? 'producao' : 'homologacao',
@@ -274,6 +282,7 @@ fiscal.post('/fiscal-settings-save', async (c) => {
     nfce_series: String(body.nfce_series || '1').slice(0, 5),
     nfe_series: String(body.nfe_series || '1').slice(0, 5),
   };
+  if (body._merged_codes) patch.product_codes = body._merged_codes;
   if (body.csc) patch.csc_encrypted = encryptSecret(String(body.csc));
   if (body.id_token) patch.id_token_encrypted = encryptSecret(String(body.id_token));
   const saved = await saveSettings(user.id, patch);
@@ -377,7 +386,17 @@ fiscal.post('/fiscal-nfce', async (c) => {
   const miss = missingCompany(cfg, { ...user, ...row });
   if (miss.length) return c.json({ ok: false, kind: 'config', message: 'Configuração fiscal incompleta.', missing: miss }, 400);
 
-  const items = Array.isArray(sale.items) ? sale.items : (body.items || []);
+  const rawItems = Array.isArray(sale.items) ? sale.items : (body.items || []);
+  const codes = (cfg && cfg.product_codes) || {};
+  const items = rawItems.map((it) => {
+    const id = String(it.product_id || it.id || it.sku || it.barcode || '');
+    const extra = codes[id] || codes[String(it.barcode || '')] || {};
+    return {
+      ...it,
+      ncm: it.ncm || it.NCM || extra.ncm || '',
+      cfop: it.cfop || it.CFOP || extra.cfop || '5102',
+    };
+  });
   const prodMiss = missingProducts(items);
   if (prodMiss.length) return c.json({ ok: false, kind: 'config', message: prodMiss[0], missing: prodMiss }, 400);
 
