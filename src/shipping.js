@@ -367,7 +367,12 @@ shipping.post('/shipping-calculate', async (c) => {
 
     let products = packItems(body.items || [], cfg);
     if (!products.length) {
-      products = packItems([{ qty: 1, unit_price: Number(body.cart_total) || 0 }], cfg);
+      const qty = Math.max(1, Number(body.item_count) || 1);
+      const total = Number(body.cart_total) || 0;
+      products = packItems([{ qty, unit_price: qty ? total / qty : total }], cfg);
+    } else {
+      const extra = Math.max(0, (Number(body.item_count) || 0) - products.reduce((s, p) => s + (Number(p.quantity) || 1), 0));
+      if (extra > 0 && products[0]) products[0].quantity += extra;
     }
 
     products = products.map((p) => ({
