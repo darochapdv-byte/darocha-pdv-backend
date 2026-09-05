@@ -304,8 +304,8 @@ shipping.post('/shipping-calculate', async (c) => {
   try {
     const body = await c.req.json().catch(() => ({}));
     const toCep = onlyDigits(body.cep || body.to_cep);
-    if (toCep.length !== 8) {
-      return c.json({ error: 'CEP inválido', message: 'Não foi possível calcular o frete para este CEP. Verifique o CEP e tente novamente.' }, 400);
+    if (toCep.length !== 8 || toCep === '00000000') {
+      return c.json({ error: 'CEP inválido', message: 'Informe o CEP de destino do cliente para calcular o frete.' }, 200);
     }
     let storeId = body.store_id || body.owner_id || '';
     const slug = String(body.slug || body.loja || '').trim();
@@ -324,7 +324,8 @@ shipping.post('/shipping-calculate', async (c) => {
     if (!storeId) return c.json({ error: 'store_missing', message: 'Não foi possível calcular o frete para este CEP. Verifique o CEP e tente novamente.' }, 200);
 
     const neighborhood = String(body.neighborhood || body.bairro || '').trim();
-    if (neighborhood) {
+    const forceMe = String(body.shipping_mode || body.delivery_mode || '').toLowerCase() === 'melhor_envio';
+    if (neighborhood && !forceMe) {
       const { data: fees } = await admin
         .from('delivery_fee')
         .select('id,fee,neighborhood')
