@@ -370,16 +370,42 @@ shipping.post('/shipping-calculate', async (c) => {
       products = packItems([{ qty: 1, unit_price: Number(body.cart_total) || 0 }], cfg);
     }
 
+    products = products.map((p) => ({
+      ...p,
+      width: Math.max(11, Math.round(Number(p.width) || 16)),
+      height: Math.max(2, Math.round(Number(p.height) || 8)),
+      length: Math.max(16, Math.round(Number(p.length) || 16)),
+      weight: Math.max(0.3, Number(p.weight) || 0.3),
+      insurance_value: Math.max(20, Number(p.insurance_value) || 20),
+    }));
+
     const token = decrypt(cfg.access_token_encrypted);
-    const { ok, data } = await meFetch(token, '/api/v2/me/shipment/calculate', {
+    let { ok, data } = await meFetch(token, '/api/v2/me/shipment/calculate', {
       method: 'POST',
       body: { from: { postal_code: fromCep }, to: { postal_code: toCep }, products },
     });
     if (!ok) {
-      const apiMsg = data && (data.message || data.error || data.errors);
+      const pkg = products[0];
+      const retry = await meFetch(token, '/api/v2/me/shipment/calculate', {
+        method: 'POST',
+        body: {
+          from: { postal_code: fromCep },
+          to: { postal_code: toCep },
+          package: {
+            height: pkg.height,
+            width: pkg.width,
+            length: pkg.length,
+            weight: pkg.weight,
+          },
+        },
+      });
+      ok = retry.ok;
+      data = retry.data;
+    }
+    if (!ok) {
       return c.json({
         error: 'quote_failed',
-        message: 'Não foi possível calcular o frete para este CEP. Verifique o CEP e tente novamente.',
+        message: 'Não foi possível calcular o frete agora. Confira se a conta Melhor Envio desta loja está conectada e tente de novo.',
         options: [],
       }, 200);
     }
@@ -394,6 +420,17 @@ shipping.post('/shipping-calculate', async (c) => {
         days: Number(s.custom_delivery_time || s.delivery_time || 0),
         currency: 'BRL',
       }));
+    if (!options.length) {
+      const firstErr = raw.find((s) => s && s.error);
+      const errText = firstErr && (firstErr.error || firstErr.message);
+      return c.json({
+        error: 'no_service',
+        message: errText
+          ? String(errText)
+          : 'Nenhuma transportadora atende este CEP no momento.',
+        options: [],
+      }, 200);
+    }
     const priced = applyStoreRules(options, cfg, body.cart_total);
     return c.json({
       ok: true,
