@@ -343,7 +343,8 @@ catalog.post('/catalog-checkout', async (c) => {
     const deliveryType = (body.delivery_type === 'entrega' || body.delivery_type === 'melhor_envio' || shipModeRaw === 'melhor_envio')
       ? 'entrega'
       : 'retirada';
-    const useMelhorEnvio = shipModeRaw === 'melhor_envio' || body.delivery_type === 'melhor_envio';
+    const shipPreview = body.shipping && typeof body.shipping === 'object' ? body.shipping : null;
+    const useMelhorEnvio = shipModeRaw === 'melhor_envio' || body.delivery_type === 'melhor_envio' || (shipPreview && Number.isFinite(Number(shipPreview.price)));
 
     if (!items.length) return c.json({ error: 'Carrinho vazio' }, 400);
     if (!customer.name || !customer.phone) return c.json({ error: 'Nome e telefone são obrigatórios' }, 400);
@@ -470,10 +471,16 @@ catalog.post('/catalog-checkout', async (c) => {
         const { data: fees } = await feeQuery;
         const fee = fees?.[0];
         if (!fee) {
-          return c.json({ error: 'A loja não entrega neste bairro. Use Melhor Envio ou retirada na loja.' }, 400);
+          if (ship && Number.isFinite(Number(ship.price)) && Number(ship.price) >= 0) {
+            deliveryFee = Math.round(Number(ship.price) * 100) / 100;
+            neighborhoodName = body.neighborhood || '';
+          } else {
+            return c.json({ error: 'Calcule o frete para este CEP antes de finalizar.' }, 400);
+          }
+        } else {
+          deliveryFee = Number(fee.fee) || 0;
+          neighborhoodName = fee.neighborhood;
         }
-        deliveryFee = Number(fee.fee) || 0;
-        neighborhoodName = fee.neighborhood;
       }
     }
 
