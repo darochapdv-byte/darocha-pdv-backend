@@ -321,7 +321,18 @@ shipping.post('/shipping-calculate', async (c) => {
         if (resolved?.userId) storeId = resolved.userId;
       }
     }
-    if (!storeId) return c.json({ error: 'store_missing', message: 'Não foi possível calcular o frete para este CEP. Verifique o CEP e tente novamente.' }, 200);
+    if (!storeId) {
+      try {
+        const user = await requireUser(c);
+        if (user?.id) storeId = user.id;
+      } catch (_) {}
+    }
+    if (!storeId) {
+      return c.json({
+        error: 'store_missing',
+        message: 'Não identifiquei a loja para calcular o frete. Abra o catálogo pelo link da loja.',
+      }, 200);
+    }
 
     const neighborhood = String(body.neighborhood || body.bairro || '').trim();
     const forceMe = String(body.shipping_mode || body.delivery_mode || '').toLowerCase() === 'melhor_envio';
@@ -348,7 +359,7 @@ shipping.post('/shipping-calculate', async (c) => {
     cfg = await refreshIfNeeded(storeId, cfg);
     const fromCep = onlyDigits(cfg.origin_cep);
     if (fromCep.length !== 8) {
-      return c.json({ error: 'origin_missing', message: 'A loja ainda não configurou o CEP de origem da entrega.' }, 400);
+      return c.json({ error: 'origin_missing', message: 'A loja ainda não configurou o CEP de origem da entrega.', options: [] }, 200);
     }
     if (cfg.status !== 'connected' || !cfg.access_token_encrypted) {
       return c.json({ error: 'not_connected', message: 'A loja ainda não conectou o Melhor Envio.', options: [] }, 200);
@@ -365,14 +376,16 @@ shipping.post('/shipping-calculate', async (c) => {
       body: { from: { postal_code: fromCep }, to: { postal_code: toCep }, products },
     });
     if (!ok) {
+      const apiMsg = data && (data.message || data.error || data.errors);
       return c.json({
         error: 'quote_failed',
         message: 'Não foi possível calcular o frete para este CEP. Verifique o CEP e tente novamente.',
+        options: [],
       }, 200);
     }
     const raw = Array.isArray(data) ? data : [];
     const options = raw
-      .filter((s) => s && !s.error && (s.price || s.custom_price))
+      .filter((s) => s && !s.error && Number(s.custom_price || s.price || 0) > 0)
       .map((s) => ({
         service_id: String(s.id),
         company: s.company?.name || s.company || '',
