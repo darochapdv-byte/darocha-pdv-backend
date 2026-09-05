@@ -302,18 +302,19 @@ shipping.post('/shipping-calculate', async (c) => {
       return c.json({ error: 'CEP inválido', message: 'Informe o CEP de destino do cliente para calcular o frete.' }, 200);
     }
     let storeId = body.store_id || body.owner_id || '';
-    const slug = String(body.slug || body.loja || '').trim();
+    let slug = String(body.slug || body.loja || '').trim();
+    if (!slug) {
+      const ref = c.req.header('Referer') || c.req.header('Referrer') || '';
+      const m =
+        ref.match(/[?&]loja=([a-zA-Z0-9-]+)/) ||
+        ref.match(/[?&]slug=([a-zA-Z0-9-]+)/) ||
+        ref.match(/\/catalogo\/([a-zA-Z0-9-]+)/) ||
+        ref.match(/https?:\/\/([a-z0-9-]+)\.darochapdv\.com/i);
+      if (m) slug = m[1];
+    }
     if (!storeId && slug) {
       const resolved = await resolveStoreBySlug(slug);
       if (resolved?.userId) storeId = resolved.userId;
-    }
-    if (!storeId) {
-      const ref = c.req.header('Referer') || c.req.header('Referrer') || '';
-      const m = ref.match(/[?&]loja=([a-zA-Z0-9-]+)/) || ref.match(/\/catalogo\/([a-zA-Z0-9-]+)/);
-      if (m) {
-        const resolved = await resolveStoreBySlug(m[1]);
-        if (resolved?.userId) storeId = resolved.userId;
-      }
     }
     if (!storeId) {
       try {
