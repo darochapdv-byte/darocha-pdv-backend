@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import crypto from 'crypto';
 import { admin } from './db.js';
-import { requireUser } from './helpers.js';
+import { requireUser, loadMergedAppSettingsRpm, mergeRolePaymentMethods } from './helpers.js';
 import {
   encryptSecret,
   decryptSecret,
@@ -53,28 +53,27 @@ function publicSettings(raw) {
 
 async function loadSettingsRow(userId) {
   if (!admin || !userId) return { row: null, fiscal: null };
-  const { data } = await admin
-    .from('app_settings')
-    .select('id,created_by,company_name,company_cnpj,company_address,company_phone,role_payment_methods')
-    .eq('created_by', userId)
-    .order('created_at', { ascending: false })
-    .limit(10);
-  const row = (data || [])[0] || null;
-  const fiscalCfg = row?.role_payment_methods?.[SETTINGS_KEY] || null;
-  return { row, fiscal: fiscalCfg };
+  const { row, rpm } = await loadMergedAppSettingsRpm(userId);
+  if (row) {
+    const { data } = await admin
+      .from('app_settings')
+      .select('id,created_by,company_name,company_cnpj,company_address,company_phone,role_payment_methods')
+      .eq('id', row.id)
+      .maybeSingle();
+    return { row: data || row, fiscal: rpm[SETTINGS_KEY] || null };
+  }
+  return { row: null, fiscal: rpm[SETTINGS_KEY] || null };
 }
 
 async function saveSettings(userId, patch) {
   const { row, fiscal } = await loadSettingsRow(userId);
+  const { rpm } = await loadMergedAppSettingsRpm(userId);
   const next = { ...(fiscal || {}), ...patch, updated_at: new Date().toISOString() };
-  const rpm = (row?.role_payment_methods && typeof row.role_payment_methods === 'object' && !Array.isArray(row.role_payment_methods))
-    ? { ...row.role_payment_methods }
-    : {};
-  rpm[SETTINGS_KEY] = next;
+  const merged = mergeRolePaymentMethods(rpm, { [SETTINGS_KEY]: next });
   if (row?.id) {
-    await admin.from('app_settings').update({ role_payment_methods: rpm }).eq('id', row.id);
+    await admin.from('app_settings').update({ role_payment_methods: merged }).eq('id', row.id);
   } else {
-    await admin.from('app_settings').insert({ created_by: userId, role_payment_methods: rpm });
+    await admin.from('app_settings').insert({ created_by: userId, role_payment_methods: merged });
   }
   return next;
 }

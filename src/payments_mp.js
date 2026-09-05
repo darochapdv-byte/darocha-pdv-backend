@@ -5,7 +5,7 @@
 import { Hono } from 'hono';
 import crypto from 'crypto';
 import { admin } from './db.js';
-import { requireUser } from './helpers.js';
+import { requireUser, loadMergedAppSettingsRpm, mergeRolePaymentMethods } from './helpers.js';
 
 const payments = new Hono();
 
@@ -127,18 +127,8 @@ async function saveMpAccount(userId, data) {
   }
 
   // 2) app_settings.role_payment_methods.__darocha_mp (coluna já existe)
-  const { data: rows, error: selErr } = await admin
-    .from('app_settings')
-    .select('id,role_payment_methods')
-    .eq('created_by', userId)
-    .order('created_at', { ascending: false })
-    .limit(1);
-  if (selErr) throw new Error(selErr.message);
-  const row = rows?.[0];
-  const current = (row?.role_payment_methods && typeof row.role_payment_methods === 'object' && !Array.isArray(row.role_payment_methods))
-    ? { ...row.role_payment_methods }
-    : {};
-  current.__darocha_mp = payload;
+  const { row, rpm } = await loadMergedAppSettingsRpm(userId);
+  const current = mergeRolePaymentMethods(rpm, { __darocha_mp: payload });
   if (row?.id) {
     const { error } = await admin.from('app_settings').update({ role_payment_methods: current }).eq('id', row.id);
     if (error) throw new Error(error.message);

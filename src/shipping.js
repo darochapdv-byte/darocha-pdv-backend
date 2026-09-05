@@ -6,7 +6,7 @@
 import { Hono } from 'hono';
 import crypto from 'crypto';
 import { admin } from './db.js';
-import { requireUser, resolveStoreBySlug } from './helpers.js';
+import { requireUser, resolveStoreBySlug, loadMergedAppSettingsRpm, mergeRolePaymentMethods } from './helpers.js';
 
 const shipping = new Hono();
 
@@ -50,15 +50,9 @@ function onlyDigits(v, n = 8) {
 
 async function loadShipCfg(storeId) {
   if (!admin || !storeId) return {};
-  const { data: rows } = await admin
-    .from('app_settings')
-    .select('id,role_payment_methods')
-    .eq('created_by', storeId)
-    .order('created_at', { ascending: false })
-    .limit(1);
-  const blob = rows?.[0]?.role_payment_methods;
-  const cfg = (blob && typeof blob === 'object' && blob.__darocha_me) || {};
-  return { ...cfg, _rowId: rows?.[0]?.id, _all: (blob && typeof blob === 'object') ? blob : {} };
+  const { row, rpm } = await loadMergedAppSettingsRpm(storeId);
+  const cfg = rpm.__darocha_me || {};
+  return { ...cfg, _rowId: row?.id, _all: rpm };
 }
 
 async function saveShipCfg(storeId, patch) {
@@ -66,7 +60,7 @@ async function saveShipCfg(storeId, patch) {
   const nextMe = { ...cur, ...patch };
   delete nextMe._rowId;
   delete nextMe._all;
-  const all = { ...(cur._all || {}), __darocha_me: nextMe };
+  const all = mergeRolePaymentMethods(cur._all || {}, { __darocha_me: nextMe });
   if (cur._rowId) {
     await admin.from('app_settings').update({ role_payment_methods: all }).eq('id', cur._rowId);
   } else {

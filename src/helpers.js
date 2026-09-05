@@ -54,6 +54,63 @@ export async function requireUser(c) {
   return getUserFromRequest(c);
 }
 
+export function isIntegrationRpmKey(key) {
+  const k = String(key || '');
+  return k.startsWith('__darocha') || k.startsWith('__catalog') || k === 'mercadopago' || k === 'melhorenvio' || k === 'fiscal';
+}
+
+const TOKEN_FIELDS = [
+  'access_token', 'access_token_encrypted', 'refresh_token', 'refresh_token_encrypted',
+  'public_key', 'provider_user_id', 'origin_cep', 'certificate_uploaded',
+  'provider_company_id', 'csc_encrypted', 'id_token_encrypted', 'mp_user_id',
+];
+
+export function mergeRolePaymentMethods(base, incoming) {
+  const a = (base && typeof base === 'object' && !Array.isArray(base)) ? { ...base } : {};
+  const b = (incoming && typeof incoming === 'object' && !Array.isArray(incoming)) ? incoming : {};
+  const out = { ...a, ...b };
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const key of keys) {
+    if (!isIntegrationRpmKey(key)) continue;
+    const prev = a[key];
+    const next = b[key];
+    if (next == null || next === '') {
+      out[key] = prev;
+      continue;
+    }
+    if (prev && typeof prev === 'object' && typeof next === 'object') {
+      const m = { ...prev, ...next };
+      for (const tk of TOKEN_FIELDS) {
+        if ((next[tk] == null || next[tk] === '') && prev[tk]) m[tk] = prev[tk];
+      }
+      const hasSecret = !!(m.access_token_encrypted || m.refresh_token_encrypted || m.certificate_uploaded || m.origin_cep);
+      if (hasSecret && prev.status === 'connected' && next.status && next.status !== 'connected' && next.status !== 'disabled') {
+        m.status = 'connected';
+      }
+      out[key] = m;
+    } else if (prev && (next == null || next === '')) {
+      out[key] = prev;
+    }
+  }
+  return out;
+}
+
+export async function loadMergedAppSettingsRpm(userId) {
+  if (!admin || !userId) return { row: null, rpm: {} };
+  const { data } = await admin
+    .from('app_settings')
+    .select('id,role_payment_methods,created_at')
+    .eq('created_by', userId)
+    .order('created_at', { ascending: false })
+    .limit(10);
+  const rows = data || [];
+  let rpm = {};
+  for (const r of [...rows].reverse()) {
+    rpm = mergeRolePaymentMethods(rpm, r.role_payment_methods);
+  }
+  return { row: rows[0] || null, rpm, rows };
+}
+
 /** Limpa reservas expiradas e retorna mapa product_id → qty reservada */
 export async function buildReservationMap(excludeHolderId = null) {
   if (!admin) return {};

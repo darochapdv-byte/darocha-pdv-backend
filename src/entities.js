@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { admin, userClient, tableFor, restQuery } from './db.js';
-import { sanitizeDateFields, sanitizeEntityBody, toBase44Row, toBase44Rows, requireUser, getAllowZeroStock, setAllowZeroStock, ensureCatalogSlug, buildStorePublicUrl, normalizePhoneBR } from './helpers.js';
+import { sanitizeDateFields, sanitizeEntityBody, toBase44Row, toBase44Rows, requireUser, getAllowZeroStock, setAllowZeroStock, ensureCatalogSlug, buildStorePublicUrl, normalizePhoneBR, mergeRolePaymentMethods, isIntegrationRpmKey } from './helpers.js';
 import { getAccessStatus } from './stripe_ops.js';
 import { applySaleCancellationSideEffects } from './integration.js';
 import { cacheGet, cacheSet, cacheDelPrefix } from './cache.js';
@@ -38,14 +38,7 @@ async function preserveAppSettingsIntegrations(id, body) {
       ? prev.role_payment_methods
       : {};
     if (body.role_payment_methods && typeof body.role_payment_methods === 'object' && !Array.isArray(body.role_payment_methods)) {
-      const incoming = body.role_payment_methods;
-      const merged = { ...prevRpm, ...incoming };
-      Object.keys(prevRpm).forEach((key) => {
-        if (isIntegrationKey(key) && (incoming[key] == null || incoming[key] === '')) {
-          merged[key] = prevRpm[key];
-        }
-      });
-      body.role_payment_methods = merged;
+      body.role_payment_methods = mergeRolePaymentMethods(prevRpm, body.role_payment_methods);
     } else if (prevRpm && Object.keys(prevRpm).length) {
       body.role_payment_methods = prevRpm;
     }
