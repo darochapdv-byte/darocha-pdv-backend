@@ -10,6 +10,10 @@ import {
   saleTotalsMatch,
   explainSefaz,
 } from './fiscal_helpers.js';
+import { resolveSefaz } from './fiscal_sefaz.js';
+import { buildAccessKey, buildNfceXml, buildQrCode } from './fiscal_xml.js';
+import { loadA1, signInfNFe } from './fiscal_sign.js';
+import { sefazAutoriza, sefazConsulta, sefazStatus, sefazCancela, sefazInutiliza } from './fiscal_soap.js';
 
 const fiscal = new Hono();
 const PROVIDER = 'sefaz';
@@ -212,6 +216,33 @@ function rateLimit(userId, route, max = 20, windowMs = 60000) {
   return true;
 }
 
+function loadStoreA1(cfg) {
+  if (!cfg?.pfx_encrypted || !cfg?.pfx_password_encrypted) {
+    const err = new Error('Envie o certificado A1 e a senha em Configurações → Fiscal.');
+    err.code = 'config';
+    throw err;
+  }
+  const b64 = decryptSecret(cfg.pfx_encrypted);
+  const pw = decryptSecret(cfg.pfx_password_encrypted);
+  return loadA1(b64, pw);
+}
+
+async function fillCmun(cfg) {
+  const existing = onlyDigits(cfg?.address?.cMun || cfg?.cMun || '');
+  if (existing.length === 7) return existing;
+  const cep = onlyDigits(cfg?.address?.cep || '');
+  if (cep.length !== 8) return existing;
+  try {
+    const r = await fetch(`https://viacep.com.br/ws/${cep}/json/`);
+    const j = await r.json();
+    if (j && j.ibge) {
+      cfg.address = { ...(cfg.address || {}), cMun: String(j.ibge), ibge: String(j.ibge), city: cfg.address?.city || j.localidade };
+      return String(j.ibge);
+    }
+  } catch (_) {}
+  return existing;
+}
+
 function canManageFiscal(user) {
   if (!user?.id) return false;
   const role = String(user?.role || user?.data?.role || '').toLowerCase().trim();
@@ -335,11 +366,34 @@ fiscal.post('/fiscal-test', async (c) => {
     return c.json({ ok: false, kind: 'config', message: 'Configuração incompleta.', missing: miss });
   }
   try {
+    const uf = cfg.address?.uf;
+    const route = resolveSefaz(uf, cfg.environment);
+    if (route.error) return c.json({ ok: false, kind: 'config', message: route.error });
+    let sefaz = null;
+    try {
+      const a1 = loadStoreA1(cfg);
+      sefaz = await sefazStatus({
+        urls: route.urls,
+        cUF: route.cUF,
+        tpAmb: cfg.environment === 'producao' ? '1' : '2',
+        a1,
+      });
+    } catch (e) {
+      return c.json({
+        ok: false,
+        kind: 'comunicacao',
+        authorizer: route.authorizer,
+        message: e.message || 'Não falou com a SEFAZ. Confira A1, senha e se a empresa está credenciada na UF.',
+      }, 400);
+    }
     return c.json({
-      ok: true,
+      ok: sefaz.cStat === '107',
       environment: cfg.environment || 'homologacao',
-      sefaz_ready: false,
-      message: 'Cadastro fiscal desta loja está completo. A emissão SOAP na SEFAZ ainda não foi ligada (próxima fase). Ambiente: ' + (cfg.environment === 'producao' ? 'produção' : 'homologação') + '.',
+      sefaz_ready: sefaz.cStat === '107',
+      authorizer: route.authorizer,
+      cStat: sefaz.cStat,
+      xMotivo: sefaz.xMotivo,
+      message: sefaz.xMotivo || 'Consulta ao status da SEFAZ concluída.',
     });
   } catch (e) {
     return c.json({ ok: false, kind: e.code === 'provider_not_configured' ? 'config' : 'comunicacao', message: e.message }, 400);
@@ -360,7 +414,7 @@ fiscal.post('/fiscal-nfce', async (c) => {
   if (authorized) {
     return c.json({ ok: true, already: true, document: sanitizeDoc(authorized) });
   }
-  const processing = existing.find((d) => ['processando', 'aguardando'].includes(d.status));
+  const processing = existing.find((d) => d.status === 'processando');
   if (processing) {
     return c.json({ ok: true, already: true, document: sanitizeDoc(processing) });
   }
@@ -425,17 +479,81 @@ fiscal.post('/fiscal-nfce', async (c) => {
   const saved = await insertDocument(draft);
 
   try {
-    await updateDocument(user.id, saved.id, {
-      status: 'aguardando',
-      rejection_message: 'Cadastro fiscal ok. Emissão SOAP na SEFAZ ainda não está ligada.',
+    const uf = cfg.address?.uf;
+    const route = resolveSefaz(uf, cfg.environment);
+    if (route.error) {
+      await updateDocument(user.id, saved.id, { status: 'erro', rejection_message: route.error });
+      return c.json({ ok: false, kind: 'config', message: route.error }, 400);
+    }
+    await fillCmun(cfg);
+    const a1 = loadStoreA1(cfg);
+    const tpAmb = cfg.environment === 'producao' ? '1' : '2';
+    const series = String(cfg.nfce_series || '1');
+    const number = Number(cfg.nfce_next || 1) || 1;
+    const cNF = String(Math.floor(Math.random() * 99999999)).padStart(8, '0');
+    const now = new Date();
+    const chave = buildAccessKey({
+      cUF: route.cUF,
+      cnpj: onlyDigits(cfg.cnpj),
+      series,
+      number,
+      tpEmis: '1',
+      emittedAt: now,
+      cNF,
     });
+    const { infNFe } = buildNfceXml({
+      cfg,
+      sale: { ...sale, total: totals.total, customer_doc: draft.customer_doc },
+      items,
+      payments: mappedPay,
+      number,
+      series,
+      chave,
+      cUF: route.cUF,
+      tpAmb,
+      tpEmis: '1',
+      now,
+    });
+    const nfeXml = signInfNFe(infNFe, a1, chave);
+    const ret = await sefazAutoriza({ urls: route.urls, nfeXml, lote: String(number), a1 });
+    const csc = cfg.csc_encrypted ? decryptSecret(cfg.csc_encrypted) : '';
+    const qr = buildQrCode({
+      chave: ret.chNFe || chave,
+      tpAmb,
+      cscId: cfg.csc_id,
+      csc,
+      qrBase: route.urls.qr,
+    });
+    const authorized = ret.authorized;
+    await saveSettings(user.id, { nfce_next: number + 1 });
+    const updated = await updateDocument(user.id, saved.id, {
+      status: authorized ? 'autorizada' : (ret.processing ? 'processando' : 'rejeitada'),
+      access_key: ret.chNFe || chave,
+      protocol: ret.nProt || null,
+      number: String(number),
+      series,
+      rejection_code: authorized ? null : ret.cStat,
+      rejection_message: authorized ? null : (ret.xMotivo || ret.cStat),
+      authorization_date: authorized ? new Date().toISOString() : null,
+      xml: nfeXml,
+      qrcode_url: qr,
+      provider_status: ret.cStat,
+    });
+    const explained = authorized ? null : explainSefaz(ret.cStat, ret.xMotivo);
     return c.json({
-      ok: false,
-      kind: 'config',
-      sefaz_ready: false,
-      message: 'A loja está conectada no Fiscal, mas a emissão na SEFAZ ainda não foi ligada (próxima fase). A venda não foi alterada.',
-      document: sanitizeDoc({ ...draft, status: 'aguardando' }),
-    }, 200);
+      ok: authorized || ret.processing,
+      document: sanitizeDoc(updated || { ...draft, access_key: chave }),
+      homolog: tpAmb === '2',
+      authorizer: route.authorizer,
+      cStat: ret.cStat,
+      xMotivo: ret.xMotivo,
+      qrcode_url: qr,
+      message: authorized
+        ? `NFC-e autorizada. Chave ${ret.chNFe || chave}`
+        : (explained?.text || ret.xMotivo || 'SEFAZ respondeu'),
+      cause: explained?.cause,
+      action: explained?.action,
+    });
     const status = mapProviderStatus(created?.status || created?.situacao);
     const explained = status === 'rejeitada' ? explainSefaz(created?.codigo_status || created?.codigo, created?.motivo_status || created?.motivo) : null;
     const updated = await updateDocument(user.id, saved.id, {
@@ -543,8 +661,24 @@ fiscal.post('/fiscal-cancel', async (c) => {
   if (doc.status === 'cancelada') return c.json({ ok: true, document: sanitizeDoc(doc) });
   if (doc.status !== 'autorizada') return c.json({ error: 'invalid_status', message: 'Só é possível cancelar documento autorizado.' }, 400);
   try {
-    if (doc.provider_document_id) {
-      await providerFetch(`/nfce/${doc.provider_document_id}/cancelamento`, { method: 'POST', body: { justificativa: reason } });
+    const { fiscal: cfg } = await loadSettingsRow(user.id);
+    const route = resolveSefaz(cfg?.address?.uf, cfg?.environment);
+    if (route.error) return c.json({ ok: false, kind: 'config', message: route.error }, 400);
+    if (!doc.access_key || !doc.protocol) {
+      return c.json({ error: 'missing', message: 'Documento sem chave ou protocolo para cancelar na SEFAZ.' }, 400);
+    }
+    const a1 = loadStoreA1(cfg);
+    const ret = await sefazCancela({
+      urls: route.urls,
+      chave: doc.access_key,
+      protocol: doc.protocol,
+      reason,
+      tpAmb: cfg.environment === 'producao' ? '1' : '2',
+      orgao: route.cUF,
+      a1,
+    });
+    if (ret.cStat !== '135' && ret.cStat !== '155' && !String(ret.xMotivo || '').toLowerCase().includes('cancelado')) {
+      return c.json({ ok: false, kind: 'sefaz', cStat: ret.cStat, message: ret.xMotivo || 'SEFAZ não cancelou.' }, 400);
     }
     const updated = await updateDocument(user.id, doc.id, {
       status: 'cancelada',
@@ -552,8 +686,7 @@ fiscal.post('/fiscal-cancel', async (c) => {
       cancelled_by: user.id,
       cancellation_date: new Date().toISOString(),
     });
-    console.info('fiscal cancel', { user: user.id, id: doc.id });
-    return c.json({ ok: true, document: sanitizeDoc(updated || { ...doc, status: 'cancelada' }) });
+    return c.json({ ok: true, document: sanitizeDoc(updated || { ...doc, status: 'cancelada' }), cStat: ret.cStat, xMotivo: ret.xMotivo });
   } catch (e) {
     return c.json({ ok: false, kind: 'sefaz', message: e.message }, 400);
   }
@@ -568,9 +701,57 @@ fiscal.post('/fiscal-status', async (c) => {
     provider: PROVIDER,
     configured: !!cfg,
     environment: cfg?.environment || 'homologacao',
-    connected: !!(cfg?.provider_company_id && cfg?.certificate_uploaded),
-    server_token: !!(env('FISCAL_API_TOKEN') || env('NUVEM_FISCAL_TOKEN')),
+    connected: !!(cfg?.enabled && cfg?.certificate_uploaded),
+    provider: 'sefaz',
+    sefaz_map: cfg?.address?.uf ? resolveSefaz(cfg.address.uf, cfg.environment) : null,
   });
+});
+
+fiscal.post('/fiscal-consultar', async (c) => {
+  const user = await requireUser(c);
+  if (!user?.id) return c.json({ error: 'unauthorized' }, 401);
+  const body = await c.req.json().catch(() => ({}));
+  const { fiscal: cfg } = await loadSettingsRow(user.id);
+  const chave = onlyDigits(body.access_key || body.chave || '');
+  if (chave.length !== 44) return c.json({ error: 'chave', message: 'Informe a chave de 44 dígitos.' }, 400);
+  const route = resolveSefaz(cfg?.address?.uf, cfg?.environment);
+  if (route.error) return c.json({ ok: false, message: route.error }, 400);
+  try {
+    const a1 = loadStoreA1(cfg);
+    const ret = await sefazConsulta({ urls: route.urls, chave, tpAmb: cfg.environment === 'producao' ? '1' : '2', a1 });
+    return c.json({ ok: true, cStat: ret.cStat, xMotivo: ret.xMotivo, chNFe: ret.chNFe || chave, nProt: ret.nProt });
+  } catch (e) {
+    return c.json({ ok: false, kind: 'comunicacao', message: e.message }, 400);
+  }
+});
+
+fiscal.post('/fiscal-inutilizar', async (c) => {
+  const user = await requireUser(c);
+  if (!user?.id) return c.json({ error: 'unauthorized' }, 401);
+  if (!canManageFiscal(user)) return c.json({ error: 'forbidden' }, 403);
+  const body = await c.req.json().catch(() => ({}));
+  const reason = String(body.reason || body.justificativa || '').trim();
+  if (reason.length < 15) return c.json({ error: 'reason', message: 'Justificativa mínima de 15 caracteres.' }, 400);
+  const { fiscal: cfg } = await loadSettingsRow(user.id);
+  const route = resolveSefaz(cfg?.address?.uf, cfg?.environment);
+  if (route.error) return c.json({ ok: false, message: route.error }, 400);
+  try {
+    const a1 = loadStoreA1(cfg);
+    const ret = await sefazInutiliza({
+      urls: route.urls,
+      cUF: route.cUF,
+      tpAmb: cfg.environment === 'producao' ? '1' : '2',
+      cnpj: onlyDigits(cfg.cnpj),
+      series: body.series || cfg.nfce_series || '1',
+      nIni: body.nIni || body.from,
+      nFin: body.nFin || body.to || body.nIni || body.from,
+      reason,
+      a1,
+    });
+    return c.json({ ok: ret.cStat === '102', cStat: ret.cStat, xMotivo: ret.xMotivo });
+  } catch (e) {
+    return c.json({ ok: false, kind: 'comunicacao', message: e.message }, 400);
+  }
 });
 
 fiscal.post('/fiscal-webhook', async (c) => {
