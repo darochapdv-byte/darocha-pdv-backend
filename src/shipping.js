@@ -376,8 +376,19 @@ shipping.post('/shipping-calculate', async (c) => {
       height: Math.max(2, Math.round(Number(p.height) || 8)),
       length: Math.max(16, Math.round(Number(p.length) || 16)),
       weight: Math.max(0.3, Number(p.weight) || 0.3),
+      quantity: Math.max(1, Number(p.quantity) || 1),
       insurance_value: Math.max(20, Number(p.insurance_value) || 20),
     }));
+
+    const totalQty = products.reduce((s, p) => s + (Number(p.quantity) || 1), 0);
+    const totalWeight = products.reduce((s, p) => s + (Number(p.weight) || 0.3) * (Number(p.quantity) || 1), 0);
+    const totalIns = products.reduce((s, p) => s + (Number(p.insurance_value) || 0) * (Number(p.quantity) || 1), 0);
+    const pkg = {
+      height: Math.max(2, Math.round((Number(products[0]?.height) || 8) + Math.max(0, totalQty - 1) * 2)),
+      width: Math.max(11, Math.round(Number(products[0]?.width) || 16)),
+      length: Math.max(16, Math.round(Number(products[0]?.length) || 16)),
+      weight: Math.max(0.3, Math.round(totalWeight * 1000) / 1000),
+    };
 
     const token = decrypt(cfg.access_token_encrypted);
     let { ok, data } = await meFetch(token, '/api/v2/me/shipment/calculate', {
@@ -385,18 +396,13 @@ shipping.post('/shipping-calculate', async (c) => {
       body: { from: { postal_code: fromCep }, to: { postal_code: toCep }, products },
     });
     if (!ok) {
-      const pkg = products[0];
       const retry = await meFetch(token, '/api/v2/me/shipment/calculate', {
         method: 'POST',
         body: {
           from: { postal_code: fromCep },
           to: { postal_code: toCep },
-          package: {
-            height: pkg.height,
-            width: pkg.width,
-            length: pkg.length,
-            weight: pkg.weight,
-          },
+          package: pkg,
+          options: { insurance_value: Math.max(20, totalIns) },
         },
       });
       ok = retry.ok;
