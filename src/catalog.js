@@ -174,7 +174,11 @@ catalog.post('/catalog-data', async (c) => {
         const maxQty = allowZeroStock
           ? Math.max(maxQtyLimit, catalogStock)
           : Math.max(0, Math.min(catalogStock, maxQtyLimit));
-        const extra = packCodes[p.id] || packCodes[String(p.barcode || '')] || {};
+        const extra = packCodes[p.id]
+          || packCodes[String(p.barcode || '')]
+          || packCodes['name:' + String(p.name || '').toLowerCase()]
+          || Object.values(packCodes).find((c) => c && c.name && String(c.name).toLowerCase() === String(p.name || '').toLowerCase())
+          || {};
         return {
           id: p.id,
           name: p.name,
