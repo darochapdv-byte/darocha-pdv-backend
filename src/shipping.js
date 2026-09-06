@@ -330,21 +330,26 @@ shipping.post('/shipping-calculate', async (c) => {
     }
 
     const neighborhood = String(body.neighborhood || body.bairro || '').trim();
-    const forceMe = String(body.shipping_mode || body.delivery_mode || '').toLowerCase() === 'melhor_envio';
-    if (neighborhood && !forceMe) {
+    const fold = (s) => String(s || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
+    if (neighborhood) {
       const { data: fees } = await admin
         .from('delivery_fee')
         .select('id,fee,neighborhood')
         .eq('created_by', storeId)
         .eq('active', true)
-        .ilike('neighborhood', neighborhood)
-        .limit(1);
-      if (fees?.[0]) {
+        .limit(200);
+      const hit = (fees || []).find((f) => fold(f.neighborhood) === fold(neighborhood) && Number(f.fee) > 0);
+      if (hit) {
         return c.json({
           ok: true,
           use_store_fee: true,
           options: [],
-          store_fee: Number(fees[0].fee) || 0,
+          store_fee: Number(hit.fee) || 0,
           message: 'Este bairro já tem taxa da loja. O Melhor Envio não é usado neste caso.',
         });
       }
