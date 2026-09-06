@@ -374,6 +374,14 @@ shipping.post('/shipping-calculate', async (c) => {
       const extra = Math.max(0, (Number(body.item_count) || 0) - products.reduce((s, p) => s + (Number(p.quantity) || 1), 0));
       if (extra > 0 && products[0]) products[0].quantity += extra;
     }
+    const cartTotal = Number(body.cart_total) || 0;
+    const unitGuess = Number(products[0] && products[0].insurance_value) || 0;
+    if (products[0] && cartTotal > 0 && unitGuess > 0) {
+      const inferred = Math.max(1, Math.round(cartTotal / unitGuess));
+      if (inferred > Number(products[0].quantity || 1) && inferred <= 200) {
+        products[0].quantity = inferred;
+      }
+    }
 
     products = products.map((p) => ({
       ...p,
