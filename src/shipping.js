@@ -396,19 +396,21 @@ shipping.post('/shipping-calculate', async (c) => {
     };
 
     const token = decrypt(cfg.access_token_encrypted);
+    // Pacote único com peso total (qtd × peso da unidade). A API "products"
+    // do Melhor Envio muitas vezes ignora quantity e cotava 1 volume.
     let { ok, data } = await meFetch(token, '/api/v2/me/shipment/calculate', {
       method: 'POST',
-      body: { from: { postal_code: fromCep }, to: { postal_code: toCep }, products },
+      body: {
+        from: { postal_code: fromCep },
+        to: { postal_code: toCep },
+        package: pkg,
+        options: { insurance_value: Math.max(20, totalIns) },
+      },
     });
     if (!ok) {
       const retry = await meFetch(token, '/api/v2/me/shipment/calculate', {
         method: 'POST',
-        body: {
-          from: { postal_code: fromCep },
-          to: { postal_code: toCep },
-          package: pkg,
-          options: { insurance_value: Math.max(20, totalIns) },
-        },
+        body: { from: { postal_code: fromCep }, to: { postal_code: toCep }, products },
       });
       ok = retry.ok;
       data = retry.data;
