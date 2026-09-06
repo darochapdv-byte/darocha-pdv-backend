@@ -53,6 +53,7 @@ function publicSettings(raw) {
     has_csc: !!raw.csc_encrypted,
     has_csc_id: !!(raw.csc_id || raw.id_token_encrypted),
     connected: raw.enabled === true && !!raw.certificate_uploaded && onlyDigits(raw.cnpj || '').length === 14 && !!(raw.address && raw.address.uf),
+    product_codes: raw.product_codes && typeof raw.product_codes === 'object' ? raw.product_codes : {},
   };
 }
 
