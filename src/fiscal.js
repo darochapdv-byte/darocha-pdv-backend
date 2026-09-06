@@ -12,8 +12,8 @@ import {
 } from './fiscal_helpers.js';
 
 const fiscal = new Hono();
-const PROVIDER = 'nuvemfiscal';
-const API_BASE = (process.env.FISCAL_API_URL || 'https://api.nuvemfiscal.com.br').replace(/\/$/, '');
+const PROVIDER = 'sefaz';
+const API_BASE = (process.env.FISCAL_API_URL || '').replace(/\/$/, '');
 const DOC_TYPE = 'fiscal_document';
 const SETTINGS_KEY = '__darocha_fiscal';
 
@@ -45,9 +45,10 @@ function publicSettings(raw) {
         : false,
     },
     provider: PROVIDER,
-    provider_company_id: raw.provider_company_id || null,
-    connected: raw.enabled === true && !!(raw.provider_company_id && raw.certificate_uploaded),
+    csc_id: raw.csc_id || '',
     has_csc: !!raw.csc_encrypted,
+    has_csc_id: !!(raw.csc_id || raw.id_token_encrypted),
+    connected: raw.enabled === true && !!raw.certificate_uploaded && onlyDigits(raw.cnpj || '').length === 14 && !!(raw.address && raw.address.uf),
   };
 }
 
@@ -117,9 +118,8 @@ function missingCompany(cfg, company) {
   if (!(cfg?.address?.uf)) miss.push('UF');
   if (!onlyDigits(cfg?.address?.cep || '').length) miss.push('CEP');
   if (!cfg?.certificate_uploaded) miss.push('Certificado A1');
-  if (!cfg?.provider_company_id && !(env('FISCAL_API_TOKEN') || env('NUVEM_FISCAL_TOKEN'))) {
-    miss.push('Token do provedor fiscal no servidor');
-  }
+  if (!cfg?.csc_encrypted) miss.push('CSC da NFC-e');
+  if (!(cfg?.csc_id || cfg?.id_token_encrypted)) miss.push('ID do CSC');
   return miss;
 }
 
@@ -284,7 +284,11 @@ fiscal.post('/fiscal-settings-save', async (c) => {
   };
   if (body._merged_codes) patch.product_codes = body._merged_codes;
   if (body.csc) patch.csc_encrypted = encryptSecret(String(body.csc));
-  if (body.id_token) patch.id_token_encrypted = encryptSecret(String(body.id_token));
+  if (body.id_token || body.csc_id) {
+    const id = String(body.csc_id || body.id_token || '').replace(/\D/g, '').slice(0, 6);
+    patch.csc_id = id;
+    if (id) patch.id_token_encrypted = encryptSecret(id);
+  }
   const saved = await saveSettings(user.id, patch);
   console.info('fiscal settings saved', { user: user.id, env: patch.environment, cnpj: patch.cnpj });
   return c.json({ ok: true, settings: publicSettings(saved) });
@@ -302,39 +306,22 @@ fiscal.post('/fiscal-certificate', async (c) => {
   const { fiscal: cfg } = await loadSettingsRow(user.id);
   if (!cfg?.cnpj) return c.json({ error: 'config', message: 'Salve o CNPJ antes de enviar o certificado.' }, 400);
   try {
-    let companyId = cfg.provider_company_id;
-    if (!companyId) {
-      const created = await providerFetch('/empresas', {
-        method: 'POST',
-        body: {
-          cpf_cnpj: onlyDigits(cfg.cnpj),
-          inscricao_estadual: cfg.ie || null,
-          nome_razao_social: cfg.legal_name,
-          nome_fantasia: cfg.trade_name || cfg.legal_name,
-          email: user.email || undefined,
-        },
-      });
-      companyId = created?.id || created?.empresa_id || created?.data?.id;
-    }
     const buf = Buffer.from(await file.arrayBuffer());
-    const fd = new FormData();
-    fd.append('certificado', new Blob([buf]), file.name || 'certificado.pfx');
-    fd.append('password', password);
-    const certRes = await providerFetch(`/empresas/${companyId}/certificado`, { method: 'PUT', form: fd });
-    const validUntil = certRes?.data_validade || certRes?.validade || certRes?.not_after || null;
+    if (!buf.length || buf.length > 80 * 1024) {
+      return c.json({ error: 'file', message: 'Arquivo .pfx inválido ou grande demais.' }, 400);
+    }
     const saved = await saveSettings(user.id, {
-      provider_company_id: companyId,
       certificate_uploaded: true,
-      certificate_valid_until: validUntil,
+      certificate_stored: 'settings',
+      pfx_encrypted: encryptSecret(buf.toString('base64')),
+      pfx_password_encrypted: encryptSecret(password),
+      pfx_bytes: buf.length,
+      certificate_valid_until: null,
     });
-    console.info('fiscal certificate uploaded', { user: user.id, companyId, validUntil });
-    return c.json({ ok: true, settings: publicSettings(saved) });
+    console.info('fiscal certificate stored locally', { user: user.id, bytes: buf.length });
+    return c.json({ ok: true, settings: publicSettings(saved), message: 'Certificado A1 guardado nesta loja (criptografado). Emissão SEFAZ ainda não está ligada.' });
   } catch (e) {
-    return c.json({
-      ok: false,
-      kind: e.code === 'provider_not_configured' ? 'config' : 'comunicacao',
-      message: e.message,
-    }, e.code === 'provider_not_configured' ? 503 : 400);
+    return c.json({ ok: false, kind: 'config', message: e.message || 'Falha ao guardar o certificado.' }, 400);
   }
 });
 
@@ -348,15 +335,11 @@ fiscal.post('/fiscal-test', async (c) => {
     return c.json({ ok: false, kind: 'config', message: 'Configuração incompleta.', missing: miss });
   }
   try {
-    if (cfg.provider_company_id) {
-      await providerFetch(`/empresas/${cfg.provider_company_id}`);
-    }
     return c.json({
       ok: true,
       environment: cfg.environment || 'homologacao',
-      message: (cfg.environment === 'producao')
-        ? 'Configuração válida para produção.'
-        : 'Ambiente de homologação — documento sem validade fiscal.',
+      sefaz_ready: false,
+      message: 'Cadastro fiscal desta loja está completo. A emissão SOAP na SEFAZ ainda não foi ligada (próxima fase). Ambiente: ' + (cfg.environment === 'producao' ? 'produção' : 'homologação') + '.',
     });
   } catch (e) {
     return c.json({ ok: false, kind: e.code === 'provider_not_configured' ? 'config' : 'comunicacao', message: e.message }, 400);
@@ -431,11 +414,28 @@ fiscal.post('/fiscal-nfce', async (c) => {
     payment_summary: mappedPay,
     created_at: new Date().toISOString(),
   };
+  if (!cfg || cfg.enabled !== true) {
+    return c.json({
+      ok: false,
+      kind: 'config',
+      message: 'Fiscal desligado nesta loja. Ligue em Configurações → Sistema → Fiscal.',
+    }, 400);
+  }
+
   const saved = await insertDocument(draft);
 
   try {
-    const payload = buildNfcePayload(cfg, sale, items, mappedPay, draft, user);
-    const created = await providerFetch('/nfce', { method: 'POST', body: payload });
+    await updateDocument(user.id, saved.id, {
+      status: 'aguardando',
+      rejection_message: 'Cadastro fiscal ok. Emissão SOAP na SEFAZ ainda não está ligada.',
+    });
+    return c.json({
+      ok: false,
+      kind: 'config',
+      sefaz_ready: false,
+      message: 'A loja está conectada no Fiscal, mas a emissão na SEFAZ ainda não foi ligada (próxima fase). A venda não foi alterada.',
+      document: sanitizeDoc({ ...draft, status: 'aguardando' }),
+    }, 200);
     const status = mapProviderStatus(created?.status || created?.situacao);
     const explained = status === 'rejeitada' ? explainSefaz(created?.codigo_status || created?.codigo, created?.motivo_status || created?.motivo) : null;
     const updated = await updateDocument(user.id, saved.id, {
