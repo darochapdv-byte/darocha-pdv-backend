@@ -554,26 +554,6 @@ fiscal.post('/fiscal-nfce', async (c) => {
       cause: explained?.cause,
       action: explained?.action,
     });
-    const status = mapProviderStatus(created?.status || created?.situacao);
-    const explained = status === 'rejeitada' ? explainSefaz(created?.codigo_status || created?.codigo, created?.motivo_status || created?.motivo) : null;
-    const updated = await updateDocument(user.id, saved.id, {
-      status,
-      provider_document_id: created?.id || created?.uuid,
-      provider_status: created?.status || created?.situacao,
-      access_key: created?.chave || created?.chave_acesso,
-      protocol: created?.protocolo,
-      number: created?.numero,
-      series: created?.serie || cfg.nfce_series,
-      rejection_code: explained?.code,
-      rejection_message: explained?.text,
-      rejection_hint: explained ? `${explained.cause} ${explained.action}` : null,
-      authorization_date: status === 'autorizada' ? new Date().toISOString() : null,
-      xml: created?.xml || null,
-      danfe_url: created?.danfe || created?.links?.danfe || null,
-      qrcode_url: created?.qrcode || created?.links?.qrcode || null,
-    });
-    console.info('fiscal nfce result', { user: user.id, saleId, status, id: saved.id });
-    return c.json({ ok: status === 'autorizada' || status === 'processando', document: sanitizeDoc(updated || { ...draft, status }), homolog: draft.environment !== 'producao' });
   } catch (e) {
     const explained = explainSefaz(e.payload?.codigo_status, e.message);
     await updateDocument(user.id, saved.id, {
