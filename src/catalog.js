@@ -12,6 +12,7 @@ import {
   getAllowZeroStock,
   buildStorePublicUrl,
   normalizeSlug,
+  loadMergedAppSettingsRpm,
 } from './helpers.js';
 
 const catalog = new Hono();
@@ -159,6 +160,12 @@ catalog.post('/catalog-data', async (c) => {
       .order('updated_at', { ascending: false })
       .limit(500);
 
+    let packCodes = {};
+    try {
+      const { rpm } = await loadMergedAppSettingsRpm(storeOwnerId);
+      packCodes = (rpm && rpm.__darocha_fiscal && rpm.__darocha_fiscal.product_codes) || {};
+    } catch (_) {}
+
     const available = (products || [])
       .filter((p) => p.active !== false && p.show_in_catalog === true)
       .map((p) => {
@@ -167,6 +174,7 @@ catalog.post('/catalog-data', async (c) => {
         const maxQty = allowZeroStock
           ? Math.max(maxQtyLimit, catalogStock)
           : Math.max(0, Math.min(catalogStock, maxQtyLimit));
+        const extra = packCodes[p.id] || packCodes[String(p.barcode || '')] || {};
         return {
           id: p.id,
           name: p.name,
@@ -179,6 +187,10 @@ catalog.post('/catalog-data', async (c) => {
           code: p.code || '',
           available: allowZeroStock || catalogStock > 0,
           max_qty: maxQty,
+          weight_g: Number(p.weight_g || extra.weight_g) || 0,
+          width: Number(p.width || extra.width) || 0,
+          height: Number(p.height || extra.height) || 0,
+          length: Number(p.length || extra.length) || 0,
         };
       });
 
