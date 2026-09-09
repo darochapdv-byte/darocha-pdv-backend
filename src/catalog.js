@@ -212,10 +212,12 @@ catalog.post('/catalog-data', async (c) => {
 
     const pauseStatus = getDeliveryPauseStatus(cfg);
     let mpConnected = false;
+    let mpPublicKey = process.env.MP_PUBLIC_KEY || null;
     try {
       const { loadMpAccount } = await import('./payments_mp.js');
       const mpAcc = await loadMpAccount(storeOwnerId);
       mpConnected = !!(mpAcc && mpAcc.status === 'connected' && mpAcc.access_token_encrypted);
+      if (mpAcc && mpAcc.public_key) mpPublicKey = mpAcc.public_key;
     } catch {}
 
     return c.json({
@@ -234,6 +236,7 @@ catalog.post('/catalog-data', async (c) => {
       store_open: (openSessions || []).length > 0,
       sell_when_closed: !!(cfg?.catalog_sell_when_closed === true || cfg?.catalog_sell_when_closed === 'true' || cfg?.role_payment_methods?.__catalog_sell_when_closed),
       mp_connected: mpConnected,
+      mp_public_key: mpPublicKey,
       store_id: storeOwnerId,
       shipping_connected: !!(cfg?.role_payment_methods?.__darocha_me?.status === 'connected'),
       delivery_paused: pauseStatus.paused,
