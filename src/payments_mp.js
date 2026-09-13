@@ -360,6 +360,7 @@ async function resolveChargeInstallments(token, {
   if (wanted <= 1) {
     return { installments: 1, issuer_id: null, plan: 'avista', mp_total: amt };
   }
+  let issuerId = null;
   const binDigits = String(bin || '').replace(/\D/g, '').slice(0, 8);
   try {
     if (binDigits.length >= 6) {
@@ -371,24 +372,19 @@ async function resolveChargeInstallments(token, {
         const costs = Array.isArray(issuer?.payer_costs) ? issuer.payer_costs : [];
         const cost = costs.find((c) => Number(c.installments) === wanted);
         if (!cost) continue;
-        const rate = Number(cost.installment_rate) || 0;
-        const total = Number(cost.total_amount);
-        const sameTotal = !Number.isFinite(total) || Math.abs(total - amt) <= 0.05;
-        if (rate === 0 && sameTotal) {
-          const issuerId = issuer?.issuer?.id ?? issuer?.issuer_id ?? null;
-          return {
-            installments: wanted,
-            issuer_id: issuerId != null ? String(issuerId) : null,
-            plan: 'sem_juros',
-            mp_total: amt,
-          };
-        }
+        issuerId = issuer?.issuer?.id ?? issuer?.issuer_id ?? issuerId;
+        break;
       }
     }
   } catch (e) {
     console.warn('mp installments lookup', e.message || e);
   }
-  return { installments: 1, issuer_id: null, plan: 'fallback_avista_sem_juros_loja', mp_total: amt };
+  return {
+    installments: wanted,
+    issuer_id: issuerId != null ? String(issuerId) : null,
+    plan: 'parcelado_valor_loja',
+    mp_total: amt,
+  };
 }
 
 
