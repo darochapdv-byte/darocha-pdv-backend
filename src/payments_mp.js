@@ -357,38 +357,43 @@ async function resolveChargeInstallments(token, {
     return { installments: 1, issuer_id: null, plan: 'avista', mp_total: amount };
   }
   const binDigits = String(bin || '').replace(/\D/g, '').slice(0, 8);
-  if (binDigits.length < 6) {
-    return { installments: 1, issuer_id: null, plan: 'fallback_avista_sem_bin', mp_total: amount };
-  }
+  let issuerId = null;
+  let mpTotal = amount;
+  let plan = 'parcelado_cliente';
   try {
-    const params = new URLSearchParams({
-      amount: String(amount),
-      bin: binDigits,
-    });
-    if (paymentMethodId) params.set('payment_method_id', String(paymentMethodId));
-    const { ok, data } = await mpFetch(token, `/v1/payment_methods/installments?${params.toString()}`);
-    const list = ok && Array.isArray(data) ? data : [];
-    for (const issuer of list) {
-      const costs = Array.isArray(issuer?.payer_costs) ? issuer.payer_costs : [];
-      const cost = costs.find((c) => Number(c.installments) === wanted);
-      if (!cost) continue;
-      const rate = Number(cost.installment_rate) || 0;
-      const total = Number(cost.total_amount);
-      const sameTotal = !Number.isFinite(total) || Math.abs(total - amount) <= 0.05;
-      if (rate === 0 && sameTotal) {
-        const issuerId = issuer?.issuer?.id ?? issuer?.issuer_id ?? null;
-        return {
-          installments: wanted,
-          issuer_id: issuerId != null ? String(issuerId) : null,
-          plan: 'sem_juros',
-          mp_total: Number.isFinite(total) ? total : amount,
-        };
+    if (binDigits.length >= 6) {
+      const params = new URLSearchParams({
+        amount: String(amount),
+        bin: binDigits,
+      });
+      if (paymentMethodId) params.set('payment_method_id', String(paymentMethodId));
+      const { ok, data } = await mpFetch(token, `/v1/payment_methods/installments?${params.toString()}`);
+      const list = ok && Array.isArray(data) ? data : [];
+      for (const issuer of list) {
+        const costs = Array.isArray(issuer?.payer_costs) ? issuer.payer_costs : [];
+        const cost = costs.find((c) => Number(c.installments) === wanted);
+        if (!cost) continue;
+        const rate = Number(cost.installment_rate) || 0;
+        const total = Number(cost.total_amount);
+        issuerId = issuer?.issuer?.id ?? issuer?.issuer_id ?? issuerId;
+        if (Number.isFinite(total) && total > 0) mpTotal = total;
+        if (rate === 0) {
+          plan = 'sem_juros';
+          break;
+        }
+        plan = 'com_juros_mp';
+        break;
       }
     }
   } catch (e) {
     console.warn('mp installments lookup', e.message || e);
   }
-  return { installments: 1, issuer_id: null, plan: 'fallback_avista_mp_juros', mp_total: amount };
+  return {
+    installments: wanted,
+    issuer_id: issuerId != null ? String(issuerId) : null,
+    plan,
+    mp_total: mpTotal,
+  };
 }
 
 
