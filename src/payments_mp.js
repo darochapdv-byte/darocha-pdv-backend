@@ -352,9 +352,13 @@ async function resolveChargeInstallments(token, {
   paymentMethodId,
   isDebit,
 }) {
-  const wanted = isDebit ? 1 : Math.max(1, Math.min(12, Number(wantedInstallments) || 1));
+  const rawWanted = isDebit ? 1 : Math.max(1, Math.min(12, Number(wantedInstallments) || 1));
+  const amt = Math.round((Number(amount) || 0) * 100) / 100;
+  const minParcela = 5;
+  const maxByMin = amt >= minParcela ? Math.max(1, Math.floor(amt / minParcela)) : 1;
+  const wanted = isDebit ? 1 : Math.min(rawWanted, maxByMin);
   if (wanted <= 1) {
-    return { installments: 1, issuer_id: null, plan: 'avista', mp_total: amount };
+    return { installments: 1, issuer_id: null, plan: rawWanted > 1 ? 'avista_valor_baixo' : 'avista', mp_total: amt };
   }
   const binDigits = String(bin || '').replace(/\D/g, '').slice(0, 8);
   let issuerId = null;
@@ -684,7 +688,7 @@ payments.post('/catalog-checkout-pix', async (c) => {
       idempotencyKey: idem,
       headers: pixHeaders,
       body: {
-        transaction_amount: amount,
+        transaction_amount: Math.round(Number(amount) * 100) / 100,
         description: `Pedido #${String(saleId).slice(-6).toUpperCase()} — Darocha Catálogo`,
         payment_method_id: 'pix',
         payer: {
