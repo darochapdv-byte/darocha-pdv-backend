@@ -1008,7 +1008,17 @@ payments.post('/catalog-checkout-card', async (c) => {
       });
       const { data: fresh } = await admin.from('sale').select('*').eq('id', saleId).maybeSingle();
       if (fresh) await notifyNewPaidOrder(fresh);
-      return c.json({ ok: true, status: 'approved', payment_id: data.id });
+      const paid = Number(data?.transaction_details?.total_paid_amount || data?.transaction_amount || amount);
+      return c.json({
+        ok: true,
+        status: 'approved',
+        payment_id: data.id,
+        amount: Number(amount),
+        charged_amount: paid,
+        mp_total_paid: paid,
+        installments,
+        charge_plan: chargePlan.plan,
+      });
     }
 
     if (status === 'rejected' || status === 'cancelled') {
