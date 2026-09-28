@@ -45,7 +45,7 @@ function readOnlinePayment(sale) {
 
 
 const MP_API = 'https://api.mercadopago.com';
-const MP_AUTH = 'https://auth.mercadopago.com.br/authorization';
+const MP_AUTH = 'https://auth.mercadopago.com/authorization';
 
 function env(name, fallback = '') {
   return String(process.env[name] || fallback).trim();
@@ -147,7 +147,7 @@ async function loadMpAccount(userId) {
       .eq('user_id', userId)
       .eq('provider', 'mercadopago')
       .maybeSingle();
-    if (data?.access_token_encrypted && data.status !== 'disconnected') {
+    if (data?.access_token_encrypted) {
       return {
         status: data.status || 'connected',
         provider_user_id: data.provider_user_id,
@@ -170,7 +170,6 @@ async function loadMpAccount(userId) {
 
   for (const r of rows || []) {
     const mp = r?.role_payment_methods?.__darocha_mp || r?.mercadopago;
-    if (mp?.status === 'disconnected') continue;
     if (mp?.access_token_encrypted || mp?.status === 'connected') {
       return mp;
     }
@@ -192,9 +191,8 @@ async function clearMpAccount(userId) {
     const current = (r.role_payment_methods && typeof r.role_payment_methods === 'object' && !Array.isArray(r.role_payment_methods))
       ? { ...r.role_payment_methods }
       : {};
-    if (current.__darocha_mp || current.mercadopago) {
-      current.__darocha_mp = { status: 'disconnected', access_token_encrypted: null, refresh_token_encrypted: null };
-      delete current.mercadopago;
+    if (current.__darocha_mp) {
+      current.__darocha_mp = { status: 'disconnected' };
       await admin.from('app_settings').update({ role_payment_methods: current }).eq('id', r.id);
     }
   }
@@ -516,7 +514,7 @@ payments.post('/mercadopago-connect', async (c) => {
       t: Date.now(),
       n: crypto.randomBytes(8).toString('hex'),
     })).toString('base64url');
-    const url = `${MP_AUTH}?client_id=${encodeURIComponent(clientId)}&response_type=code&platform_id=mp&prompt=login&state=${encodeURIComponent(state)}&redirect_uri=${encodeURIComponent(redirectUri)}`;
+    const url = `${MP_AUTH}?client_id=${encodeURIComponent(clientId)}&response_type=code&platform_id=mp&state=${encodeURIComponent(state)}&redirect_uri=${encodeURIComponent(redirectUri)}`;
     return c.json({ ok: true, url, redirect_uri: redirectUri });
   } catch (e) {
     return c.json({ error: e.message }, 500);
