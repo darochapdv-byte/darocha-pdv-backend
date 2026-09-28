@@ -45,7 +45,7 @@ function readOnlinePayment(sale) {
 
 
 const MP_API = 'https://api.mercadopago.com';
-const MP_AUTH = 'https://auth.mercadopago.com/authorization';
+const MP_AUTH = 'https://auth.mercadopago.com.br/authorization';
 
 function env(name, fallback = '') {
   return String(process.env[name] || fallback).trim();
@@ -514,7 +514,7 @@ payments.post('/mercadopago-connect', async (c) => {
       t: Date.now(),
       n: crypto.randomBytes(8).toString('hex'),
     })).toString('base64url');
-    const url = `${MP_AUTH}?client_id=${encodeURIComponent(clientId)}&response_type=code&platform_id=mp&state=${encodeURIComponent(state)}&redirect_uri=${encodeURIComponent(redirectUri)}`;
+    const url = `${MP_AUTH}?client_id=${encodeURIComponent(clientId)}&response_type=code&platform_id=mp&prompt=login&state=${encodeURIComponent(state)}&redirect_uri=${encodeURIComponent(redirectUri)}`;
     return c.json({ ok: true, url, redirect_uri: redirectUri });
   } catch (e) {
     return c.json({ error: e.message }, 500);
