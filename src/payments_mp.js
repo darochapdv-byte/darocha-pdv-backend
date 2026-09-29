@@ -1300,13 +1300,14 @@ payments.post('/mp-point-charge', async (c) => {
           terminal_id: terminalId,
           print_on_terminal: 'seller_ticket',
         },
-        payment_method: (() => {
-          const isDebit = payType === 'debit' || payType === 'debit_card';
-          const isPix = payType === 'pix' || payType === 'qr' || payType === 'bank_transfer';
-          const method = { default_type: isDebit ? 'debit_card' : (isPix ? 'qr' : 'credit_card') };
-          if (!isDebit && !isPix) method.default_installments = installments;
-          return method;
-        })(),
+        payment_method: {
+          default_type: (payType === 'debit' || payType === 'debit_card')
+            ? 'debit_card'
+            : (payType === 'pix' || payType === 'qr' || payType === 'bank_transfer')
+              ? 'qr'
+              : 'credit_card',
+          default_installments: installments,
+        },
       },
     };
 
