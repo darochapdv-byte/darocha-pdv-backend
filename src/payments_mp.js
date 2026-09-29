@@ -1286,71 +1286,34 @@ payments.post('/mp-point-charge', async (c) => {
     if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
 
     const payType = String(body.payment_type || body.type || 'credit_card');
-    const isDebit = payType === 'debit' || payType === 'debit_card';
-    const isPix = payType === 'pix' || payType === 'qr' || payType === 'bank_transfer';
-    const installments = Math.max(1, Math.min(12, Number(body.installments || body.installments_number) || 1));
+    const installments = Math.max(1, Math.min(12, Number(body.installments) || 1));
     const idem = (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`);
 
-    // Smart 2 / N950: API legado trava débito/crédito e parcelas. Pix segue na Orders (QR).
-    if (!isPix) {
-      const cents = Math.round(amount * 100);
-      const intentBody = {
-        amount: cents,
-        description: body.description || 'Venda Darocha PDV',
-        payment: {
-          type: isDebit ? 'debit_card' : 'credit_card',
-          installments: isDebit ? 1 : installments,
-          installments_cost: 'seller',
-        },
-        additional_info: {
-          external_reference: String(body.sale_id || body.external_reference || `pdv-${Date.now()}`).slice(0, 64),
-          print_on_terminal: true,
-        },
-      };
-      const created = await mpFetch(token, `/point/integration-api/devices/${encodeURIComponent(terminalId)}/payment-intents`, {
-        method: 'POST',
-        body: intentBody,
-        idempotencyKey: idem,
-      });
-      if (created.ok && (created.data?.id || created.data?.payment_intent_id)) {
-        const id = created.data.id || created.data.payment_intent_id;
-        return c.json({
-          ok: true,
-          order_id: id,
-          intent_id: id,
-          api: 'payment-intents',
-          status: 'pending',
-          terminal_id: terminalId,
-          amount,
-          installments: isDebit ? 1 : installments,
-        });
-      }
-      // se a legado falhar, tenta Orders
-      console.warn('point intent fail', created.status, created.data);
-    }
-
-    const paymentMethod = {
-      default_type: isDebit ? 'debit_card' : (isPix ? 'qr' : 'credit_card'),
-    };
-    if (!isDebit && !isPix) {
-      paymentMethod.default_installments = installments;
-      if (installments > 1) paymentMethod.installments_cost = 'seller';
-    }
     const payload = {
       type: 'point',
-      external_reference: String(body.sale_id || body.external_reference || `pdv-${Date.now()}`).slice(0, 64),
+      external_reference: String(body.sale_id || body.external_reference || `pdv-${Date.now()}`),
       expiration_time: 'PT10M',
       description: body.description || 'Venda Darocha PDV',
       transactions: { payments: [{ amount: amount.toFixed(2) }] },
       config: {
-        point: { terminal_id: terminalId, print_on_terminal: 'seller_ticket' },
-        payment_method: paymentMethod,
+        point: {
+          terminal_id: terminalId,
+          print_on_terminal: 'seller_ticket',
+        },
+        payment_method: (() => {
+          const isDebit = payType === 'debit' || payType === 'debit_card';
+          const isPix = payType === 'pix' || payType === 'qr' || payType === 'bank_transfer';
+          const method = { default_type: isDebit ? 'debit_card' : (isPix ? 'qr' : 'credit_card') };
+          if (!isDebit && !isPix) method.default_installments = installments;
+          return method;
+        })(),
       },
     };
+
     const created = await mpFetch(token, '/v1/orders', {
       method: 'POST',
       body: payload,
-      idempotencyKey: idem + '-ord',
+      idempotencyKey: idem,
     });
     if (!created.ok) {
       return c.json({
@@ -1362,12 +1325,10 @@ payments.post('/mp-point-charge', async (c) => {
     return c.json({
       ok: true,
       order_id: order.id,
-      api: 'orders',
       status: pointOrderStatus(order),
       raw_status: order.status,
       terminal_id: terminalId,
       amount,
-      installments: isPix || isDebit ? 1 : installments,
     });
   } catch (e) {
     return c.json({ error: e.message }, 500);
@@ -1379,37 +1340,18 @@ payments.post('/mp-point-status', async (c) => {
     const user = await requireUser(c);
     if (!user?.id) return c.json({ error: 'Faça login no PDV.' }, 401);
     const body = await c.req.json().catch(() => ({}));
-    const orderId = String(body.order_id || body.id || body.intent_id || '').trim();
+    const orderId = String(body.order_id || body.id || '').trim();
     if (!orderId) return c.json({ error: 'order_id obrigatório' }, 400);
     const { error, token } = await getAccessTokenForStore(user.id);
     if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
-
-    const order = await mpFetch(token, `/v1/orders/${orderId}`);
-    if (order.ok) {
-      return c.json({
-        ok: true,
-        order_id: order.data.id,
-        status: pointOrderStatus(order.data),
-        raw_status: order.data.status,
-        amount: order.data.transactions?.payments?.[0]?.amount || null,
-      });
-    }
-
-    const intent = await mpFetch(token, `/point/integration-api/payment-intents/${orderId}`);
-    if (!intent.ok) {
-      return c.json({ error: intent.data?.message || 'Não foi possível consultar a maquininha.', detail: intent.data }, intent.status || 400);
-    }
-    const st = String(intent.data?.state || intent.data?.status || '').toUpperCase();
-    let mapped = 'pending';
-    if (st === 'FINISHED' || st === 'PROCESSED' || st === 'APPROVED') mapped = 'approved';
-    else if (st === 'CANCELED' || st === 'CANCELLED' || st === 'EXPIRED' || st === 'ABANDONED') mapped = 'cancelled';
-    else if (st === 'ERROR' || st === 'FAILED') mapped = 'rejected';
+    const { ok, data, status } = await mpFetch(token, `/v1/orders/${orderId}`);
+    if (!ok) return c.json({ error: data?.message || 'Não foi possível consultar a maquininha.', detail: data }, status || 400);
     return c.json({
       ok: true,
-      order_id: intent.data.id || orderId,
-      status: mapped,
-      raw_status: intent.data.state || intent.data.status,
-      amount: intent.data.amount != null ? Number(intent.data.amount) / 100 : null,
+      order_id: data.id,
+      status: pointOrderStatus(data),
+      raw_status: data.status,
+      amount: data.transactions?.payments?.[0]?.amount || null,
     });
   } catch (e) {
     return c.json({ error: e.message }, 500);
