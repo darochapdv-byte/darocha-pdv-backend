@@ -1384,14 +1384,17 @@ payments.post('/mp-point-status', async (c) => {
     const { error, token } = await getAccessTokenForStore(user.id);
     if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
 
-    const order = await mpFetch(token, `/v1/orders/${orderId}`);
-    if (order.ok) {
-      return c.json({
-        ok: true,
-        order_id: order.data.id,
-        status: pointOrderStatus(order.data),
-        raw_status: order.data.status,
-      });
+    const looksOrder = /^ORD/i.test(orderId) || !String(orderId).includes('-');
+    if (looksOrder) {
+      const order = await mpFetch(token, `/v1/orders/${orderId}`);
+      if (order.ok && (order.data?.id || order.data?.status)) {
+        return c.json({
+          ok: true,
+          order_id: order.data.id,
+          status: pointOrderStatus(order.data),
+          raw_status: order.data.status,
+        });
+      }
     }
     const intent = await mpFetch(token, `/point/integration-api/payment-intents/${orderId}`);
     if (!intent.ok) {
