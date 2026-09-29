@@ -1297,7 +1297,7 @@ payments.post('/mp-point-charge', async (c) => {
         type: isDebit ? 'debit_card' : 'credit_card',
         installments,
       };
-      if (!isDebit && installments > 1) payment.installments_cost = 'seller';
+      if (!isDebit) payment.installments_cost = 'seller';
       const created = await mpFetch(
         token,
         `/point/integration-api/devices/${encodeURIComponent(terminalId)}/payment-intents`,
@@ -1336,7 +1336,7 @@ payments.post('/mp-point-charge', async (c) => {
     };
     if (!isDebit && !isPix) {
       paymentMethod.default_installments = installments;
-      if (installments > 1) paymentMethod.installments_cost = 'seller';
+      paymentMethod.installments_cost = 'seller';
     }
     const created = await mpFetch(token, '/v1/orders', {
       method: 'POST',
