@@ -1229,7 +1229,7 @@ function pointOrderStatus(order) {
   const st = String(order?.status || order?.status_detail || '').toLowerCase();
   const pay = order?.transactions?.payments?.[0] || order?.transactions?.payments?.[0] || {};
   const paySt = String(pay.status || '').toLowerCase();
-  if (st === 'processed' || paySt === 'processed' || paySt === 'approved') return 'approved';
+  if (['processed','approved','accredited','authorized','closed','finished','paid'].includes(st) || ['processed','approved','accredited','authorized'].includes(paySt)) return 'approved';
   if (st === 'canceled' || st === 'cancelled' || paySt === 'cancelled') return 'cancelled';
   if (st === 'expired' || st === 'failed' || paySt === 'rejected' || paySt === 'failed') return 'rejected';
   return 'pending';
