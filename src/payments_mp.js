@@ -1300,13 +1300,18 @@ payments.post('/mp-point-charge', async (c) => {
           terminal_id: terminalId,
           print_on_terminal: 'seller_ticket',
         },
-        payment_method: {
-          default_type: (payType === 'debit' || payType === 'debit_card')
-            ? 'debit_card'
-            : (payType === 'pix' || payType === 'qr' || payType === 'bank_transfer')
-              ? 'qr'
-              : 'credit_card',
-        },
+        payment_method: (() => {
+          const isDebit = payType === 'debit' || payType === 'debit_card';
+          const isPix = payType === 'pix' || payType === 'qr' || payType === 'bank_transfer';
+          const method = {
+            default_type: isDebit ? 'debit_card' : (isPix ? 'qr' : 'credit_card'),
+          };
+          // credito 1x: forca a vista para valores >= R$5 (abaixo disso a Point ja nao parcela)
+          if (!isDebit && !isPix && installments <= 1) {
+            method.default_installments = 1;
+          }
+          return method;
+        })(),
       },
     };
 
