@@ -1288,25 +1288,42 @@ payments.post('/mp-point-charge', async (c) => {
 
     const payType = String(body.payment_type || body.type || 'credit_card');
     const installments = Math.max(1, Math.min(12, Number(body.installments) || 1));
+    const isDebit = payType === 'debit' || payType === 'debit_card';
+    const isPix = payType === 'pix' || payType === 'qr' || payType === 'bank_transfer';
     const idem = (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`);
+    const external = String(body.sale_id || body.external_reference || `pdv-${Date.now()}`);
+
+    if (!isDebit && !isPix) {
+      const intent = await mpFetch(token, `/point/integration-api/devices/${encodeURIComponent(terminalId)}/payment-intents`, {
+        method: 'POST',
+        body: {
+          amount: Math.round(amount * 100),
+          description: body.description || 'Venda Darocha PDV',
+          additional_info: { external_reference: external, print_on_terminal: true },
+          payment: {
+            type: 'credit_card',
+            installments,
+            installments_cost: 'seller',
+          },
+        },
+        idempotencyKey: idem,
+      });
+      if (intent.ok && (intent.data?.id || intent.data?.payment_intent_id)) {
+        const id = intent.data.id || intent.data.payment_intent_id;
+        return c.json({ ok: true, order_id: id, intent_id: id, status: 'pending', via: 'intent', terminal_id: terminalId, amount, installments });
+      }
+    }
 
     const payload = {
       type: 'point',
-      external_reference: String(body.sale_id || body.external_reference || `pdv-${Date.now()}`),
+      external_reference: external,
       expiration_time: 'PT10M',
       description: body.description || 'Venda Darocha PDV',
       transactions: { payments: [{ amount: amount.toFixed(2) }] },
       config: {
-        point: {
-          terminal_id: terminalId,
-          print_on_terminal: 'seller_ticket',
-        },
+        point: { terminal_id: terminalId, print_on_terminal: 'seller_ticket' },
         payment_method: (() => {
-          const isDebit = payType === 'debit' || payType === 'debit_card';
-          const isPix = payType === 'pix' || payType === 'qr' || payType === 'bank_transfer';
-          const method = {
-            default_type: isDebit ? 'debit_card' : (isPix ? 'qr' : 'credit_card'),
-          };
+          const method = { default_type: isDebit ? 'debit_card' : (isPix ? 'qr' : 'credit_card') };
           if (!isDebit && !isPix) {
             method.default_installments = installments;
             method.installments_cost = 'seller';
@@ -1315,27 +1332,12 @@ payments.post('/mp-point-charge', async (c) => {
         })(),
       },
     };
-
-    const created = await mpFetch(token, '/v1/orders', {
-      method: 'POST',
-      body: payload,
-      idempotencyKey: idem,
-    });
+    const created = await mpFetch(token, '/v1/orders', { method: 'POST', body: payload, idempotencyKey: idem + '-ord' });
     if (!created.ok) {
-      return c.json({
-        error: created.data?.message || created.data?.error || 'Não foi possível enviar a cobrança para a maquininha.',
-        detail: created.data,
-      }, created.status || 400);
+      return c.json({ error: created.data?.message || created.data?.error || 'Não foi possível enviar a cobrança para a maquininha.', detail: created.data }, created.status || 400);
     }
     const order = created.data || {};
-    return c.json({
-      ok: true,
-      order_id: order.id,
-      status: pointOrderStatus(order),
-      raw_status: order.status,
-      terminal_id: terminalId,
-      amount,
-    });
+    return c.json({ ok: true, order_id: order.id, status: pointOrderStatus(order), raw_status: order.status, terminal_id: terminalId, amount });
   } catch (e) {
     return c.json({ error: e.message }, 500);
   }
@@ -1350,6 +1352,12 @@ payments.post('/mp-point-status', async (c) => {
     if (!orderId) return c.json({ error: 'order_id obrigatório' }, 400);
     const { error, token } = await getAccessTokenForStore(user.id);
     if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
+    const intent = await mpFetch(token, `/point/integration-api/payment-intents/${encodeURIComponent(orderId)}`);
+    if (intent.ok && intent.data) {
+      const st = String(intent.data.state || intent.data.status || '').toLowerCase();
+      const mapped = (st === 'finished' || st === 'processed' || st === 'approved') ? 'approved' : (st === 'canceled' || st === 'cancelled' || st === 'error' || st === 'abandoned' ? 'cancelled' : 'pending');
+      return c.json({ ok: true, order_id: intent.data.id || orderId, status: mapped, raw_status: st, via: 'intent' });
+    }
     const { ok, data, status } = await mpFetch(token, `/v1/orders/${orderId}`);
     if (!ok) return c.json({ error: data?.message || 'Não foi possível consultar a maquininha.', detail: data }, status || 400);
     return c.json({
