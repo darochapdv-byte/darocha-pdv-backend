@@ -1293,26 +1293,18 @@ payments.post('/mp-point-charge', async (c) => {
     const idem = (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`);
     const external = String(body.sale_id || body.external_reference || `pdv-${Date.now()}`);
 
-    if (!isDebit && !isPix) {
-      const intent = await mpFetch(token, `/point/integration-api/devices/${encodeURIComponent(terminalId)}/payment-intents`, {
-        method: 'POST',
-        body: {
-          amount: Math.round(amount * 100),
-          description: body.description || 'Venda Darocha PDV',
-          additional_info: { external_reference: external, print_on_terminal: true },
-          payment: Object.assign({
-            type: 'credit_card',
-            installments,
-          }, installments > 1 ? { installments_cost: 'seller' } : {}),
-        },
-        idempotencyKey: idem,
+    try {
+      await mpFetch(token, '/terminals/v1/setup', {
+        method: 'PATCH',
+        body: { terminals: [{ id: terminalId, operating_mode: 'PDV' }] },
       });
-      if (intent.ok && (intent.data?.id || intent.data?.payment_intent_id)) {
-        const id = intent.data.id || intent.data.payment_intent_id;
-        return c.json({ ok: true, order_id: id, intent_id: id, status: 'pending', via: 'intent', terminal_id: terminalId, amount, installments });
-      }
-    }
+    } catch (e) {}
 
+    const paymentMethod = { default_type: isDebit ? 'debit_card' : (isPix ? 'qr' : 'credit_card') };
+    if (!isDebit && !isPix) {
+      paymentMethod.default_installments = installments;
+      if (installments > 1) paymentMethod.installments_cost = 'seller';
+    }
     const payload = {
       type: 'point',
       external_reference: external,
@@ -1321,22 +1313,25 @@ payments.post('/mp-point-charge', async (c) => {
       transactions: { payments: [{ amount: amount.toFixed(2) }] },
       config: {
         point: { terminal_id: terminalId, print_on_terminal: 'seller_ticket' },
-        payment_method: (() => {
-          const method = { default_type: isDebit ? 'debit_card' : (isPix ? 'qr' : 'credit_card') };
-          if (!isDebit && !isPix) {
-            method.default_installments = installments;
-            if (installments > 1) method.installments_cost = 'seller';
-          }
-          return method;
-        })(),
+        payment_method: paymentMethod,
       },
     };
-    const created = await mpFetch(token, '/v1/orders', { method: 'POST', body: payload, idempotencyKey: idem + '-ord' });
+    const created = await mpFetch(token, '/v1/orders', { method: 'POST', body: payload, idempotencyKey: idem });
     if (!created.ok) {
       return c.json({ error: created.data?.message || created.data?.error || 'Não foi possível enviar a cobrança para a maquininha.', detail: created.data }, created.status || 400);
     }
     const order = created.data || {};
-    return c.json({ ok: true, order_id: order.id, status: pointOrderStatus(order), raw_status: order.status, terminal_id: terminalId, amount });
+    const echoed = order.config?.payment_method || paymentMethod;
+    return c.json({
+      ok: true,
+      order_id: order.id,
+      status: pointOrderStatus(order),
+      raw_status: order.status,
+      terminal_id: terminalId,
+      amount,
+      installments,
+      payment_method: echoed,
+    });
   } catch (e) {
     return c.json({ error: e.message }, 500);
   }
