@@ -1293,13 +1293,6 @@ payments.post('/mp-point-charge', async (c) => {
     const idem = (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`);
     const external = String(body.sale_id || body.external_reference || `pdv-${Date.now()}`);
 
-    try {
-      await mpFetch(token, '/terminals/v1/setup', {
-        method: 'PATCH',
-        body: { terminals: [{ id: terminalId, operating_mode: 'PDV' }] },
-      });
-    } catch (e) {}
-
     const paymentMethod = { default_type: isDebit ? 'debit_card' : (isPix ? 'qr' : 'credit_card') };
     if (!isDebit && !isPix) {
       paymentMethod.default_installments = installments;
