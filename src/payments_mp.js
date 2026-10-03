@@ -1307,9 +1307,9 @@ payments.post('/mp-point-charge', async (c) => {
           const method = {
             default_type: isDebit ? 'debit_card' : (isPix ? 'qr' : 'credit_card'),
           };
-          // credito 1x: forca a vista para valores >= R$5 (abaixo disso a Point ja nao parcela)
-          if (!isDebit && !isPix && installments <= 1) {
-            method.default_installments = 1;
+          if (!isDebit && !isPix) {
+            method.default_installments = installments;
+            method.installments_cost = 'seller';
           }
           return method;
         })(),
