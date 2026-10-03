@@ -1300,11 +1300,10 @@ payments.post('/mp-point-charge', async (c) => {
           amount: Math.round(amount * 100),
           description: body.description || 'Venda Darocha PDV',
           additional_info: { external_reference: external, print_on_terminal: true },
-          payment: {
+          payment: Object.assign({
             type: 'credit_card',
             installments,
-            installments_cost: 'seller',
-          },
+          }, installments > 1 ? { installments_cost: 'seller' } : {}),
         },
         idempotencyKey: idem,
       });
@@ -1326,7 +1325,7 @@ payments.post('/mp-point-charge', async (c) => {
           const method = { default_type: isDebit ? 'debit_card' : (isPix ? 'qr' : 'credit_card') };
           if (!isDebit && !isPix) {
             method.default_installments = installments;
-            method.installments_cost = 'seller';
+            if (installments > 1) method.installments_cost = 'seller';
           }
           return method;
         })(),
