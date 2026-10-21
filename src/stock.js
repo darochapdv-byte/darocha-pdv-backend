@@ -60,10 +60,9 @@ stock.post('/stock-count-search', async (c) => {
     if (q.length < 1) return c.json({ products: [] });
 
     let products = [];
-
-    // Mesmo caminho do CRUD de Product (admin + tenant)
+    const safe = q.replace(/[%_,]/g, '');
     if (admin) {
-      let pq = admin.from('product').select('*').limit(10000);
+      let pq = admin.from('product').select('*').or(`name.ilike.%${safe}%,barcode.ilike.%${safe}%,code.ilike.%${safe}%,sku.ilike.%${safe}%,brand.ilike.%${safe}%`).limit(50);
       if (user?.id) pq = pq.eq('created_by', user.id);
       const { data, error } = await pq;
       if (error) console.warn('stock-count-search admin', error.message);
