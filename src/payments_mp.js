@@ -1430,10 +1430,12 @@ payments.post('/payment-link', async (c) => {
     if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
     const ref = String(body.external_reference || `pdv-link-${user.id.slice(0, 8)}-${Date.now()}`);
     const title = String(body.description || body.title || 'Pagamento Darocha PDV').slice(0, 80);
+    const installments = Math.max(1, Math.min(12, Number(body.installments) || 1));
     const { ok, data } = await mpFetch(token, '/checkout/preferences', {
       method: 'POST',
       body: {
         items: [{ title, quantity: 1, currency_id: 'BRL', unit_price: amount }],
+        payment_methods: { installments, default_installments: installments },
         external_reference: ref,
         notification_url: env('MP_WEBHOOK_URL') || 'https://darocha-pdv-backend.onrender.com/functions/mercadopago-webhook',
         back_urls: {
