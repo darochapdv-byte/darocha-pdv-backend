@@ -56,63 +56,62 @@ stock.post('/stock-count-search', async (c) => {
     const user = await requireUser(c);
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
     const body = await c.req.json().catch(() => ({}));
-    const q = String(body.query || body.q || '').trim().toLowerCase();
+    const raw = String(body.query || body.q || '').trim();
+    const q = raw.toLowerCase();
     if (q.length < 1) return c.json({ products: [] });
+    const fold = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    const qf = fold(raw);
+    const digits = raw.replace(/\D/g, '');
+
+    const mapRow = (p) => ({
+      id: p.id,
+      name: p.name,
+      barcode: p.barcode,
+      code: p.code,
+      brand: p.brand,
+      category: p.category,
+      stock: p.stock,
+      sale_price: p.sale_price,
+      image_url: p.image_url || p.image || '',
+    });
+    const hit = (p) => {
+      const fields = [p.name, p.barcode, p.code, p.sku, p.brand, p.reference].map(fold);
+      const raws = [p.barcode, p.code, p.sku, p.reference].map((v) => String(v || '').replace(/\D/g, ''));
+      return fields.some((f) => f.includes(qf)) || (digits.length >= 4 && raws.some((d) => d.includes(digits)));
+    };
 
     let products = [];
-    const safe = q.replace(/[%_,]/g, '');
-    if (admin) {
-      let pq = admin.from('product').select('*').or(`name.ilike.%${safe}%,barcode.ilike.%${safe}%,code.ilike.%${safe}%,sku.ilike.%${safe}%,brand.ilike.%${safe}%`).limit(50);
-      if (user?.id) pq = pq.eq('created_by', user.id);
-      const { data, error } = await pq;
-      if (error) console.warn('stock-count-search admin', error.message);
-      products = data || [];
-    }
-
-    if (!products.length) {
-      try {
-        const pathQ = user?.id
-          ? `product?created_by=eq.${encodeURIComponent(user.id)}&select=*&limit=10000`
-          : `product?select=*&limit=10000`;
-        const rows = await restQuery(pathQ);
-        if (Array.isArray(rows)) products = rows;
-      } catch (e) {
-        console.warn('stock-count-search rest', e.message);
+    if (admin && user?.id) {
+      const safe = q.replace(/[%_,.()]/g, '');
+      const cols = ['name', 'barcode', 'code', 'sku', 'brand', 'reference'];
+      for (const col of cols) {
+        const { data } = await admin.from('product').select('*').eq('created_by', user.id).ilike(col, `%${safe}%`).limit(40);
+        if (data?.length) products.push(...data);
+      }
+      if (digits && digits !== safe) {
+        const { data } = await admin.from('product').select('*').eq('created_by', user.id).ilike('barcode', `%${digits}%`).limit(40);
+        if (data?.length) products.push(...data);
       }
     }
 
-    const matched = products
-      .filter((p) => {
-        const name = String(p.name || '').toLowerCase();
-        const barcode = String(p.barcode || '').toLowerCase();
-        const code = String(p.code || '').toLowerCase();
-        const brand = String(p.brand || '').toLowerCase();
-        const sku = String(p.sku || '').toLowerCase();
-        const ref = String(p.reference || '').toLowerCase();
-        return (
-          name.includes(q) ||
-          barcode.includes(q) ||
-          code.includes(q) ||
-          brand.includes(q) ||
-          sku.includes(q) ||
-          ref.includes(q)
-        );
-      })
-      .slice(0, 50)
-      .map((p) => ({
-        id: p.id,
-        name: p.name,
-        barcode: p.barcode,
-        code: p.code,
-        brand: p.brand,
-        category: p.category,
-        stock: p.stock,
-        sale_price: p.sale_price,
-        cost_price: p.cost_price,
-        image_url: p.image_url,
-        active: p.active,
-      }));
+    const seen = new Set(products.map((p) => p.id));
+    if (products.filter(hit).length < 1 && admin && user?.id) {
+      for (let from = 0; from < 20000; from += 1000) {
+        const { data, error } = await admin.from('product').select('*').eq('created_by', user.id).range(from, from + 999);
+        if (error || !data?.length) break;
+        for (const p of data) if (!seen.has(p.id) && hit(p)) { products.push(p); seen.add(p.id); }
+        if (data.length < 1000) break;
+      }
+    }
 
+    const matched = [];
+    const ids = new Set();
+    for (const p of products) {
+      if (!p || ids.has(p.id) || !hit(p)) continue;
+      ids.add(p.id);
+      matched.push(mapRow(p));
+      if (matched.length >= 40) break;
+    }
     return c.json({ products: matched });
   } catch (error) {
     return c.json({ error: error.message }, 500);
