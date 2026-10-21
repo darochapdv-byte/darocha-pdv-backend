@@ -1419,6 +1419,69 @@ payments.post('/pdv-pix-create', async (c) => {
   }
 });
 
+payments.post('/payment-link', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Faça login no PDV.' }, 401);
+    const body = await c.req.json().catch(() => ({}));
+    const amount = Math.round(Number(body.amount || body.total || 0) * 100) / 100;
+    if (!(amount > 0)) return c.json({ error: 'Valor inválido' }, 400);
+    const { error, token } = await getAccessTokenForStore(user.id);
+    if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
+    const ref = String(body.external_reference || `pdv-link-${user.id.slice(0, 8)}-${Date.now()}`);
+    const title = String(body.description || body.title || 'Pagamento Darocha PDV').slice(0, 80);
+    const { ok, data } = await mpFetch(token, '/checkout/preferences', {
+      method: 'POST',
+      body: {
+        items: [{ title, quantity: 1, currency_id: 'BRL', unit_price: amount }],
+        external_reference: ref,
+        notification_url: env('MP_WEBHOOK_URL') || 'https://darocha-pdv-backend.onrender.com/functions/mercadopago-webhook',
+        back_urls: {
+          success: 'https://darochapdv.com',
+          pending: 'https://darochapdv.com',
+          failure: 'https://darochapdv.com',
+        },
+        auto_return: 'approved',
+        statement_descriptor: 'DAROCHA',
+      },
+    });
+    if (!ok) return c.json({ error: data.message || data.error || 'Falha ao criar link', details: data }, 400);
+    return c.json({
+      ok: true,
+      preference_id: data.id,
+      init_point: data.init_point,
+      sandbox_init_point: data.sandbox_init_point,
+      external_reference: ref,
+      amount,
+    });
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
+  }
+});
+
+payments.post('/payment-link-status', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ error: 'Faça login no PDV.' }, 401);
+    const body = await c.req.json().catch(() => ({}));
+    const ref = String(body.external_reference || '').trim();
+    if (!ref) return c.json({ error: 'external_reference obrigatório' }, 400);
+    const { error, token } = await getAccessTokenForStore(user.id);
+    if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
+    const { ok, data } = await mpFetch(token, '/v1/payments/search?external_reference=' + encodeURIComponent(ref) + '&sort=date_created&criteria=desc');
+    if (!ok) return c.json({ error: data.message || 'Falha ao consultar', details: data }, 400);
+    const pay = (data.results || [])[0] || null;
+    return c.json({
+      ok: true,
+      status: pay ? pay.status : 'pending',
+      payment_id: pay ? pay.id : null,
+      amount: pay ? pay.transaction_amount : null,
+    });
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
+  }
+});
+
 payments.post('/pdv-pix-status', async (c) => {
   try {
     const user = await requireUser(c);
