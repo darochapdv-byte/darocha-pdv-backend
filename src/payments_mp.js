@@ -1467,12 +1467,24 @@ payments.post('/payment-link-status', async (c) => {
     if (!user?.id) return c.json({ error: 'Faça login no PDV.' }, 401);
     const body = await c.req.json().catch(() => ({}));
     const ref = String(body.external_reference || '').trim();
-    if (!ref) return c.json({ error: 'external_reference obrigatório' }, 400);
+    const pref = String(body.preference_id || '').trim();
+    if (!ref && !pref) return c.json({ error: 'external_reference obrigatório' }, 400);
     const { error, token } = await getAccessTokenForStore(user.id);
     if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
-    const { ok, data } = await mpFetch(token, '/v1/payments/search?external_reference=' + encodeURIComponent(ref) + '&sort=date_created&criteria=desc');
-    if (!ok) return c.json({ error: data.message || 'Falha ao consultar', details: data }, 400);
-    const pay = (data.results || [])[0] || null;
+    let pay = null;
+    if (ref) {
+      const { ok, data } = await mpFetch(token, '/v1/payments/search?external_reference=' + encodeURIComponent(ref) + '&sort=date_created&criteria=desc');
+      if (ok) pay = (data.results || [])[0] || null;
+    }
+    if (!pay && pref) {
+      const orders = await mpFetch(token, '/merchant_orders/search?preference_id=' + encodeURIComponent(pref));
+      const order = orders.ok ? ((orders.data.elements || [])[0] || null) : null;
+      const paid = order && (order.order_status === 'paid' || (order.payments || []).some(p => p.status === 'approved'));
+      if (paid) {
+        const approved = (order.payments || []).find(p => p.status === 'approved') || {};
+        return c.json({ ok: true, status: 'approved', payment_id: approved.id || null, amount: order.total_amount || null });
+      }
+    }
     return c.json({
       ok: true,
       status: pay ? pay.status : 'pending',
