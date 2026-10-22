@@ -10,6 +10,27 @@ import { requireUser, loadMergedAppSettingsRpm, mergeRolePaymentMethods } from '
 const payments = new Hono();
 
 /** Campos extras de pagamento online sem colunas novas no banco */
+
+async function notifyPixPaid(sale, amount) {
+  try {
+    if (!admin || !sale) return;
+    const total = Number(amount || sale.total || 0);
+    const msg = 'R$ ' + total.toFixed(2).replace('.', ',') + ' · clique para imprimir a notinha';
+    const since = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    const { data: dup } = await admin.from('notification').select('id').eq('sale_id', sale.id).gte('created_at', since).limit(1);
+    if (dup && dup.length) return;
+    await admin.from('notification').insert({
+      title: 'Pagamento recebido · Pix',
+      message: msg,
+      sale_id: sale.id,
+      type: 'pagamento_pix',
+      delivery_type: sale.delivery_type || '',
+      read: false,
+      created_by: sale.created_by || null
+    });
+  } catch (e) {}
+}
+
 function encodeOnlinePaymentFields({ payment_status, mp_payment_id, payment_meta, paid_at, status } = {}) {
   const out = {};
   if (status) out.status = status;
@@ -1081,6 +1102,7 @@ payments.post('/catalog-checkout-status', async (c) => {
             payment_meta: { ...((readOnlinePayment(sale).payment_meta) || {}), status: 'approved', payment_id: data.id },
           });
           const { data: fresh } = await admin.from('sale').select('*').eq('id', saleId).maybeSingle();
+          await notifyPixPaid(fresh || sale, (fresh||sale).total);
           if (fresh) await notifyNewPaidOrder(fresh);
           return c.json({ ok: true, status: 'approved', payment_status: 'paid', sale_id: saleId });
         }
