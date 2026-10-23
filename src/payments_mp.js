@@ -1161,7 +1161,7 @@ payments.post('/mercadopago-webhook', async (c) => {
       const { data: recent } = await admin
         .from('sale')
         .select('*')
-        .eq('source', 'catalog')
+        .in('source', ['catalog','pdv'])
         .in('status', ['pending_payment', 'orcamento', 'cancelada'])
         .order('created_at', { ascending: false })
         .limit(50);
@@ -1212,6 +1212,8 @@ payments.post('/mercadopago-webhook', async (c) => {
             webhook_at: new Date().toISOString(),
           },
         });
+        await notifyPixPaid(sale, sale.total);
+
         const { data: fresh } = await admin.from('sale').select('*').eq('id', sale.id).maybeSingle();
         if (fresh) await notifyNewPaidOrder(fresh);
       }
@@ -1427,6 +1429,22 @@ payments.post('/pdv-pix-create', async (c) => {
     });
     if (!ok) return c.json({ error: data.message || data.error || 'Falha ao criar Pix', details: data }, 400);
     const tx = data.point_of_interaction?.transaction_data || {};
+    try {
+      const items = Array.isArray(body.items) && body.items.length ? body.items : [{ name: 'Venda PDV', qty: 1, unit_price: amount, total: amount }];
+      await admin.from('sale').insert({
+        created_by: user.id,
+        customer_name: body.customer_name || 'Consumidor final',
+        items,
+        subtotal: amount,
+        total: amount,
+        payment_method: 'pix',
+        status: 'pending_payment',
+        delivery_type: body.delivery_type || 'levar_agora',
+        source: 'pdv',
+        client_ref: String(data.id),
+        notes: 'pix:' + String(data.id)
+      });
+    } catch (e) { console.warn('pending pix sale', e.message); }
     return c.json({
       ok: true,
       payment_id: data.id,
@@ -1515,6 +1533,31 @@ payments.post('/payment-link-status', async (c) => {
     });
   } catch (e) {
     return c.json({ error: e.message }, 500);
+  }
+});
+
+
+payments.post('/pdv-pix-sweep', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user?.id) return c.json({ ok: false }, 401);
+    const { data: pending } = await admin.from('sale').select('*').eq('created_by', user.id).eq('status', 'pending_payment').eq('payment_method', 'pix').order('created_at', { ascending: false }).limit(10);
+    const { token } = await getAccessTokenForStore(user.id);
+    if (!token) return c.json({ ok: true, checked: 0 });
+    let done = 0;
+    for (const sale of pending || []) {
+      const pid = String(sale.client_ref || '').replace(/^pix:/, '');
+      if (!pid) continue;
+      const { ok, data } = await mpFetch(token, '/v1/payments/' + pid);
+      if (ok && data && data.status === 'approved' && sale.status !== 'concluida') {
+        await updateSalePaid(sale.id, { mp_payment_id: pid, payment_method: 'pix' });
+        await notifyPixPaid(sale, sale.total);
+        done++;
+      }
+    }
+    return c.json({ ok: true, done });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message });
   }
 });
 
