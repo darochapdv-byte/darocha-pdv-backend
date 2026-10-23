@@ -1550,7 +1550,7 @@ payments.post('/pdv-pix-sweep', async (c) => {
       if (!pid) continue;
       const { ok, data } = await mpFetch(token, '/v1/payments/' + pid);
       if (ok && data && data.status === 'approved' && sale.status !== 'concluida') {
-        await updateSalePaid(sale.id, { mp_payment_id: pid, payment_method: 'pix' });
+        await updateSalePaid(sale.id, { mp_payment_id: pid, payment_method: 'pix', status: 'concluida' });
         await notifyPixPaid(sale, sale.total);
         done++;
       }
