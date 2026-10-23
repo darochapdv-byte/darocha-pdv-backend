@@ -17,7 +17,7 @@ async function notifyPixPaid(sale, amount) {
     const total = Number(amount || sale.total || 0);
     const msg = 'R$ ' + total.toFixed(2).replace('.', ',') + ' · clique para imprimir a notinha';
     const since = new Date(Date.now() - 2 * 60 * 1000).toISOString();
-    const { data: dup } = await admin.from('notification').select('id').eq('sale_id', sale.id).limit(1);
+    const { data: dup } = await admin.from('notification').select('id').eq('sale_id', sale.id).gte('created_at', since).limit(1);
     if (dup && dup.length) return;
     await admin.from('notification').insert({
       title: 'Pagamento recebido · Pix',
@@ -1430,25 +1430,43 @@ payments.post('/pdv-pix-create', async (c) => {
     if (!ok) return c.json({ error: data.message || data.error || 'Falha ao criar Pix', details: data }, 400);
     const tx = data.point_of_interaction?.transaction_data || {};
     try {
-      const items = Array.isArray(body.items) && body.items.length ? body.items : [{ name: 'Venda PDV', qty: 1, unit_price: amount, total: amount }];
-      const saleId = String(body.sale_id || body.external_reference || '').trim();
-      const row = {
+      const items = Array.isArray(body.items) && body.items.length
+        ? body.items.map((it) => ({
+            product_id: it.product_id || it.id || null,
+            name: String(it.name || 'Produto').trim() || 'Produto',
+            qty: Number(it.qty || it.quantity || 1) || 1,
+            unit_price: Number(it.unit_price || it.price || 0) || 0,
+            total: Number(it.total || ((Number(it.qty || 1) || 1) * (Number(it.unit_price || it.price || 0) || 0))) || 0,
+            discount: Number(it.discount || 0) || 0,
+          }))
+        : [{ name: 'Venda PDV', qty: 1, unit_price: amount, total: amount, discount: 0 }];
+      const subtotal = Math.round((Number(body.subtotal) || items.reduce((s, it) => s + Number(it.total || 0), 0) || amount) * 100) / 100;
+      const realNotes = String(body.notes || '').replace(/^pix:\d+$/i, '').trim();
+      await admin.from('sale').insert({
+        created_by: user.id,
         customer_name: body.customer_name || 'Consumidor final',
+        customer_phone: body.customer_phone || '',
         items,
-        subtotal: amount,
+        subtotal,
+        discount: Number(body.discount || 0) || 0,
         total: amount,
         payment_method: 'pix',
         status: 'pending_payment',
         delivery_type: body.delivery_type || 'levar_agora',
-        delivery_address: body.delivery_address || null,
-        delivery_number: body.delivery_number || null,
-        delivery_neighborhood: body.delivery_neighborhood || null,
-        delivery_city: body.delivery_city || null,
+        delivery_address: body.delivery_address || '',
+        delivery_number: body.delivery_number || '',
+        delivery_neighborhood: body.delivery_neighborhood || '',
+        delivery_complement: body.delivery_complement || '',
+        delivery_reference: body.delivery_reference || '',
+        delivery_cep: body.delivery_cep || '',
+        delivery_person: body.delivery_person || '',
+        delivery_fee: Number(body.delivery_fee || 0) || 0,
+        operator_name: body.operator_name || '',
+        seller_name: body.seller_name || body.operator_name || '',
+        source: 'pdv',
         client_ref: String(data.id),
-        notes: null
-      };
-      if (saleId) await admin.from('sale').update(row).eq('id', saleId);
-      else await admin.from('sale').insert(Object.assign({ created_by: user.id, source: 'pdv' }, row));
+        notes: realNotes || null,
+      });
     } catch (e) { console.warn('pending pix sale', e.message); }
     return c.json({
       ok: true,
@@ -1494,25 +1512,44 @@ payments.post('/payment-link', async (c) => {
     });
     if (!ok) return c.json({ error: data.message || data.error || 'Falha ao criar link', details: data }, 400);
     try {
-      const items = Array.isArray(body.items) && body.items.length ? body.items : [{ name: 'Venda PDV', qty: 1, unit_price: amount, total: amount }];
-      const saleId = String(body.sale_id || body.external_reference || '').trim();
-      const row = {
+      const items = Array.isArray(body.items) && body.items.length
+        ? body.items.map((it) => ({
+            product_id: it.product_id || it.id || null,
+            name: String(it.name || 'Produto').trim() || 'Produto',
+            qty: Number(it.qty || it.quantity || 1) || 1,
+            unit_price: Number(it.unit_price || it.price || 0) || 0,
+            total: Number(it.total || ((Number(it.qty || 1) || 1) * (Number(it.unit_price || it.price || 0) || 0))) || 0,
+            discount: Number(it.discount || 0) || 0,
+          }))
+        : [{ name: 'Venda PDV', qty: 1, unit_price: amount, total: amount, discount: 0 }];
+      const subtotal = Math.round((Number(body.subtotal) || items.reduce((s, it) => s + Number(it.total || 0), 0) || amount) * 100) / 100;
+      const realNotes = String(body.notes || '').replace(/^pix:\d+$/i, '').replace(/^link:/i, '').trim();
+      await admin.from('sale').insert({
+        created_by: user.id,
         customer_name: body.customer_name || 'Consumidor final',
+        customer_phone: body.customer_phone || '',
         items,
-        subtotal: amount,
+        subtotal,
+        discount: Number(body.discount || 0) || 0,
         total: amount,
         payment_method: 'link',
         status: 'pending_payment',
         delivery_type: body.delivery_type || 'levar_agora',
-        delivery_address: body.delivery_address || null,
-        delivery_number: body.delivery_number || null,
-        delivery_neighborhood: body.delivery_neighborhood || null,
-        delivery_city: body.delivery_city || null,
-        client_ref: String(data.id),
-        notes: null
-      };
-      if (saleId) await admin.from('sale').update(row).eq('id', saleId);
-      else await admin.from('sale').insert(Object.assign({ created_by: user.id, source: 'pdv' }, row));
+        delivery_address: body.delivery_address || '',
+        delivery_number: body.delivery_number || '',
+        delivery_neighborhood: body.delivery_neighborhood || '',
+        delivery_complement: body.delivery_complement || '',
+        delivery_reference: body.delivery_reference || '',
+        delivery_cep: body.delivery_cep || '',
+        delivery_person: body.delivery_person || '',
+        delivery_fee: Number(body.delivery_fee || 0) || 0,
+        operator_name: body.operator_name || '',
+        seller_name: body.seller_name || body.operator_name || '',
+        source: 'pdv',
+        client_ref: ref,
+        notes: realNotes || null,
+        installments,
+      });
     } catch (e) { console.warn('pending link sale', e.message); }
     return c.json({
       ok: true,
@@ -1548,24 +1585,8 @@ payments.post('/payment-link-status', async (c) => {
       const paid = order && (order.order_status === 'paid' || (order.payments || []).some(p => p.status === 'approved'));
       if (paid) {
         const approved = (order.payments || []).find(p => p.status === 'approved') || {};
-        try {
-          const { data: sale } = await admin.from('sale').select('*').eq('client_ref', pref).maybeSingle();
-          if (sale && sale.status !== 'concluida' && sale.status !== 'pago') {
-            await updateSalePaid(sale.id, { status: 'concluida', payment_status: 'paid', mp_payment_id: approved.id || null });
-            await notifyPixPaid(sale, order.total_amount || sale.total);
-          }
-        } catch (e) {}
         return c.json({ ok: true, status: 'approved', payment_id: approved.id || null, amount: order.total_amount || null });
       }
-    }
-    if (pay && pay.status === 'approved' && pref) {
-      try {
-        const { data: sale } = await admin.from('sale').select('*').eq('client_ref', pref).maybeSingle();
-        if (sale && sale.status !== 'concluida' && sale.status !== 'pago') {
-          await updateSalePaid(sale.id, { status: 'concluida', payment_status: 'paid', mp_payment_id: pay.id || null });
-          await notifyPixPaid(sale, pay.transaction_amount || sale.total);
-        }
-      } catch (e) {}
     }
     return c.json({
       ok: true,
