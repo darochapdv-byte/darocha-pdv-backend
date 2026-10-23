@@ -1440,9 +1440,13 @@ payments.post('/pdv-pix-create', async (c) => {
         payment_method: 'pix',
         status: 'pending_payment',
         delivery_type: body.delivery_type || 'levar_agora',
+        delivery_address: body.delivery_address || null,
+        delivery_number: body.delivery_number || null,
+        delivery_neighborhood: body.delivery_neighborhood || null,
+        delivery_city: body.delivery_city || null,
         source: 'pdv',
         client_ref: String(data.id),
-        notes: 'pix:' + String(data.id)
+        notes: null
       });
     } catch (e) { console.warn('pending pix sale', e.message); }
     return c.json({
@@ -1499,9 +1503,13 @@ payments.post('/payment-link', async (c) => {
         payment_method: 'link',
         status: 'pending_payment',
         delivery_type: body.delivery_type || 'levar_agora',
+        delivery_address: body.delivery_address || null,
+        delivery_number: body.delivery_number || null,
+        delivery_neighborhood: body.delivery_neighborhood || null,
+        delivery_city: body.delivery_city || null,
         source: 'pdv',
         client_ref: String(data.id),
-        notes: 'link:' + String(data.id)
+        notes: null
       });
     } catch (e) { console.warn('pending link sale', e.message); }
     return c.json({
