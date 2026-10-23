@@ -1431,8 +1431,8 @@ payments.post('/pdv-pix-create', async (c) => {
     const tx = data.point_of_interaction?.transaction_data || {};
     try {
       const items = Array.isArray(body.items) && body.items.length ? body.items : [{ name: 'Venda PDV', qty: 1, unit_price: amount, total: amount }];
-      await admin.from('sale').insert({
-        created_by: user.id,
+      const saleId = String(body.sale_id || body.external_reference || '').trim();
+      const row = {
         customer_name: body.customer_name || 'Consumidor final',
         items,
         subtotal: amount,
@@ -1444,10 +1444,11 @@ payments.post('/pdv-pix-create', async (c) => {
         delivery_number: body.delivery_number || null,
         delivery_neighborhood: body.delivery_neighborhood || null,
         delivery_city: body.delivery_city || null,
-        source: 'pdv',
         client_ref: String(data.id),
         notes: null
-      });
+      };
+      if (saleId) await admin.from('sale').update(row).eq('id', saleId);
+      else await admin.from('sale').insert(Object.assign({ created_by: user.id, source: 'pdv' }, row));
     } catch (e) { console.warn('pending pix sale', e.message); }
     return c.json({
       ok: true,
@@ -1494,8 +1495,8 @@ payments.post('/payment-link', async (c) => {
     if (!ok) return c.json({ error: data.message || data.error || 'Falha ao criar link', details: data }, 400);
     try {
       const items = Array.isArray(body.items) && body.items.length ? body.items : [{ name: 'Venda PDV', qty: 1, unit_price: amount, total: amount }];
-      await admin.from('sale').insert({
-        created_by: user.id,
+      const saleId = String(body.sale_id || body.external_reference || '').trim();
+      const row = {
         customer_name: body.customer_name || 'Consumidor final',
         items,
         subtotal: amount,
@@ -1507,10 +1508,11 @@ payments.post('/payment-link', async (c) => {
         delivery_number: body.delivery_number || null,
         delivery_neighborhood: body.delivery_neighborhood || null,
         delivery_city: body.delivery_city || null,
-        source: 'pdv',
         client_ref: String(data.id),
         notes: null
-      });
+      };
+      if (saleId) await admin.from('sale').update(row).eq('id', saleId);
+      else await admin.from('sale').insert(Object.assign({ created_by: user.id, source: 'pdv' }, row));
     } catch (e) { console.warn('pending link sale', e.message); }
     return c.json({
       ok: true,
