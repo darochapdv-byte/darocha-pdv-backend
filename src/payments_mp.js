@@ -17,7 +17,7 @@ async function notifyPixPaid(sale, amount) {
     const total = Number(amount || sale.total || 0);
     const msg = 'R$ ' + total.toFixed(2).replace('.', ',') + ' · clique para imprimir a notinha';
     const since = new Date(Date.now() - 2 * 60 * 1000).toISOString();
-    const { data: dup } = await admin.from('notification').select('id').eq('sale_id', sale.id).gte('created_at', since).limit(1);
+    const { data: dup } = await admin.from('notification').select('id').eq('sale_id', sale.id).limit(1);
     if (dup && dup.length) return;
     await admin.from('notification').insert({
       title: 'Pagamento recebido · Pix',
@@ -1488,6 +1488,22 @@ payments.post('/payment-link', async (c) => {
       },
     });
     if (!ok) return c.json({ error: data.message || data.error || 'Falha ao criar link', details: data }, 400);
+    try {
+      const items = Array.isArray(body.items) && body.items.length ? body.items : [{ name: 'Venda PDV', qty: 1, unit_price: amount, total: amount }];
+      await admin.from('sale').insert({
+        created_by: user.id,
+        customer_name: body.customer_name || 'Consumidor final',
+        items,
+        subtotal: amount,
+        total: amount,
+        payment_method: 'link',
+        status: 'pending_payment',
+        delivery_type: body.delivery_type || 'levar_agora',
+        source: 'pdv',
+        client_ref: String(data.id),
+        notes: 'link:' + String(data.id)
+      });
+    } catch (e) { console.warn('pending link sale', e.message); }
     return c.json({
       ok: true,
       preference_id: data.id,
@@ -1522,8 +1538,24 @@ payments.post('/payment-link-status', async (c) => {
       const paid = order && (order.order_status === 'paid' || (order.payments || []).some(p => p.status === 'approved'));
       if (paid) {
         const approved = (order.payments || []).find(p => p.status === 'approved') || {};
+        try {
+          const { data: sale } = await admin.from('sale').select('*').eq('client_ref', pref).maybeSingle();
+          if (sale && sale.status !== 'concluida' && sale.status !== 'pago') {
+            await updateSalePaid(sale.id, { status: 'concluida', payment_status: 'paid', mp_payment_id: approved.id || null });
+            await notifyPixPaid(sale, order.total_amount || sale.total);
+          }
+        } catch (e) {}
         return c.json({ ok: true, status: 'approved', payment_id: approved.id || null, amount: order.total_amount || null });
       }
+    }
+    if (pay && pay.status === 'approved' && pref) {
+      try {
+        const { data: sale } = await admin.from('sale').select('*').eq('client_ref', pref).maybeSingle();
+        if (sale && sale.status !== 'concluida' && sale.status !== 'pago') {
+          await updateSalePaid(sale.id, { status: 'concluida', payment_status: 'paid', mp_payment_id: pay.id || null });
+          await notifyPixPaid(sale, pay.transaction_amount || sale.total);
+        }
+      } catch (e) {}
     }
     return c.json({
       ok: true,
