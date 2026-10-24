@@ -1433,39 +1433,44 @@ payments.post('/pdv-pix-create', async (c) => {
       const items = Array.isArray(body.items) && body.items.length
         ? body.items.map((it) => ({
             product_id: it.product_id || it.id || null,
-            name: String(it.name || 'Produto').trim() || 'Produto',
-            qty: Number(it.qty || it.quantity || 1) || 1,
+            name: String(it.name || 'Produto').slice(0, 200),
+            qty: Number(it.qty) || 1,
             unit_price: Number(it.unit_price || it.price || 0) || 0,
-            total: Number(it.total || ((Number(it.qty || 1) || 1) * (Number(it.unit_price || it.price || 0) || 0))) || 0,
-            discount: Number(it.discount || 0) || 0,
+            discount: Number(it.discount) || 0,
+            total: Number(it.total) || ((Number(it.qty) || 1) * (Number(it.unit_price || it.price) || 0)),
           }))
-        : [{ name: 'Venda PDV', qty: 1, unit_price: amount, total: amount, discount: 0 }];
-      const subtotal = Math.round((Number(body.subtotal) || items.reduce((s, it) => s + Number(it.total || 0), 0) || amount) * 100) / 100;
-      const realNotes = String(body.notes || '').replace(/^pix:\d+$/i, '').trim();
+        : [{ name: 'Venda PDV', qty: 1, unit_price: amount, total: amount }];
+      const subtotal = Number(body.subtotal) > 0 ? Number(body.subtotal) : items.reduce((a, it) => a + (Number(it.total) || 0), 0);
+      const deliveryFee = Number(body.delivery_fee) || 0;
+      const discount = Number(body.discount) || 0;
+      const addrParts = [body.delivery_address, body.delivery_number, body.delivery_neighborhood, body.delivery_complement]
+        .map((x) => String(x || '').trim()).filter(Boolean);
+      const noteUser = String(body.notes || '').trim();
+      const notePix = 'pix:' + String(data.id);
+      const notes = noteUser && !/^pix:\d+$/i.test(noteUser) ? (noteUser + ' | ' + notePix) : notePix;
       await admin.from('sale').insert({
         created_by: user.id,
-        customer_name: body.customer_name || 'Consumidor final',
-        customer_phone: body.customer_phone || '',
+        customer_name: body.customer_name || body.payer_name || 'Consumidor final',
+        customer_phone: body.customer_phone || null,
+        customer_id: body.customer_id || null,
         items,
-        subtotal,
-        discount: Number(body.discount || 0) || 0,
+        subtotal: subtotal || amount,
+        discount,
+        delivery_fee: deliveryFee,
         total: amount,
         payment_method: 'pix',
         status: 'pending_payment',
         delivery_type: body.delivery_type || 'levar_agora',
-        delivery_address: body.delivery_address || '',
-        delivery_number: body.delivery_number || '',
-        delivery_neighborhood: body.delivery_neighborhood || '',
-        delivery_complement: body.delivery_complement || '',
-        delivery_reference: body.delivery_reference || '',
-        delivery_cep: body.delivery_cep || '',
-        delivery_person: body.delivery_person || '',
-        delivery_fee: Number(body.delivery_fee || 0) || 0,
-        operator_name: body.operator_name || '',
-        seller_name: body.seller_name || body.operator_name || '',
+        delivery_address: body.delivery_address || (addrParts.length ? addrParts.join(', ') : null),
+        delivery_number: body.delivery_number || null,
+        delivery_neighborhood: body.delivery_neighborhood || null,
+        delivery_complement: body.delivery_complement || null,
+        seller_name: body.seller_name || null,
+        seller_id: body.seller_id || null,
+        operator_name: body.operator_name || null,
         source: 'pdv',
         client_ref: String(data.id),
-        notes: realNotes || null,
+        notes,
       });
     } catch (e) { console.warn('pending pix sale', e.message); }
     return c.json({
@@ -1511,46 +1516,6 @@ payments.post('/payment-link', async (c) => {
       },
     });
     if (!ok) return c.json({ error: data.message || data.error || 'Falha ao criar link', details: data }, 400);
-    try {
-      const items = Array.isArray(body.items) && body.items.length
-        ? body.items.map((it) => ({
-            product_id: it.product_id || it.id || null,
-            name: String(it.name || 'Produto').trim() || 'Produto',
-            qty: Number(it.qty || it.quantity || 1) || 1,
-            unit_price: Number(it.unit_price || it.price || 0) || 0,
-            total: Number(it.total || ((Number(it.qty || 1) || 1) * (Number(it.unit_price || it.price || 0) || 0))) || 0,
-            discount: Number(it.discount || 0) || 0,
-          }))
-        : [{ name: 'Venda PDV', qty: 1, unit_price: amount, total: amount, discount: 0 }];
-      const subtotal = Math.round((Number(body.subtotal) || items.reduce((s, it) => s + Number(it.total || 0), 0) || amount) * 100) / 100;
-      const realNotes = String(body.notes || '').replace(/^pix:\d+$/i, '').replace(/^link:/i, '').trim();
-      await admin.from('sale').insert({
-        created_by: user.id,
-        customer_name: body.customer_name || 'Consumidor final',
-        customer_phone: body.customer_phone || '',
-        items,
-        subtotal,
-        discount: Number(body.discount || 0) || 0,
-        total: amount,
-        payment_method: 'link',
-        status: 'pending_payment',
-        delivery_type: body.delivery_type || 'levar_agora',
-        delivery_address: body.delivery_address || '',
-        delivery_number: body.delivery_number || '',
-        delivery_neighborhood: body.delivery_neighborhood || '',
-        delivery_complement: body.delivery_complement || '',
-        delivery_reference: body.delivery_reference || '',
-        delivery_cep: body.delivery_cep || '',
-        delivery_person: body.delivery_person || '',
-        delivery_fee: Number(body.delivery_fee || 0) || 0,
-        operator_name: body.operator_name || '',
-        seller_name: body.seller_name || body.operator_name || '',
-        source: 'pdv',
-        client_ref: ref,
-        notes: realNotes || null,
-        installments,
-      });
-    } catch (e) { console.warn('pending link sale', e.message); }
     return c.json({
       ok: true,
       preference_id: data.id,
