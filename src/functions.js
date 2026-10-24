@@ -1207,14 +1207,7 @@ functions.post('/app-bootstrap', async (c) => {
 });
 
 
-// ─── vínculo celular ↔ computador (impressão) ─────────────────────────────
-
-function stationCode(){
-  const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let out='';
-  for(let i=0;i<6;i++) out+=chars[Math.floor(Math.random()*chars.length)];
-  return out;
-}
+// ─── vínculo pelo mesmo caixa ─────────────────────────────────────────────
 
 functions.post('/print-station-register', async (c) => {
   try {
@@ -1223,52 +1216,20 @@ functions.post('/print-station-register', async (c) => {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const body = await c.req.json().catch(() => ({}));
     const device_id = String(body.device_id || '').trim();
-    if (!device_id) return c.json({ error: 'Dispositivo não identificado.' }, 400);
+    const cash_session_id = String(body.cash_session_id || '').trim();
+    if (!device_id || !cash_session_id) return c.json({ error: 'Caixa não informado.' }, 400);
     const { data: existing } = await admin.from('notification')
-      .select('*').eq('created_by', user.id).eq('type', 'print_station').eq('sale_id', device_id).limit(1);
-    if (existing && existing.length) {
-      return c.json({ ok: true, code: existing[0].title, device_id, resumed: true });
-    }
-    const code = stationCode();
+      .select('id').eq('created_by', user.id).eq('type', 'print_station').eq('sale_id', cash_session_id).limit(5);
+    for (const row of existing || []) await admin.from('notification').delete().eq('id', row.id);
     await admin.from('notification').insert({
-      title: code,
-      message: JSON.stringify({ device_id, name: body.name || 'Computador' }),
+      title: 'Computador',
+      message: JSON.stringify({ device_id, cash_session_id, at: Date.now() }),
       type: 'print_station',
-      sale_id: device_id,
+      sale_id: cash_session_id,
       read: true,
       created_by: user.id,
     });
-    return c.json({ ok: true, code, device_id });
-  } catch (e) {
-    return c.json({ error: e.message || 'failed' }, 500);
-  }
-});
-
-functions.post('/print-station-link', async (c) => {
-  try {
-    const user = await requireUser(c);
-    if (!user) return c.json({ error: 'Unauthorized' }, 401);
-    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
-    const body = await c.req.json().catch(() => ({}));
-    const code = String(body.code || '').trim().toUpperCase();
-    const mobile_id = String(body.device_id || '').trim();
-    if (!code || !mobile_id) return c.json({ error: 'Informe o código e o celular.' }, 400);
-    const { data: station } = await admin.from('notification')
-      .select('*').eq('created_by', user.id).eq('type', 'print_station').eq('title', code).limit(1);
-    if (!station || !station.length) return c.json({ error: 'Código não encontrado neste sistema.' }, 404);
-    const station_id = station[0].sale_id;
-    const { data: old } = await admin.from('notification')
-      .select('id').eq('created_by', user.id).eq('type', 'device_link').eq('sale_id', mobile_id).limit(5);
-    for (const row of old || []) await admin.from('notification').delete().eq('id', row.id);
-    await admin.from('notification').insert({
-      title: code,
-      message: JSON.stringify({ mobile_id, station_id, code }),
-      type: 'device_link',
-      sale_id: mobile_id,
-      read: true,
-      created_by: user.id,
-    });
-    return c.json({ ok: true, station_id, code });
+    return c.json({ ok: true, cash_session_id });
   } catch (e) {
     return c.json({ error: e.message || 'failed' }, 500);
   }
@@ -1280,13 +1241,15 @@ functions.post('/print-job', async (c) => {
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const body = await c.req.json().catch(() => ({}));
-    const mobile_id = String(body.device_id || '').trim();
+    const cash_session_id = String(body.cash_session_id || '').trim();
     const sale_id = String(body.sale_id || '').trim();
-    if (!mobile_id) return c.json({ error: 'Celular não identificado.' }, 400);
-    const { data: link } = await admin.from('notification')
-      .select('*').eq('created_by', user.id).eq('type', 'device_link').eq('sale_id', mobile_id).limit(1);
-    if (!link || !link.length) return c.json({ error: 'Celular não vinculado a um computador.', offline: true }, 409);
-    const station_id = JSON.parse(link[0].message || '{}').station_id;
+    if (!cash_session_id) return c.json({ error: 'Abra o mesmo caixa neste celular.' }, 400);
+    const { data: station } = await admin.from('notification')
+      .select('*').eq('created_by', user.id).eq('type', 'print_station').eq('sale_id', cash_session_id).limit(1);
+    if (!station || !station.length) return c.json({ error: 'Nenhum computador com este caixa aberto.' }, 409);
+    let info={};
+    try{ info=JSON.parse(station[0].message||'{}'); }catch(e){}
+    if (info.at && Date.now()-info.at > 20000) return c.json({ error: 'O computador deste caixa está desconectado.' }, 409);
     if (sale_id) {
       const { data: dup } = await admin.from('notification')
         .select('id').eq('created_by', user.id).eq('type', 'print_job').eq('sale_id', sale_id).eq('read', false).limit(1);
@@ -1294,14 +1257,14 @@ functions.post('/print-job', async (c) => {
     }
     await admin.from('notification').insert({
       title: 'Imprimir',
-      message: JSON.stringify({ station_id, sale: body.sale || null, from: mobile_id }),
+      message: JSON.stringify({ cash_session_id, station_id: info.device_id, sale: body.sale || null }),
       type: 'print_job',
       sale_id: sale_id || null,
       delivery_type: body.delivery_type || '',
       read: false,
       created_by: user.id,
     });
-    return c.json({ ok: true, station_id });
+    return c.json({ ok: true });
   } catch (e) {
     return c.json({ error: e.message || 'failed' }, 500);
   }
@@ -1313,13 +1276,13 @@ functions.post('/print-jobs', async (c) => {
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const body = await c.req.json().catch(() => ({}));
-    const station_id = String(body.device_id || '').trim();
-    if (!station_id) return c.json({ jobs: [] });
+    const cash_session_id = String(body.cash_session_id || '').trim();
+    if (!cash_session_id) return c.json({ jobs: [] });
     const { data } = await admin.from('notification')
       .select('*').eq('created_by', user.id).eq('type', 'print_job').eq('read', false)
       .order('created_date', { ascending: true }).limit(20);
     const jobs = (data || []).filter((row) => {
-      try { return JSON.parse(row.message || '{}').station_id === station_id; } catch { return false; }
+      try { return JSON.parse(row.message || '{}').cash_session_id === cash_session_id; } catch { return false; }
     });
     return c.json({ jobs });
   } catch (e) {
