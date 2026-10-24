@@ -1443,11 +1443,8 @@ payments.post('/pdv-pix-create', async (c) => {
       const subtotal = Number(body.subtotal) > 0 ? Number(body.subtotal) : items.reduce((a, it) => a + (Number(it.total) || 0), 0);
       const deliveryFee = Number(body.delivery_fee) || 0;
       const discount = Number(body.discount) || 0;
-      const addrParts = [body.delivery_address, body.delivery_number, body.delivery_neighborhood, body.delivery_complement]
-        .map((x) => String(x || '').trim()).filter(Boolean);
-      const noteUser = String(body.notes || '').trim();
-      const notePix = 'pix:' + String(data.id);
-      const notes = noteUser && !/^pix:\d+$/i.test(noteUser) ? (noteUser + ' | ' + notePix) : notePix;
+      const noteUser = String(body.notes || '').replace(/pix:\d+/gi, '').replace(/^[|\s]+|[|\s]+$/g, '').trim();
+      const notes = noteUser || null;
       await admin.from('sale').insert({
         created_by: user.id,
         customer_name: body.customer_name || body.payer_name || 'Consumidor final',
@@ -1461,13 +1458,14 @@ payments.post('/pdv-pix-create', async (c) => {
         payment_method: 'pix',
         status: 'pending_payment',
         delivery_type: body.delivery_type || 'levar_agora',
-        delivery_address: body.delivery_address || (addrParts.length ? addrParts.join(', ') : null),
+        delivery_address: body.delivery_address || null,
         delivery_number: body.delivery_number || null,
         delivery_neighborhood: body.delivery_neighborhood || null,
         delivery_complement: body.delivery_complement || null,
-        seller_name: body.seller_name || null,
+        delivery_person: body.delivery_person || body.entregador || body.courier || null,
+        seller_name: body.seller_name || body.operator_name || null,
         seller_id: body.seller_id || null,
-        operator_name: body.operator_name || null,
+        operator_name: body.operator_name || body.seller_name || null,
         source: 'pdv',
         client_ref: String(data.id),
         notes,
