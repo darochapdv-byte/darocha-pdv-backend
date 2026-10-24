@@ -279,19 +279,8 @@ functions.post('/cash-session-heartbeat', async (c) => {
       }, 409);
     }
 
-    // Caixa foi assumido em outro dispositivo → força saída neste aparelho
-    if (session.device_id && device_id && session.device_id !== device_id) {
-      return c.json({
-        ok: false,
-        foreign: true,
-        force_exit: true,
-        reason: 'taken_over',
-        message: 'Este caixa foi assumido em outro dispositivo. Você foi desconectado.',
-        current_device_id: session.device_id,
-      }, 409);
-    }
-
-
+    // Vários aparelhos podem usar o mesmo caixa ao mesmo tempo.
+    // Não derruba a sessão se o device_id for diferente.
 
     const now = new Date().toISOString();
     const updates = { last_active_at: now };
@@ -1217,6 +1206,141 @@ functions.post('/app-bootstrap', async (c) => {
   }
 });
 
+
+// ─── vínculo celular ↔ computador (impressão) ─────────────────────────────
+
+function stationCode(){
+  const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let out='';
+  for(let i=0;i<6;i++) out+=chars[Math.floor(Math.random()*chars.length)];
+  return out;
+}
+
+functions.post('/print-station-register', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const body = await c.req.json().catch(() => ({}));
+    const device_id = String(body.device_id || '').trim();
+    if (!device_id) return c.json({ error: 'Dispositivo não identificado.' }, 400);
+    const { data: existing } = await admin.from('notification')
+      .select('*').eq('created_by', user.id).eq('type', 'print_station').eq('sale_id', device_id).limit(1);
+    if (existing && existing.length) {
+      return c.json({ ok: true, code: existing[0].title, device_id, resumed: true });
+    }
+    const code = stationCode();
+    await admin.from('notification').insert({
+      title: code,
+      message: JSON.stringify({ device_id, name: body.name || 'Computador' }),
+      type: 'print_station',
+      sale_id: device_id,
+      read: true,
+      created_by: user.id,
+    });
+    return c.json({ ok: true, code, device_id });
+  } catch (e) {
+    return c.json({ error: e.message || 'failed' }, 500);
+  }
+});
+
+functions.post('/print-station-link', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const body = await c.req.json().catch(() => ({}));
+    const code = String(body.code || '').trim().toUpperCase();
+    const mobile_id = String(body.device_id || '').trim();
+    if (!code || !mobile_id) return c.json({ error: 'Informe o código e o celular.' }, 400);
+    const { data: station } = await admin.from('notification')
+      .select('*').eq('created_by', user.id).eq('type', 'print_station').eq('title', code).limit(1);
+    if (!station || !station.length) return c.json({ error: 'Código não encontrado neste sistema.' }, 404);
+    const station_id = station[0].sale_id;
+    const { data: old } = await admin.from('notification')
+      .select('id').eq('created_by', user.id).eq('type', 'device_link').eq('sale_id', mobile_id).limit(5);
+    for (const row of old || []) await admin.from('notification').delete().eq('id', row.id);
+    await admin.from('notification').insert({
+      title: code,
+      message: JSON.stringify({ mobile_id, station_id, code }),
+      type: 'device_link',
+      sale_id: mobile_id,
+      read: true,
+      created_by: user.id,
+    });
+    return c.json({ ok: true, station_id, code });
+  } catch (e) {
+    return c.json({ error: e.message || 'failed' }, 500);
+  }
+});
+
+functions.post('/print-job', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const body = await c.req.json().catch(() => ({}));
+    const mobile_id = String(body.device_id || '').trim();
+    const sale_id = String(body.sale_id || '').trim();
+    if (!mobile_id) return c.json({ error: 'Celular não identificado.' }, 400);
+    const { data: link } = await admin.from('notification')
+      .select('*').eq('created_by', user.id).eq('type', 'device_link').eq('sale_id', mobile_id).limit(1);
+    if (!link || !link.length) return c.json({ error: 'Celular não vinculado a um computador.', offline: true }, 409);
+    const station_id = JSON.parse(link[0].message || '{}').station_id;
+    if (sale_id) {
+      const { data: dup } = await admin.from('notification')
+        .select('id').eq('created_by', user.id).eq('type', 'print_job').eq('sale_id', sale_id).eq('read', false).limit(1);
+      if (dup && dup.length) return c.json({ ok: true, duplicate: true });
+    }
+    await admin.from('notification').insert({
+      title: 'Imprimir',
+      message: JSON.stringify({ station_id, sale: body.sale || null, from: mobile_id }),
+      type: 'print_job',
+      sale_id: sale_id || null,
+      delivery_type: body.delivery_type || '',
+      read: false,
+      created_by: user.id,
+    });
+    return c.json({ ok: true, station_id });
+  } catch (e) {
+    return c.json({ error: e.message || 'failed' }, 500);
+  }
+});
+
+functions.post('/print-jobs', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const body = await c.req.json().catch(() => ({}));
+    const station_id = String(body.device_id || '').trim();
+    if (!station_id) return c.json({ jobs: [] });
+    const { data } = await admin.from('notification')
+      .select('*').eq('created_by', user.id).eq('type', 'print_job').eq('read', false)
+      .order('created_date', { ascending: true }).limit(20);
+    const jobs = (data || []).filter((row) => {
+      try { return JSON.parse(row.message || '{}').station_id === station_id; } catch { return false; }
+    });
+    return c.json({ jobs });
+  } catch (e) {
+    return c.json({ error: e.message || 'failed' }, 500);
+  }
+});
+
+functions.post('/print-job-done', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const body = await c.req.json().catch(() => ({}));
+    if (!body.id) return c.json({ error: 'id' }, 400);
+    await admin.from('notification').update({ read: true }).eq('id', body.id).eq('created_by', user.id);
+    return c.json({ ok: true });
+  } catch (e) {
+    return c.json({ error: e.message || 'failed' }, 500);
+  }
+});
+
 // ─── catch-all ─────────────────────────────────────────────────────────────
 
 functions.post('/:name', async (c) => {
@@ -1229,7 +1353,7 @@ functions.post('/:name', async (c) => {
   'start-stock-count','stock-count-search','stock-count-apply','sync-pdv-reservations',
   'admin-stats','cleanup-cash-sessions','purge-account','init-help-content',
   'check-vale-due','sales-revenue-summary','top-products-month','app-bootstrap','create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','get-access-status','access-status','referral-panel','master-code-status','ensure-referral-code','cancel-subscription','resume-subscription',
-  'fetch-nfe-xml','import-nfe','address-search',
+  'print-station-register','print-station-link','print-job','print-jobs','print-job-done','fetch-nfe-xml','import-nfe','address-search',
     'fiscal-disconnect','fiscal-connect-toggle','fiscal-settings','fiscal-settings-save','fiscal-certificate','fiscal-test','fiscal-nfce','fiscal-nfe','fiscal-documents','fiscal-document','fiscal-document-xml','fiscal-document-danfe','fiscal-cancel','fiscal-status','fiscal-webhook',
 ];
   if (implemented.includes(name)) return c.json({ error: 'routing_error' }, 500);
