@@ -17,18 +17,67 @@ async function notifyPixPaid(sale, amount) {
     const total = Number(amount || sale.total || 0);
     const msg = 'R$ ' + total.toFixed(2).replace('.', ',') + ' · clique para imprimir a notinha';
     const since = new Date(Date.now() - 2 * 60 * 1000).toISOString();
-    const { data: dup } = await admin.from('notification').select('id').eq('sale_id', sale.id).gte('created_at', since).limit(1);
-    if (dup && dup.length) return;
-    await admin.from('notification').insert({
-      title: 'Pagamento recebido · Pix',
-      message: msg,
-      sale_id: sale.id,
-      type: 'pagamento_pix',
-      delivery_type: sale.delivery_type || '',
-      read: false,
-      created_by: sale.created_by || null
-    });
-  } catch (e) {}
+    const { data: dup } = await admin.from('notification').select('id').eq('sale_id', sale.id).eq('type', 'pagamento_pix').gte('created_at', since).limit(1);
+    if (!(dup && dup.length)) {
+      await admin.from('notification').insert({
+        title: 'Pagamento recebido · Pix',
+        message: msg,
+        sale_id: sale.id,
+        type: 'pagamento_pix',
+        delivery_type: sale.delivery_type || '',
+        read: false,
+        created_by: sale.created_by || null
+      });
+    }
+    // Enfileira impressão automática em TODOS os computadores (print_station) da loja
+    try {
+      let saleFull = sale;
+      if (!sale.items || !Array.isArray(sale.items) || !sale.items.length) {
+        const { data: fresh } = await admin.from('sale').select('*').eq('id', sale.id).maybeSingle();
+        if (fresh) saleFull = fresh;
+      }
+      const { data: stations } = await admin
+        .from('notification')
+        .select('*')
+        .eq('created_by', sale.created_by)
+        .eq('type', 'print_station')
+        .limit(20);
+      const { data: jobDup } = await admin
+        .from('notification')
+        .select('id')
+        .eq('created_by', sale.created_by)
+        .eq('type', 'print_job')
+        .eq('sale_id', sale.id)
+        .eq('read', false)
+        .limit(1);
+      if (!(jobDup && jobDup.length)) {
+        const list = (stations && stations.length) ? stations : [{ sale_id: null }];
+        for (const st of list) {
+          const station_id = st.sale_id || null; // null = qualquer computador da loja
+          await admin.from('notification').insert({
+            title: 'Imprimir',
+            message: JSON.stringify({ 
+              station_id, 
+              sale: saleFull, 
+              from: 'webhook-pix', 
+              auto: true,
+              cash_session_id: sale.cash_session_id || saleFull.cash_session_id || null
+            }),
+            type: 'print_job',
+            sale_id: sale.id,
+            delivery_type: sale.delivery_type || '',
+            read: false,
+            created_by: sale.created_by || null,
+          });
+          if (!station_id) break; // um job broadcast basta
+        }
+      }
+    } catch (pe) {
+      console.warn('notifyPixPaid print_job', pe.message);
+    }
+  } catch (e) {
+    console.warn('notifyPixPaid', e.message);
+  }
 }
 
 function encodeOnlinePaymentFields({ payment_status, mp_payment_id, payment_meta, paid_at, status } = {}) {
@@ -455,10 +504,11 @@ async function saveTransaction(row) {
 
 async function updateSalePaid(saleId, patch = {}) {
   const { payment_status, paid_at, payment_meta, mp_payment_id, ...rest } = patch || {};
-  const st = rest.status || patch.status || 'pago';
+  // PDV e histórico esperam "concluida" para mostrar Reimprimir / ações de venda paga
+  const st = rest.status || patch.status || 'concluida';
   const { error: eStatus } = await admin.from('sale').update({ status: st }).eq('id', saleId);
   if (eStatus) {
-    console.warn('updateSalePaid status pago', eStatus.message);
+    console.warn('updateSalePaid status', eStatus.message);
     const { error: e2 } = await admin.from('sale').update({ status: 'concluida' }).eq('id', saleId);
     if (e2) console.warn('updateSalePaid status concluida', e2.message);
   }
@@ -1146,8 +1196,8 @@ payments.post('/mercadopago-webhook', async (c) => {
       return c.json({ ok: true, ignored: true });
     }
 
-    // Buscar sale pelo mp_payment_id ou external_reference depois de consultar MP
-    // Precisamos do token da loja — localiza sale
+    // Buscar sale APENAS para UPDATE — nunca INSERT neste webhook
+    // Ordem: client_ref (payment id) → external_reference (após fetch MP) → payment_meta
     let sale = null;
     const { data: byMp } = await admin
       .from('sale')
@@ -1157,28 +1207,40 @@ payments.post('/mercadopago-webhook', async (c) => {
     sale = byMp;
 
     if (!sale) {
-      // tenta achar por payment_meta (menos ideal)
+      const { data: byMp2 } = await admin
+        .from('sale')
+        .select('*')
+        .eq('client_ref', 'pix:' + String(paymentId))
+        .maybeSingle();
+      sale = byMp2;
+    }
+
+    if (!sale) {
+      // tenta achar por payment_meta / mp_payment_id em vendas recentes pendentes
       const { data: recent } = await admin
         .from('sale')
         .select('*')
         .in('source', ['catalog','pdv'])
-        .in('status', ['pending_payment', 'orcamento', 'cancelada'])
+        .in('status', ['pending_payment', 'orcamento', 'cancelada', 'concluida', 'pago'])
         .order('created_at', { ascending: false })
-        .limit(50);
+        .limit(80);
       sale = (recent || []).find((s) => {
         const op = readOnlinePayment(s);
-        return String(op.mp_payment_id) === String(paymentId) || String(op.payment_meta?.payment_id) === String(paymentId);
-      });
+        return String(op.mp_payment_id) === String(paymentId)
+          || String(op.payment_meta?.payment_id) === String(paymentId)
+          || String(s.client_ref || '') === String(paymentId)
+          || String(s.client_ref || '') === 'pix:' + String(paymentId);
+      }) || null;
+    }
+
+    // Idempotência preliminar (só se já achamos a sale)
+    if (sale && (readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida' || sale.status === 'pago')) {
+      return c.json({ ok: true, already_paid: true });
     }
 
     if (!sale?.created_by) {
       console.warn('mp webhook: sale not found for payment', paymentId);
       return c.json({ ok: true, not_found: true });
-    }
-
-    // Idempotência: já pago
-    if ((readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida' || sale.status === 'pago')) {
-      return c.json({ ok: true, already_paid: true });
     }
 
     const { token } = await getAccessTokenForStore(sale.created_by);
@@ -1190,10 +1252,20 @@ payments.post('/mercadopago-webhook', async (c) => {
       return c.json({ ok: true, fetch_failed: true });
     }
 
-    // Confirma external_reference
-    if (data.external_reference && String(data.external_reference) !== String(sale.id)) {
-      const { data: byRef } = await admin.from('sale').select('*').eq('id', data.external_reference).maybeSingle();
+    // Prioriza external_reference (= id da venda original) — preserva customer_name
+    if (data.external_reference) {
+      const { data: byRef } = await admin.from('sale').select('*').eq('id', String(data.external_reference)).maybeSingle();
       if (byRef) sale = byRef;
+    }
+
+    if (!sale?.created_by) {
+      console.warn('mp webhook: sale still not found after MP fetch', paymentId, data.external_reference);
+      return c.json({ ok: true, not_found: true });
+    }
+
+    // Idempotência após resolver sale definitiva
+    if ((readOnlinePayment(sale).payment_status === 'paid' || sale.status === 'concluida' || sale.status === 'pago')) {
+      return c.json({ ok: true, already_paid: true });
     }
 
     if (data.status === 'approved') {
@@ -1414,7 +1486,56 @@ payments.post('/pdv-pix-create', async (c) => {
     if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
     const names = splitPersonName(body.payer_name || body.name || 'Cliente PDV');
     const email = isRealPayerEmail(body.email) ? String(body.email).trim().toLowerCase() : `pdv.${String(user.id).replace(/-/g, '').slice(0, 10)}@gmail.com`;
-    const idem = `pdvpix-${user.id.slice(0, 8)}-${Math.round(amount * 100)}-${Date.now()}`;
+    // Prefer update existing pending sale (preserves customer_name) over INSERT
+    const existingSaleId = String(body.sale_id || body.external_reference || '').trim();
+    let saleIdForRef = existingSaleId;
+    if (!saleIdForRef) {
+      try {
+        const items = Array.isArray(body.items) && body.items.length
+          ? body.items.map((it) => ({
+              product_id: it.product_id || it.id || null,
+              name: String(it.name || 'Produto').slice(0, 200),
+              qty: Number(it.qty) || 1,
+              unit_price: Number(it.unit_price || it.price || 0) || 0,
+              discount: Number(it.discount) || 0,
+              total: Number(it.total) || ((Number(it.qty) || 1) * (Number(it.unit_price || it.price) || 0)),
+            }))
+          : [{ name: 'Venda PDV', qty: 1, unit_price: amount, total: amount }];
+        const subtotal = Number(body.subtotal) > 0 ? Number(body.subtotal) : items.reduce((a, it) => a + (Number(it.total) || 0), 0);
+        const deliveryFee = Number(body.delivery_fee) || 0;
+        const discount = Number(body.discount) || 0;
+        const noteUser = String(body.notes || '').replace(/pix:\d+/gi, '').replace(/^[|\s]+|[|\s]+$/g, '').trim();
+        const custName = String(body.customer_name || body.payer_name || '').trim() || 'Consumidor final';
+        const { data: inserted, error: insErr } = await admin.from('sale').insert({
+          created_by: user.id,
+          customer_name: custName,
+          customer_phone: body.customer_phone || null,
+          customer_id: body.customer_id || null,
+          items,
+          subtotal: subtotal || amount,
+          discount,
+          delivery_fee: deliveryFee,
+          total: amount,
+          payment_method: 'pix',
+          status: 'pending_payment',
+          delivery_type: body.delivery_type || 'levar_agora',
+          delivery_address: body.delivery_address || null,
+          delivery_number: body.delivery_number || null,
+          delivery_neighborhood: body.delivery_neighborhood || null,
+          delivery_complement: body.delivery_complement || null,
+          delivery_person: body.delivery_person || body.entregador || body.courier || null,
+          seller_name: body.seller_name || body.operator_name || null,
+          seller_id: body.seller_id || null,
+          operator_name: body.operator_name || body.seller_name || null,
+          source: 'pdv',
+          notes: noteUser || null,
+        }).select('id').single();
+        if (insErr) console.warn('pending pix sale insert', insErr.message);
+        if (inserted?.id) saleIdForRef = inserted.id;
+      } catch (e) { console.warn('pending pix sale', e.message); }
+    }
+    const externalRef = String(saleIdForRef || body.external_reference || `pdv-pix-${Date.now()}`);
+    const idem = `pdvpix-${user.id.slice(0, 8)}-${Math.round(amount * 100)}-${externalRef}`;
     const { ok, data } = await mpFetch(token, '/v1/payments', {
       method: 'POST',
       idempotencyKey: idem,
@@ -1423,57 +1544,27 @@ payments.post('/pdv-pix-create', async (c) => {
         description: body.description || `Venda PDV ${amount.toFixed(2)}`,
         payment_method_id: 'pix',
         payer: { email, first_name: names.first_name, last_name: names.last_name },
-        external_reference: String(body.external_reference || `pdv-pix-${Date.now()}`),
+        external_reference: externalRef,
         notification_url: env('MP_WEBHOOK_URL') || 'https://darocha-pdv-backend.onrender.com/functions/mercadopago-webhook',
       },
     });
     if (!ok) return c.json({ error: data.message || data.error || 'Falha ao criar Pix', details: data }, 400);
     const tx = data.point_of_interaction?.transaction_data || {};
-    try {
-      const items = Array.isArray(body.items) && body.items.length
-        ? body.items.map((it) => ({
-            product_id: it.product_id || it.id || null,
-            name: String(it.name || 'Produto').slice(0, 200),
-            qty: Number(it.qty) || 1,
-            unit_price: Number(it.unit_price || it.price || 0) || 0,
-            discount: Number(it.discount) || 0,
-            total: Number(it.total) || ((Number(it.qty) || 1) * (Number(it.unit_price || it.price) || 0)),
-          }))
-        : [{ name: 'Venda PDV', qty: 1, unit_price: amount, total: amount }];
-      const subtotal = Number(body.subtotal) > 0 ? Number(body.subtotal) : items.reduce((a, it) => a + (Number(it.total) || 0), 0);
-      const deliveryFee = Number(body.delivery_fee) || 0;
-      const discount = Number(body.discount) || 0;
-      const noteUser = String(body.notes || '').replace(/pix:\d+/gi, '').replace(/^[|\s]+|[|\s]+$/g, '').trim();
-      const notes = noteUser || null;
-      await admin.from('sale').insert({
-        created_by: user.id,
-        customer_name: body.customer_name || body.payer_name || 'Consumidor final',
-        customer_phone: body.customer_phone || null,
-        customer_id: body.customer_id || null,
-        items,
-        subtotal: subtotal || amount,
-        discount,
-        delivery_fee: deliveryFee,
-        total: amount,
-        payment_method: 'pix',
-        status: 'pending_payment',
-        delivery_type: body.delivery_type || 'levar_agora',
-        delivery_address: body.delivery_address || null,
-        delivery_number: body.delivery_number || null,
-        delivery_neighborhood: body.delivery_neighborhood || null,
-        delivery_complement: body.delivery_complement || null,
-        delivery_person: body.delivery_person || body.entregador || body.courier || null,
-        seller_name: body.seller_name || body.operator_name || null,
-        seller_id: body.seller_id || null,
-        operator_name: body.operator_name || body.seller_name || null,
-        source: 'pdv',
-        client_ref: String(data.id),
-        notes,
-      });
-    } catch (e) { console.warn('pending pix sale', e.message); }
+    // Vincula payment id à venda existente — NUNCA cria segunda venda
+    if (saleIdForRef && data.id) {
+      try {
+        await admin.from('sale').update({
+          client_ref: String(data.id),
+          status: 'pending_payment',
+          payment_method: 'pix',
+        }).eq('id', saleIdForRef).eq('created_by', user.id);
+      } catch (e) { console.warn('link pix payment to sale', e.message); }
+    }
     return c.json({
       ok: true,
       payment_id: data.id,
+      sale_id: saleIdForRef || null,
+      external_reference: externalRef,
       status: data.status,
       qr_code: tx.qr_code || null,
       qr_code_base64: tx.qr_code_base64 || null,
@@ -1494,7 +1585,46 @@ payments.post('/payment-link', async (c) => {
     if (!(amount > 0)) return c.json({ error: 'Valor inválido' }, 400);
     const { error, token } = await getAccessTokenForStore(user.id);
     if (error || !token) return c.json({ error: error || 'Mercado Pago não conectado.' }, 400);
-    const ref = String(body.external_reference || `pdv-link-${user.id.slice(0, 8)}-${Date.now()}`);
+
+    // Cria (ou reutiliza) venda pendente UMA vez — webhook/finalize só atualizam
+    let saleId = String(body.sale_id || body.external_reference || '').trim();
+    if (!saleId || saleId.startsWith('pdv-link-')) {
+      try {
+        const items = Array.isArray(body.items) && body.items.length
+          ? body.items.map((it) => ({
+              product_id: it.product_id || it.id || null,
+              name: String(it.name || 'Produto').slice(0, 200),
+              qty: Number(it.qty) || 1,
+              unit_price: Number(it.unit_price || it.price || 0) || 0,
+              total: Number(it.total) || ((Number(it.qty) || 1) * (Number(it.unit_price || it.price) || 0)),
+            }))
+          : [{ name: 'Pagamento link', qty: 1, unit_price: amount, total: amount }];
+        const custName = String(body.customer_name || body.payer_name || '').trim() || 'Consumidor final';
+        const { data: inserted } = await admin.from('sale').insert({
+          created_by: user.id,
+          customer_name: custName,
+          customer_phone: body.customer_phone || null,
+          customer_id: body.customer_id || null,
+          items,
+          subtotal: Number(body.subtotal) || amount,
+          discount: Number(body.discount) || 0,
+          delivery_fee: Number(body.delivery_fee) || 0,
+          total: amount,
+          payment_method: 'pix',
+          status: 'pending_payment',
+          delivery_type: body.delivery_type || 'levar_agora',
+          delivery_address: body.delivery_address || null,
+          delivery_neighborhood: body.delivery_neighborhood || null,
+          seller_name: body.seller_name || body.operator_name || null,
+          operator_name: body.operator_name || body.seller_name || null,
+          source: 'pdv',
+        }).select('id').single();
+        if (inserted?.id) saleId = inserted.id;
+      } catch (e) {
+        console.warn('payment-link pending sale', e.message);
+      }
+    }
+    const ref = String(saleId || body.external_reference || `pdv-link-${user.id.slice(0, 8)}-${Date.now()}`);
     const title = String(body.description || body.title || 'Pagamento Darocha PDV').slice(0, 80);
     const installments = Math.max(1, Math.min(12, Number(body.installments) || 1));
     const { ok, data } = await mpFetch(token, '/checkout/preferences', {
@@ -1520,6 +1650,7 @@ payments.post('/payment-link', async (c) => {
       init_point: data.init_point,
       sandbox_init_point: data.sandbox_init_point,
       external_reference: ref,
+      sale_id: saleId || null,
       amount,
     });
   } catch (e) {

@@ -575,6 +575,7 @@ functions.post("/finalize-sale", async (c) => {
           saleRow = { ...saleRow, ...patch, id: saleId };
         }
       }
+      try { await enqueuePrintJobForSale(saleRow, user.id); } catch (_) {}
       return c.json({ ok: true, success: true, sale: toBase44Row(saleRow), sale_id: saleId || saleRow.id });
     }
 
@@ -585,9 +586,99 @@ functions.post("/finalize-sale", async (c) => {
         .from('sale').select('*').eq('client_ref', client_ref)
         .order('created_at', { ascending: false }).limit(1);
       if (existing?.length) {
+        const ex = existing[0];
+        // Completa pendente Pix/link sem criar segunda nota
+        if (ex.status === 'pending_payment' || ex.status === 'orcamento') {
+          try {
+            const patch = {
+              status: 'concluida',
+              cash_session_id: session_id || ex.cash_session_id || null,
+              operator_name: operator_name || ex.operator_name,
+              customer_name: sale.customer_name || ex.customer_name,
+              customer_phone: sale.customer_phone || ex.customer_phone,
+              delivery_type: sale.delivery_type || ex.delivery_type,
+              payment_method: sale.payment_method || ex.payment_method || 'pix',
+            };
+            const { data: upd } = await admin.from('sale').update(patch).eq('id', ex.id).select().maybeSingle();
+            if (session_id) {
+              try {
+                await registerCashMovement({
+                  cash_session_id: session_id,
+                  type: 'venda',
+                  amount: Number((upd || ex).total) || 0,
+                  reason: `Venda PDV #${String(ex.id).slice(-6).toUpperCase()}`,
+                  sale_id: ex.id,
+                  operator_name,
+                });
+              } catch (_) {}
+              await releaseSessionReservations(session_id);
+            }
+            try { await enqueuePrintJobForSale({ ...(upd || ex), ...patch, id: ex.id }, user.id); } catch (_) {}
+          return c.json({ ok: true, success: true, sale: toBase44Row(upd || { ...ex, ...patch }), sale_id: ex.id, resumed: true });
+          } catch (e) {
+            console.warn('complete pending by client_ref', e.message);
+          }
+        }
         if (session_id) await releaseSessionReservations(session_id);
-        return c.json({ ok: true, success: true, sale: toBase44Row(existing[0]), sale_id: existing[0].id });
+        return c.json({ ok: true, success: true, sale: toBase44Row(ex), sale_id: ex.id, duplicate: true });
       }
+    }
+
+    // Dedup: venda Pix/link pendente recente mesma loja + total (+ cliente se houver)
+    try {
+      const pm = String(sale.payment_method || '').toLowerCase();
+      const isOnlinePay = pm === 'pix' || pm.includes('link') || sale.pay_online || sale.online_payment;
+      if (isOnlinePay) {
+        const since = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+        const totalN = Number(sale.total) || 0;
+        let q = admin.from('sale').select('*')
+          .eq('created_by', user.id)
+          .eq('status', 'pending_payment')
+          .gte('created_at', since)
+          .order('created_at', { ascending: false })
+          .limit(15);
+        const { data: pendings } = await q;
+        const match = (pendings || []).find((s) => {
+          const sameTotal = Math.abs(Number(s.total || 0) - totalN) < 0.02;
+          const cn = String(sale.customer_name || '').trim().toLowerCase();
+          const sn = String(s.customer_name || '').trim().toLowerCase();
+          const sameCust = !cn || !sn || cn === sn || sn === 'consumidor final' || cn === 'consumidor final';
+          return sameTotal && sameCust;
+        });
+        if (match) {
+          const patch = {
+            status: 'concluida',
+            cash_session_id: session_id || match.cash_session_id || null,
+            operator_name: operator_name || match.operator_name,
+            customer_name: sale.customer_name || match.customer_name,
+            customer_phone: sale.customer_phone || match.customer_phone,
+            delivery_type: sale.delivery_type || match.delivery_type,
+            delivery_address: sale.delivery_address || match.delivery_address,
+            delivery_neighborhood: sale.delivery_neighborhood || match.delivery_neighborhood,
+            payment_method: sale.payment_method || match.payment_method || 'pix',
+            items: items.length ? items : match.items,
+          };
+          if (client_ref) patch.client_ref = client_ref;
+          const { data: upd } = await admin.from('sale').update(patch).eq('id', match.id).select().maybeSingle();
+          if (session_id) {
+            try {
+              await registerCashMovement({
+                cash_session_id: session_id,
+                type: 'venda',
+                amount: Number((upd || match).total) || 0,
+                reason: `Venda PDV #${String(match.id).slice(-6).toUpperCase()}`,
+                sale_id: match.id,
+                operator_name,
+              });
+            } catch (_) {}
+            await releaseSessionReservations(session_id);
+          }
+          try { await enqueuePrintJobForSale({ ...(upd || match), ...patch, id: match.id }, user.id); } catch (_) {}
+          return c.json({ ok: true, success: true, sale: toBase44Row(upd || { ...match, ...patch }), sale_id: match.id, resumed: true });
+        }
+      }
+    } catch (e) {
+      console.warn('pending pix dedup', e.message);
     }
 
     const ids = items.map((i) => i.product_id).filter(Boolean);
@@ -708,6 +799,7 @@ functions.post("/finalize-sale", async (c) => {
       }
     }
     // Frontend espera response.data.sale
+    try { await enqueuePrintJobForSale(createdSale, user.id); } catch (_) {}
     return c.json({ ok: true, success: true, sale: toBase44Row(createdSale), sale_id: createdSale.id });
   } catch (error) {
     await logOperation({
@@ -1207,7 +1299,14 @@ functions.post('/app-bootstrap', async (c) => {
 });
 
 
-// ─── vínculo pelo mesmo caixa ─────────────────────────────────────────────
+// ─── vínculo celular ↔ computador (impressão) ─────────────────────────────
+
+function stationCode(){
+  const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let out='';
+  for(let i=0;i<6;i++) out+=chars[Math.floor(Math.random()*chars.length)];
+  return out;
+}
 
 functions.post('/print-station-register', async (c) => {
   try {
@@ -1216,24 +1315,97 @@ functions.post('/print-station-register', async (c) => {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const body = await c.req.json().catch(() => ({}));
     const device_id = String(body.device_id || '').trim();
-    const cash_session_id = String(body.cash_session_id || '').trim();
-    if (!device_id || !cash_session_id) return c.json({ error: 'Caixa não informado.' }, 400);
+    if (!device_id) return c.json({ error: 'Dispositivo não identificado.' }, 400);
     const { data: existing } = await admin.from('notification')
-      .select('id').eq('created_by', user.id).eq('type', 'print_station').eq('sale_id', cash_session_id).limit(5);
-    for (const row of existing || []) await admin.from('notification').delete().eq('id', row.id);
+      .select('*').eq('created_by', user.id).eq('type', 'print_station').eq('sale_id', device_id).limit(1);
+    if (existing && existing.length) {
+      return c.json({ ok: true, code: existing[0].title, device_id, resumed: true });
+    }
+    const code = stationCode();
     await admin.from('notification').insert({
-      title: 'Computador',
-      message: JSON.stringify({ device_id, cash_session_id, at: Date.now() }),
+      title: code,
+      message: JSON.stringify({ device_id, name: body.name || 'Computador' }),
       type: 'print_station',
-      sale_id: cash_session_id,
+      sale_id: device_id,
       read: true,
       created_by: user.id,
     });
-    return c.json({ ok: true, cash_session_id });
+    return c.json({ ok: true, code, device_id });
   } catch (e) {
     return c.json({ error: e.message || 'failed' }, 500);
   }
 });
+
+functions.post('/print-station-link', async (c) => {
+  try {
+    const user = await requireUser(c);
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+    if (!admin) return c.json({ error: 'db_unavailable' }, 503);
+    const body = await c.req.json().catch(() => ({}));
+    const code = String(body.code || '').trim().toUpperCase();
+    const mobile_id = String(body.device_id || '').trim();
+    if (!code || !mobile_id) return c.json({ error: 'Informe o código e o celular.' }, 400);
+    const { data: station } = await admin.from('notification')
+      .select('*').eq('created_by', user.id).eq('type', 'print_station').eq('title', code).limit(1);
+    if (!station || !station.length) return c.json({ error: 'Código não encontrado neste sistema.' }, 404);
+    const station_id = station[0].sale_id;
+    const { data: old } = await admin.from('notification')
+      .select('id').eq('created_by', user.id).eq('type', 'device_link').eq('sale_id', mobile_id).limit(5);
+    for (const row of old || []) await admin.from('notification').delete().eq('id', row.id);
+    await admin.from('notification').insert({
+      title: code,
+      message: JSON.stringify({ mobile_id, station_id, code }),
+      type: 'device_link',
+      sale_id: mobile_id,
+      read: true,
+      created_by: user.id,
+    });
+    return c.json({ ok: true, station_id, code });
+  } catch (e) {
+    return c.json({ error: e.message || 'failed' }, 500);
+  }
+});
+
+
+async function enqueuePrintJobForSale(sale, userId) {
+  try {
+    if (!admin || !sale || !sale.id) return;
+    const dt = String(sale.delivery_type || '').toLowerCase();
+    // Só força fila automática para entrega/retirada (PC imprime na i8)
+    if (dt !== 'entrega' && dt !== 'retirada') return;
+    const { data: jobDup } = await admin
+      .from('notification')
+      .select('id')
+      .eq('created_by', userId || sale.created_by)
+      .eq('type', 'print_job')
+      .eq('sale_id', sale.id)
+      .eq('read', false)
+      .limit(1);
+    if (jobDup && jobDup.length) return;
+    let saleFull = sale;
+    if (!sale.items || !sale.items.length) {
+      const { data: fresh } = await admin.from('sale').select('*').eq('id', sale.id).maybeSingle();
+      if (fresh) saleFull = fresh;
+    }
+    await admin.from('notification').insert({
+      title: 'Imprimir',
+      message: JSON.stringify({ 
+        station_id: null, 
+        sale: saleFull, 
+        from: 'finalize-er', 
+        auto: true,
+        cash_session_id: sale.cash_session_id || saleFull.cash_session_id || null
+      }),
+      type: 'print_job',
+      sale_id: sale.id,
+      delivery_type: sale.delivery_type || '',
+      read: false,
+      created_by: userId || sale.created_by || null,
+    });
+  } catch (e) {
+    console.warn('enqueuePrintJobForSale', e.message);
+  }
+}
 
 functions.post('/print-job', async (c) => {
   try {
@@ -1241,15 +1413,13 @@ functions.post('/print-job', async (c) => {
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const body = await c.req.json().catch(() => ({}));
-    const cash_session_id = String(body.cash_session_id || '').trim();
+    const mobile_id = String(body.device_id || '').trim();
     const sale_id = String(body.sale_id || '').trim();
-    if (!cash_session_id) return c.json({ error: 'Abra o mesmo caixa neste celular.' }, 400);
-    const { data: station } = await admin.from('notification')
-      .select('*').eq('created_by', user.id).eq('type', 'print_station').eq('sale_id', cash_session_id).limit(1);
-    if (!station || !station.length) return c.json({ error: 'Nenhum computador com este caixa aberto.' }, 409);
-    let info={};
-    try{ info=JSON.parse(station[0].message||'{}'); }catch(e){}
-    if (info.at && Date.now()-info.at > 20000) return c.json({ error: 'O computador deste caixa está desconectado.' }, 409);
+    if (!mobile_id) return c.json({ error: 'Celular não identificado.' }, 400);
+    const { data: link } = await admin.from('notification')
+      .select('*').eq('created_by', user.id).eq('type', 'device_link').eq('sale_id', mobile_id).limit(1);
+    if (!link || !link.length) return c.json({ error: 'Celular não vinculado a um computador.', offline: true }, 409);
+    const station_id = JSON.parse(link[0].message || '{}').station_id;
     if (sale_id) {
       const { data: dup } = await admin.from('notification')
         .select('id').eq('created_by', user.id).eq('type', 'print_job').eq('sale_id', sale_id).eq('read', false).limit(1);
@@ -1257,14 +1427,19 @@ functions.post('/print-job', async (c) => {
     }
     await admin.from('notification').insert({
       title: 'Imprimir',
-      message: JSON.stringify({ cash_session_id, station_id: info.device_id, sale: body.sale || null }),
+      message: JSON.stringify({ 
+        station_id, 
+        sale: body.sale || null, 
+        from: mobile_id,
+        cash_session_id: body.cash_session_id || (body.sale && body.sale.cash_session_id) || null
+      }),
       type: 'print_job',
       sale_id: sale_id || null,
       delivery_type: body.delivery_type || '',
       read: false,
       created_by: user.id,
     });
-    return c.json({ ok: true });
+    return c.json({ ok: true, station_id });
   } catch (e) {
     return c.json({ error: e.message || 'failed' }, 500);
   }
@@ -1276,13 +1451,46 @@ functions.post('/print-jobs', async (c) => {
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const body = await c.req.json().catch(() => ({}));
-    const cash_session_id = String(body.cash_session_id || '').trim();
-    if (!cash_session_id) return c.json({ jobs: [] });
-    const { data } = await admin.from('notification')
-      .select('*').eq('created_by', user.id).eq('type', 'print_job').eq('read', false)
-      .order('created_date', { ascending: true }).limit(20);
+    const station_id = String(body.device_id || body.station_id || '').trim();
+    // Expira jobs antigos (>10 min) para não entupir a fila
+    try {
+      const stale = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      await admin.from('notification')
+        .update({ read: true })
+        .eq('created_by', user.id)
+        .eq('type', 'print_job')
+        .eq('read', false)
+        .lt('created_at', stale);
+    } catch (_) {}
+    let data = null;
+    try {
+      const r1 = await admin.from('notification')
+        .select('*').eq('created_by', user.id).eq('type', 'print_job').eq('read', false)
+        .order('created_at', { ascending: true }).limit(50);
+      data = r1.data;
+      if (r1.error) throw r1.error;
+    } catch (_) {
+      try {
+        const r2 = await admin.from('notification')
+          .select('*').eq('created_by', user.id).eq('type', 'print_job').eq('read', false)
+          .limit(50);
+        data = r2.data;
+      } catch (e2) {
+        console.warn('print-jobs', e2.message);
+      }
+    }
+    // Aceita jobs desta estação OU jobs broadcast (station_id vazio / auto webhook)
+    // Se station_id do request estiver vazio, devolve todos os jobs da loja
     const jobs = (data || []).filter((row) => {
-      try { return JSON.parse(row.message || '{}').cash_session_id === cash_session_id; } catch { return false; }
+      try {
+        const msg = JSON.parse(row.message || '{}');
+        if (!station_id) return true;
+        if (!msg.station_id) return true;
+        return msg.station_id === station_id;
+      } catch {
+        // mensagem inválida: ainda devolve para o PC tentar imprimir pelo sale_id
+        return true;
+      }
     });
     return c.json({ jobs });
   } catch (e) {
@@ -1315,7 +1523,7 @@ functions.post('/:name', async (c) => {
   'barcode-lookup','product-name-lookup','enrich-product','save-product','repair-product-ownership','refresh-products-catalog',
   'start-stock-count','stock-count-search','stock-count-apply','sync-pdv-reservations',
   'admin-stats','cleanup-cash-sessions','purge-account','init-help-content',
-  'check-vale-due','sales-revenue-summary','top-products-month','app-bootstrap','create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','get-access-status','access-status','referral-panel','master-code-status','ensure-referral-code','cancel-subscription','resume-subscription',
+  'check-vale-due','sales-revenue-summary','top-products-month','app-bootstrap','create-checkout','stripe-webhook','init-subscription','link-referral','subscription-status','get-access-status','access-status','referral-panel','master-code-status','ensure-referral-code','cancel-subscription','resume-subscription','cancel-open-order','edit-concluded-sale','mark-vale-paid','set-catalog-slug','payment-link','pdv-pix-sweep',
   'print-station-register','print-station-link','print-job','print-jobs','print-job-done','fetch-nfe-xml','import-nfe','address-search',
     'fiscal-disconnect','fiscal-connect-toggle','fiscal-settings','fiscal-settings-save','fiscal-certificate','fiscal-test','fiscal-nfce','fiscal-nfe','fiscal-documents','fiscal-document','fiscal-document-xml','fiscal-document-danfe','fiscal-cancel','fiscal-status','fiscal-webhook',
 ];
