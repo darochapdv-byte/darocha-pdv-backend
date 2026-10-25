@@ -1413,13 +1413,8 @@ functions.post('/print-job', async (c) => {
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const body = await c.req.json().catch(() => ({}));
-    const mobile_id = String(body.device_id || '').trim();
     const sale_id = String(body.sale_id || '').trim();
-    if (!mobile_id) return c.json({ error: 'Celular não identificado.' }, 400);
-    const { data: link } = await admin.from('notification')
-      .select('*').eq('created_by', user.id).eq('type', 'device_link').eq('sale_id', mobile_id).limit(1);
-    if (!link || !link.length) return c.json({ error: 'Celular não vinculado a um computador.', offline: true }, 409);
-    const station_id = JSON.parse(link[0].message || '{}').station_id;
+    // Vinculação removida: job é broadcast (qualquer PC da conta pega, filtrado por caixa)
     if (sale_id) {
       const { data: dup } = await admin.from('notification')
         .select('id').eq('created_by', user.id).eq('type', 'print_job').eq('sale_id', sale_id).eq('read', false).limit(1);
@@ -1428,9 +1423,9 @@ functions.post('/print-job', async (c) => {
     await admin.from('notification').insert({
       title: 'Imprimir',
       message: JSON.stringify({ 
-        station_id, 
+        station_id: null, 
         sale: body.sale || null, 
-        from: mobile_id,
+        from: body.device_id || 'mobile',
         cash_session_id: body.cash_session_id || (body.sale && body.sale.cash_session_id) || null
       }),
       type: 'print_job',
@@ -1439,7 +1434,7 @@ functions.post('/print-job', async (c) => {
       read: false,
       created_by: user.id,
     });
-    return c.json({ ok: true, station_id });
+    return c.json({ ok: true });
   } catch (e) {
     return c.json({ error: e.message || 'failed' }, 500);
   }
