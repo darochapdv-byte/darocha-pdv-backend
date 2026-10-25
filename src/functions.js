@@ -800,6 +800,17 @@ functions.post("/finalize-sale", async (c) => {
     }
     // Frontend espera response.data.sale
     try { await enqueuePrintJobForSale(createdSale, user.id); } catch (_) {}
+    try {
+      await admin.from('notification').insert({
+        title: 'Venda recebida',
+        message: `Pedido #${String(createdSale.id).slice(-6).toUpperCase()} · R$ ${Number(createdSale.total||0).toFixed(2)} · ${createdSale.delivery_type||''}`,
+        type: 'pagamento_recebido',
+        sale_id: createdSale.id,
+        delivery_type: createdSale.delivery_type || '',
+        read: false,
+        created_by: user.id,
+      });
+    } catch (_) {}
     return c.json({ ok: true, success: true, sale: toBase44Row(createdSale), sale_id: createdSale.id });
   } catch (error) {
     await logOperation({
