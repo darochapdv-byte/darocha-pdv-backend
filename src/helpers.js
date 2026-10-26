@@ -546,24 +546,7 @@ export async function getAllowZeroStock(userId = null) {
       cacheSet(ck, true, 60000);
       return true;
     }
-    const { data: logs } = await admin
-      .from('operational_log')
-      .select('description')
-      .eq('type', ZERO_STOCK_SETTING_TYPE)
-      .order('created_at', { ascending: false })
-      .limit(1);
-    if (logs?.[0]?.description) {
-      try {
-        const parsed = JSON.parse(logs[0].description);
-        const v = parsed?.allow_zero_stock === true;
-        cacheSet(ck, v, 60000);
-        return v;
-      } catch {
-        const v = logs[0].description === 'true';
-        cacheSet(ck, v, 60000);
-        return v;
-      }
-    }
+    // Log global antigo não força mais o padrão — padrão é ATIVO
   } catch (e) {
     console.error('getAllowZeroStock', e.message || e);
   }
