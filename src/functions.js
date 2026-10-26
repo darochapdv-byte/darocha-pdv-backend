@@ -380,7 +380,7 @@ functions.post("/finalize-sale", async (c) => {
     } catch (_) {}
 
     // allow_zero_stock com cache (45s)
-    let allowZeroStock = body.allow_zero_stock === true;
+    let allowZeroStock = body.allow_zero_stock !== false; // padrão ativo
     try {
       const azKey = `azs:${user.id}`;
       const cachedAz = cacheGet(azKey);

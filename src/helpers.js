@@ -531,9 +531,20 @@ export async function getAllowZeroStock(userId = null) {
     const { data: settingsList } = await q;
     const s = settingsList?.[0];
     if (s && Object.prototype.hasOwnProperty.call(s, 'allow_zero_stock') && s.allow_zero_stock != null) {
+      // Só desliga se estiver explicitamente false
+      if (s.allow_zero_stock === false || s.allow_zero_stock === 'false' || s.allow_zero_stock === 0) {
+        cacheSet(ck, false, 60000);
+        return false;
+      }
       const v = s.allow_zero_stock === true || s.allow_zero_stock === 'true' || s.allow_zero_stock === 1;
-      cacheSet(ck, v, 60000);
-      return v;
+      // null/undefined na coluna = ativo (padrão)
+      cacheSet(ck, v || true, 60000);
+      return true;
+    }
+    // Sem valor gravado: padrão ATIVO
+    if (s) {
+      cacheSet(ck, true, 60000);
+      return true;
     }
     const { data: logs } = await admin
       .from('operational_log')
@@ -556,8 +567,9 @@ export async function getAllowZeroStock(userId = null) {
   } catch (e) {
     console.error('getAllowZeroStock', e.message || e);
   }
-  cacheSet(`azs2:${userId || 'global'}`, false, 30000);
-  return false;
+  // Padrão: ATIVO em todas as contas (quem não quiser desativa nas configurações)
+  cacheSet(`azs2:${userId || 'global'}`, true, 30000);
+  return true;
 }
 
 /** Persiste a política global "vender sem estoque". */
