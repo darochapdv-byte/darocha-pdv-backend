@@ -523,12 +523,17 @@ export async function resolveStoreBySlug(slug) {
 export async function getAllowZeroStock(userId = null) {
   if (!admin) return false;
   try {
-    let q = admin.from('app_settings').select('*').order('created_at', { ascending: false }).limit(1);
-    if (userId) q = admin.from('app_settings').select('*').eq('created_by', userId).order('created_at', { ascending: false }).limit(1);
+    const ck = `azs2:${userId || 'global'}`;
+    const hit = cacheGet(ck);
+    if (typeof hit === 'boolean') return hit;
+    let q = admin.from('app_settings').select('allow_zero_stock').order('created_at', { ascending: false }).limit(1);
+    if (userId) q = admin.from('app_settings').select('allow_zero_stock').eq('created_by', userId).order('created_at', { ascending: false }).limit(1);
     const { data: settingsList } = await q;
     const s = settingsList?.[0];
     if (s && Object.prototype.hasOwnProperty.call(s, 'allow_zero_stock') && s.allow_zero_stock != null) {
-      return s.allow_zero_stock === true || s.allow_zero_stock === 'true' || s.allow_zero_stock === 1;
+      const v = s.allow_zero_stock === true || s.allow_zero_stock === 'true' || s.allow_zero_stock === 1;
+      cacheSet(ck, v, 60000);
+      return v;
     }
     const { data: logs } = await admin
       .from('operational_log')
@@ -539,14 +544,19 @@ export async function getAllowZeroStock(userId = null) {
     if (logs?.[0]?.description) {
       try {
         const parsed = JSON.parse(logs[0].description);
-        return parsed?.allow_zero_stock === true;
+        const v = parsed?.allow_zero_stock === true;
+        cacheSet(ck, v, 60000);
+        return v;
       } catch {
-        return logs[0].description === 'true';
+        const v = logs[0].description === 'true';
+        cacheSet(ck, v, 60000);
+        return v;
       }
     }
   } catch (e) {
     console.error('getAllowZeroStock', e.message || e);
   }
+  cacheSet(`azs2:${userId || 'global'}`, false, 30000);
   return false;
 }
 

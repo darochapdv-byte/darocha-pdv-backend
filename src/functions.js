@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { admin } from './db.js';
 import { logOperation, releaseSessionReservations, requireUser, stackOf, sanitizeDateFields, toBase44Row, toBase44Rows, getAllowZeroStock, upsertCustomer, ensureCatalogSlug, buildStorePublicUrl } from './helpers.js';
+import { cacheGet, cacheSet } from './cache.js';
 import { registerCashMovement } from './integration.js';
 import { getAccessStatus } from './stripe_ops.js';
 
@@ -350,35 +351,55 @@ functions.post("/finalize-sale", async (c) => {
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
 
     const body = await c.req.json().catch(() => ({}));
-    // Recupera vendas PDV órfãs (created_by null) ligadas a caixas desta loja
-    try {
-      const { data: sessions } = await admin.from('cash_session').select('id').eq('created_by', user.id).limit(100);
-      const sids = (sessions || []).map((x) => x.id).filter(Boolean);
-      if (sids.length) {
-        await admin.from('sale').update({ created_by: user.id }).is('created_by', null).in('cash_session_id', sids);
-      }
-    } catch (e) {
-      console.warn('orphan sale ownership recovery', e?.message || e);
-    }
     const sale = sanitizeDateFields(body.sale || body);
     session_id = body.session_id || sale.cash_session_id || '';
     device_id = body.device_id || '';
     client_ref = sale.client_ref || '';
-    // Política "vender sem estoque" da própria loja
-    let allowZeroStock = body.allow_zero_stock === true;
-    try {
-      const { data: ownSettings } = await admin
-        .from('app_settings').select('allow_zero_stock')
-        .eq('created_by', user.id)
-        .order('created_at', { ascending: false }).limit(20);
-      if ((ownSettings || []).some((s) => s && s.allow_zero_stock === true)) allowZeroStock = true;
-      else if (!allowZeroStock) allowZeroStock = await getAllowZeroStock(user.id);
-    } catch {
-      try { allowZeroStock = (await getAllowZeroStock(user.id)) || allowZeroStock; }
-      catch { allowZeroStock = (await getAllowZeroStock()) || allowZeroStock; }
-    }
     const items = Array.isArray(sale.items) ? sale.items : [];
     const operator_name = sale.operator_name || user.full_name || user.email || '';
+
+    // Orphan recovery em background (não atrasa a venda) — no máximo 1x/5min por loja
+    try {
+      const okKey = `orphan:${user.id}`;
+      if (!cacheGet(okKey)) {
+        cacheSet(okKey, 1, 5 * 60 * 1000);
+        setImmediate(() => {
+          (async () => {
+            try {
+              const { data: sessions } = await admin.from('cash_session').select('id').eq('created_by', user.id).limit(50);
+              const sids = (sessions || []).map((x) => x.id).filter(Boolean);
+              if (sids.length) {
+                await admin.from('sale').update({ created_by: user.id }).is('created_by', null).in('cash_session_id', sids);
+              }
+            } catch (e) {
+              console.warn('orphan sale ownership recovery', e?.message || e);
+            }
+          })();
+        });
+      }
+    } catch (_) {}
+
+    // allow_zero_stock com cache (45s)
+    let allowZeroStock = body.allow_zero_stock === true;
+    try {
+      const azKey = `azs:${user.id}`;
+      const cachedAz = cacheGet(azKey);
+      if (typeof cachedAz === 'boolean') {
+        if (cachedAz) allowZeroStock = true;
+      } else {
+        const { data: ownSettings } = await admin
+          .from('app_settings').select('allow_zero_stock')
+          .eq('created_by', user.id)
+          .order('created_at', { ascending: false }).limit(5);
+        const fromDb = (ownSettings || []).some((s) => s && s.allow_zero_stock === true);
+        if (fromDb) allowZeroStock = true;
+        else if (!allowZeroStock) allowZeroStock = !!(await getAllowZeroStock(user.id));
+        cacheSet(azKey, allowZeroStock, 45000);
+      }
+    } catch {
+      try { allowZeroStock = (await getAllowZeroStock(user.id)) || allowZeroStock; }
+      catch { allowZeroStock = allowZeroStock; }
+    }
 
     if (!items.length) {
       return c.json({ error: 'Carrinho vazio. Nenhuma alteração foi realizada.' }, 400);
@@ -448,51 +469,57 @@ functions.post("/finalize-sale", async (c) => {
           reason: 'wrong_store',
         }, 403);
       }
-      // Caixa órfão: vincula à loja logada
-      if (!cashSession.created_by && user.id) {
-        try {
-          await admin.from('cash_session').update({ created_by: user.id }).eq('id', session_id).is('created_by', null);
-        } catch (_) {}
-      }
-      // Se o dispositivo mudou mas o caixa é da mesma loja, assume neste aparelho e segue a venda
-      if (device_id && cashSession.device_id && cashSession.device_id !== device_id) {
-        try {
-          await admin.from('cash_session').update({
-            device_id,
-            last_active_at: new Date().toISOString(),
-            inactive: false,
-          }).eq('id', session_id);
-        } catch (e) {
-          console.warn('auto-takeover device on finalize', e?.message || e);
-        }
-      } else if (device_id && !cashSession.device_id) {
-        try {
-          await admin.from('cash_session').update({ device_id, last_active_at: new Date().toISOString() }).eq('id', session_id);
-        } catch (_) {}
-      }
+      // Updates de caixa em background (não bloqueiam a gravação da venda)
+      const sid = session_id;
+      const uid = user.id;
+      const did = device_id;
+      const cs = cashSession;
+      setImmediate(() => {
+        (async () => {
+          try {
+            if (!cs.created_by && uid) {
+              await admin.from('cash_session').update({ created_by: uid }).eq('id', sid).is('created_by', null);
+            }
+            if (did && cs.device_id && cs.device_id !== did) {
+              await admin.from('cash_session').update({
+                device_id: did,
+                last_active_at: new Date().toISOString(),
+                inactive: false,
+              }).eq('id', sid);
+            } else if (did && !cs.device_id) {
+              await admin.from('cash_session').update({ device_id: did, last_active_at: new Date().toISOString() }).eq('id', sid);
+            }
+          } catch (e) {
+            console.warn('cash session bg update', e?.message || e);
+          }
+        })();
+      });
     }
 
 
 
-    // RPC atômica (se 002_finalize_sale_rpc.sql foi aplicado)
-    // Cliente automático antes da RPC também
-    try {
-      const custId = await upsertCustomer(user.id, {
-        name: sale.customer_name || sale.client_name || sale.delivery_person,
-        phone: sale.customer_phone || sale.client_phone || sale.delivery_phone,
-        email: sale.customer_email || sale.client_email,
-        street: sale.delivery_address || sale.customer_address,
-        number: sale.delivery_number,
-        complement: sale.delivery_complement,
-        neighborhood: sale.delivery_neighborhood,
-        city: sale.delivery_city,
-        state: sale.delivery_state,
-        cep: sale.delivery_cep,
-        doc: sale.customer_doc || sale.customer_cpf || sale.cpf,
-      });
-      if (custId) sale.customer_id = custId;
-    } catch (e) {
-      console.warn('customer upsert pre-rpc', e?.message || e);
+    // Cliente: só busca/cria se houver nome ou telefone (leva agora sem cliente = skip)
+    const _cname = (sale.customer_name || sale.client_name || '').trim();
+    const _cphone = (sale.customer_phone || sale.client_phone || sale.delivery_phone || '').trim();
+    if ((_cname || _cphone) && !sale.customer_id) {
+      try {
+        const custId = await upsertCustomer(user.id, {
+          name: sale.customer_name || sale.client_name || sale.delivery_person,
+          phone: sale.customer_phone || sale.client_phone || sale.delivery_phone,
+          email: sale.customer_email || sale.client_email,
+          street: sale.delivery_address || sale.customer_address,
+          number: sale.delivery_number,
+          complement: sale.delivery_complement,
+          neighborhood: sale.delivery_neighborhood,
+          city: sale.delivery_city,
+          state: sale.delivery_state,
+          cep: sale.delivery_cep,
+          doc: sale.customer_doc || sale.customer_cpf || sale.cpf,
+        });
+        if (custId) sale.customer_id = custId;
+      } catch (e) {
+        console.warn('customer upsert pre-rpc', e?.message || e);
+      }
     }
 
     const { data: rpcResult, error: rpcError } = await admin.rpc('finalize_sale', {
@@ -560,22 +587,38 @@ functions.post("/finalize-sale", async (c) => {
         };
         // remove undefined to avoid wiping columns
         Object.keys(patch).forEach((k) => { if (patch[k] === undefined) delete patch[k]; });
-        try {
-          const { data: fixed, error: fixErr } = await admin
-            .from('sale')
-            .update(patch)
-            .eq('id', saleId)
-            .select()
-            .maybeSingle();
-          if (fixErr) console.warn('patch sale after RPC', fixErr.message);
-          if (fixed) saleRow = fixed;
-          else saleRow = { ...saleRow, ...patch, id: saleId };
-        } catch (e) {
-          console.warn('patch sale after finalize_sale RPC', e?.message || e);
-          saleRow = { ...saleRow, ...patch, id: saleId };
-        }
+        // Responde na hora com merge local; UPDATE no banco em paralelo (sem await do select)
+        saleRow = { ...saleRow, ...patch, id: saleId };
+        const sidUpd = saleId;
+        const patchBg = { ...patch };
+        setImmediate(() => {
+          admin.from('sale').update(patchBg).eq('id', sidUpd).then(({ error: fixErr }) => {
+            if (fixErr) console.warn('patch sale after RPC', fixErr.message);
+          }).catch((e) => console.warn('patch sale after finalize_sale RPC', e?.message || e));
+        });
       }
-      try { await enqueuePrintJobForSale(saleRow, user.id); } catch (_) {}
+      // Cash movement + release reservas em background (não atrasa o PDV)
+      if (session_id && saleId) {
+        const _sid = session_id;
+        const _saleId = saleId;
+        const _total = Number(saleRow.total) || Number(sale.total) || 0;
+        const _op = operator_name;
+        setImmediate(() => {
+          (async () => {
+            try {
+              await registerCashMovement({
+                cash_session_id: _sid,
+                type: 'venda',
+                amount: _total,
+                reason: `Venda PDV #${String(_saleId).slice(-6).toUpperCase()}`,
+                sale_id: _saleId,
+                operator_name: _op,
+              });
+            } catch (_) {}
+            try { await releaseSessionReservations(_sid); } catch (_) {}
+          })();
+        });
+      }
       return c.json({ ok: true, success: true, sale: toBase44Row(saleRow), sale_id: saleId || saleRow.id });
     }
 
@@ -613,8 +656,7 @@ functions.post("/finalize-sale", async (c) => {
               } catch (_) {}
               await releaseSessionReservations(session_id);
             }
-            try { await enqueuePrintJobForSale({ ...(upd || ex), ...patch, id: ex.id }, user.id); } catch (_) {}
-          return c.json({ ok: true, success: true, sale: toBase44Row(upd || { ...ex, ...patch }), sale_id: ex.id, resumed: true });
+            return c.json({ ok: true, success: true, sale: toBase44Row(upd || { ...ex, ...patch }), sale_id: ex.id, resumed: true });
           } catch (e) {
             console.warn('complete pending by client_ref', e.message);
           }
@@ -673,7 +715,6 @@ functions.post("/finalize-sale", async (c) => {
             } catch (_) {}
             await releaseSessionReservations(session_id);
           }
-          try { await enqueuePrintJobForSale({ ...(upd || match), ...patch, id: match.id }, user.id); } catch (_) {}
           return c.json({ ok: true, success: true, sale: toBase44Row(upd || { ...match, ...patch }), sale_id: match.id, resumed: true });
         }
       }
@@ -799,18 +840,6 @@ functions.post("/finalize-sale", async (c) => {
       }
     }
     // Frontend espera response.data.sale
-    try { await enqueuePrintJobForSale(createdSale, user.id); } catch (_) {}
-    try {
-      await admin.from('notification').insert({
-        title: 'Venda recebida',
-        message: `Pedido #${String(createdSale.id).slice(-6).toUpperCase()} · R$ ${Number(createdSale.total||0).toFixed(2)} · ${createdSale.delivery_type||''}`,
-        type: 'pagamento_recebido',
-        sale_id: createdSale.id,
-        delivery_type: createdSale.delivery_type || '',
-        read: false,
-        created_by: user.id,
-      });
-    } catch (_) {}
     return c.json({ ok: true, success: true, sale: toBase44Row(createdSale), sale_id: createdSale.id });
   } catch (error) {
     await logOperation({
@@ -1377,55 +1406,19 @@ functions.post('/print-station-link', async (c) => {
   }
 });
 
-
-async function enqueuePrintJobForSale(sale, userId) {
-  try {
-    if (!admin || !sale || !sale.id) return;
-    const dt = String(sale.delivery_type || '').toLowerCase();
-    // Só força fila automática para entrega/retirada (PC imprime na i8)
-    if (dt !== 'entrega' && dt !== 'retirada') return;
-    const { data: jobDup } = await admin
-      .from('notification')
-      .select('id')
-      .eq('created_by', userId || sale.created_by)
-      .eq('type', 'print_job')
-      .eq('sale_id', sale.id)
-      .eq('read', false)
-      .limit(1);
-    if (jobDup && jobDup.length) return;
-    let saleFull = sale;
-    if (!sale.items || !sale.items.length) {
-      const { data: fresh } = await admin.from('sale').select('*').eq('id', sale.id).maybeSingle();
-      if (fresh) saleFull = fresh;
-    }
-    await admin.from('notification').insert({
-      title: 'Imprimir',
-      message: JSON.stringify({ 
-        station_id: null, 
-        sale: saleFull, 
-        from: 'finalize-er', 
-        auto: true,
-        cash_session_id: sale.cash_session_id || saleFull.cash_session_id || null
-      }),
-      type: 'print_job',
-      sale_id: sale.id,
-      delivery_type: sale.delivery_type || '',
-      read: false,
-      created_by: userId || sale.created_by || null,
-    });
-  } catch (e) {
-    console.warn('enqueuePrintJobForSale', e.message);
-  }
-}
-
 functions.post('/print-job', async (c) => {
   try {
     const user = await requireUser(c);
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const body = await c.req.json().catch(() => ({}));
+    const mobile_id = String(body.device_id || '').trim();
     const sale_id = String(body.sale_id || '').trim();
-    // Vinculação removida: job é broadcast (qualquer PC da conta pega, filtrado por caixa)
+    if (!mobile_id) return c.json({ error: 'Celular não identificado.' }, 400);
+    const { data: link } = await admin.from('notification')
+      .select('*').eq('created_by', user.id).eq('type', 'device_link').eq('sale_id', mobile_id).limit(1);
+    if (!link || !link.length) return c.json({ error: 'Celular não vinculado a um computador.', offline: true }, 409);
+    const station_id = JSON.parse(link[0].message || '{}').station_id;
     if (sale_id) {
       const { data: dup } = await admin.from('notification')
         .select('id').eq('created_by', user.id).eq('type', 'print_job').eq('sale_id', sale_id).eq('read', false).limit(1);
@@ -1433,19 +1426,14 @@ functions.post('/print-job', async (c) => {
     }
     await admin.from('notification').insert({
       title: 'Imprimir',
-      message: JSON.stringify({ 
-        station_id: null, 
-        sale: body.sale || null, 
-        from: body.device_id || 'mobile',
-        cash_session_id: body.cash_session_id || (body.sale && body.sale.cash_session_id) || null
-      }),
+      message: JSON.stringify({ station_id, sale: body.sale || null, from: mobile_id }),
       type: 'print_job',
       sale_id: sale_id || null,
       delivery_type: body.delivery_type || '',
       read: false,
       created_by: user.id,
     });
-    return c.json({ ok: true });
+    return c.json({ ok: true, station_id });
   } catch (e) {
     return c.json({ error: e.message || 'failed' }, 500);
   }
@@ -1457,46 +1445,32 @@ functions.post('/print-jobs', async (c) => {
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
     if (!admin) return c.json({ error: 'db_unavailable' }, 503);
     const body = await c.req.json().catch(() => ({}));
-    const station_id = String(body.device_id || body.station_id || '').trim();
-    // Expira jobs antigos (>10 min) para não entupir a fila
-    try {
-      const stale = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-      await admin.from('notification')
-        .update({ read: true })
-        .eq('created_by', user.id)
-        .eq('type', 'print_job')
-        .eq('read', false)
-        .lt('created_at', stale);
-    } catch (_) {}
+    const station_id = String(body.device_id || '').trim();
+    if (!station_id) return c.json({ jobs: [] });
     let data = null;
     try {
       const r1 = await admin.from('notification')
         .select('*').eq('created_by', user.id).eq('type', 'print_job').eq('read', false)
-        .order('created_at', { ascending: true }).limit(50);
+        .order('created_at', { ascending: true }).limit(30);
       data = r1.data;
       if (r1.error) throw r1.error;
     } catch (_) {
       try {
         const r2 = await admin.from('notification')
           .select('*').eq('created_by', user.id).eq('type', 'print_job').eq('read', false)
-          .limit(50);
+          .limit(30);
         data = r2.data;
       } catch (e2) {
         console.warn('print-jobs', e2.message);
       }
     }
     // Aceita jobs desta estação OU jobs broadcast (station_id vazio / auto webhook)
-    // Se station_id do request estiver vazio, devolve todos os jobs da loja
     const jobs = (data || []).filter((row) => {
       try {
         const msg = JSON.parse(row.message || '{}');
-        if (!station_id) return true;
         if (!msg.station_id) return true;
         return msg.station_id === station_id;
-      } catch {
-        // mensagem inválida: ainda devolve para o PC tentar imprimir pelo sale_id
-        return true;
-      }
+      } catch { return false; }
     });
     return c.json({ jobs });
   } catch (e) {
