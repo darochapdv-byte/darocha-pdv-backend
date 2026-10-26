@@ -556,26 +556,31 @@ export async function getAllowZeroStock(userId = null) {
 }
 
 /** Persiste a política global "vender sem estoque". */
-export async function setAllowZeroStock(value) {
+export async function setAllowZeroStock(value, userId = null) {
   if (!admin) return false;
   const enabled = value === true;
   try {
-    const { data: settingsList } = await admin
-      .from('app_settings')
-      .select('id')
-      .order('created_at', { ascending: false })
-      .limit(1);
-    const id = settingsList?.[0]?.id;
-    if (id) {
-      const { error } = await admin
-        .from('app_settings')
-        .update({ allow_zero_stock: enabled })
-        .eq('id', id);
-      if (!error) return true;
-      console.warn('setAllowZeroStock app_settings', error.message);
+    // Invalida cache
+    try {
+      const { cacheDel, cacheDelPrefix } = await import('./cache.js');
+      cacheDel(`azs2:${userId || 'global'}`);
+      cacheDelPrefix('azs:');
+    } catch (_) {}
+    let q = admin.from('app_settings').select('id,role_payment_methods,created_by').order('created_at', { ascending: false }).limit(30);
+    if (userId) q = admin.from('app_settings').select('id,role_payment_methods,created_by').eq('created_by', userId).order('created_at', { ascending: false }).limit(30);
+    const { data: rows } = await q;
+    if (rows && rows.length) {
+      for (const row of rows) {
+        const rpm = (row.role_payment_methods && typeof row.role_payment_methods === 'object' && !Array.isArray(row.role_payment_methods))
+          ? { ...row.role_payment_methods }
+          : {};
+        rpm.__darocha = Object.assign({}, rpm.__darocha || {}, { allow_zero_stock: enabled });
+        await admin.from('app_settings').update({ role_payment_methods: rpm }).eq('id', row.id);
+      }
+      return true;
     }
   } catch (e) {
-    console.warn('setAllowZeroStock app_settings', e.message || e);
+    console.warn('setAllowZeroStock', e.message || e);
   }
   try {
     await admin.from('operational_log').insert({
@@ -586,7 +591,7 @@ export async function setAllowZeroStock(value) {
     });
     return true;
   } catch (e) {
-    console.error('setAllowZeroStock fallback', e.message || e);
+    console.error('setAllowZeroStock log', e.message || e);
     return false;
   }
 }

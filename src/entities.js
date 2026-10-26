@@ -438,12 +438,25 @@ entities.get('/:entity', async (c) => {
       let catalog_slug = r.catalog_slug || null;
       // Não gera slug em toda listagem (lento) — só se já existir
       const catalog_url = catalog_slug ? buildStorePublicUrl(catalog_slug) : null;
-      // allow_zero_stock: true por padrão, false só se explícito na linha
-      let az = allow;
-      if (r && r.allow_zero_stock === false) az = false;
-      else if (r && (r.allow_zero_stock === true || r.allow_zero_stock === 'true')) az = true;
-      else az = true; // padrão ON
-      enriched.push({ ...r, allow_zero_stock: az, catalog_slug: catalog_slug || r.catalog_slug || null, catalog_url });
+      // allow_zero_stock: da flag consolidada (padrão ON)
+      let az = allow !== false;
+      try {
+        const rpm = r?.role_payment_methods;
+        const flag = rpm?.__darocha?.allow_zero_stock ?? rpm?.allow_zero_stock;
+        if (flag === false || flag === 'false') az = false;
+        if (flag === true || flag === 'true') az = true;
+      } catch (_) {}
+      // Restaura PIN do backup JSON se coluna vazia
+      let pin_hash = r.pin_hash;
+      let pin_set = r.pin_set;
+      try {
+        const sec = r?.role_payment_methods?.__darocha_security;
+        if (sec?.pin_hash && !pin_hash) {
+          pin_hash = sec.pin_hash;
+          pin_set = true;
+        }
+      } catch (_) {}
+      enriched.push({ ...r, pin_hash: pin_hash || r.pin_hash, pin_set: !!(pin_set || pin_hash || r.pin_set), allow_zero_stock: az, catalog_slug: catalog_slug || r.catalog_slug || null, catalog_url });
     }
     rows = enriched;
   }
@@ -721,9 +734,29 @@ entities.post('/:entity', async (c) => {
           if (body.pin_hash) {
             row.pin_hash = body.pin_hash;
             row.pin_set = true;
+            // Propaga PIN para TODAS as linhas app_settings desta loja (evita loop de cadastro)
+            try {
+              const pinPatch = {
+                pin_hash: body.pin_hash,
+                pin_set: true,
+                pin_failed_attempts: 0,
+                pin_locked_until: null,
+              };
+              await admin.from(table).update(pinPatch).eq('created_by', user.id);
+            } catch (pe) {
+              console.warn('propagate pin', pe?.message || pe);
+            }
           }
-          if (allowZeroStockSaved != null) row.allow_zero_stock = allowZeroStockSaved;
-          else row.allow_zero_stock = true;
+          if (allowZeroStockSaved != null) {
+            row.allow_zero_stock = allowZeroStockSaved;
+            try { await setAllowZeroStock(allowZeroStockSaved, user.id); } catch (_) {}
+          } else {
+            row.allow_zero_stock = true;
+          }
+          // Espelha flag no JSON se veio no body
+          try {
+            if (allowZeroStockSaved != null) row.allow_zero_stock = allowZeroStockSaved;
+          } catch (_) {}
           try { invalidateListCache(entity, user.id); } catch (_) {}
           return c.json(row);
         }

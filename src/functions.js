@@ -379,24 +379,10 @@ functions.post("/finalize-sale", async (c) => {
       }
     } catch (_) {}
 
-    // allow_zero_stock: padrão ATIVO; só desliga se a loja marcou false
+    // allow_zero_stock via role_payment_methods (coluna DB não existe)
     let allowZeroStock = true;
     try {
-      const azKey = `azs:${user.id}`;
-      const cachedAz = cacheGet(azKey);
-      if (typeof cachedAz === 'boolean') {
-        allowZeroStock = cachedAz;
-      } else {
-        const { data: ownSettings } = await admin
-          .from('app_settings').select('allow_zero_stock')
-          .eq('created_by', user.id)
-          .order('created_at', { ascending: false }).limit(3);
-        const explicitOff = (ownSettings || []).some((s) => s && (s.allow_zero_stock === false || s.allow_zero_stock === 'false'));
-        const explicitOn = (ownSettings || []).some((s) => s && (s.allow_zero_stock === true || s.allow_zero_stock === 'true'));
-        if (explicitOff && !explicitOn) allowZeroStock = false;
-        else allowZeroStock = true;
-        cacheSet(azKey, allowZeroStock, 120000);
-      }
+      allowZeroStock = await getAllowZeroStock(user.id);
     } catch {
       allowZeroStock = true;
     }
