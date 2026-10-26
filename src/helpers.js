@@ -1,4 +1,5 @@
 import { admin } from './db.js';
+import { cacheGet, cacheSet, cacheDel, cacheDelPrefix } from './cache.js';
 
 export function stackOf(error) {
   return (error && (error.stack || error.message)) || String(error || '');
@@ -521,37 +522,40 @@ export async function resolveStoreBySlug(slug) {
 
 /** Lê a política "vender sem estoque" (PDV + catálogo). Opcionalmente por loja (userId). */
 export async function getAllowZeroStock(userId = null) {
-  if (!admin) return false;
+  // Coluna allow_zero_stock NAO existe no Postgres — usa role_payment_methods.__darocha
+  // Padrao: ATIVO (true)
+  if (!admin) return true;
   try {
     const ck = `azs2:${userId || 'global'}`;
     const hit = cacheGet(ck);
     if (typeof hit === 'boolean') return hit;
-    let q = admin.from('app_settings').select('allow_zero_stock').order('created_at', { ascending: false }).limit(1);
-    if (userId) q = admin.from('app_settings').select('allow_zero_stock').eq('created_by', userId).order('created_at', { ascending: false }).limit(1);
-    const { data: settingsList } = await q;
-    const s = settingsList?.[0];
-    if (s && Object.prototype.hasOwnProperty.call(s, 'allow_zero_stock') && s.allow_zero_stock != null) {
-      // Só desliga se estiver explicitamente false
-      if (s.allow_zero_stock === false || s.allow_zero_stock === 'false' || s.allow_zero_stock === 0) {
-        cacheSet(ck, false, 60000);
+    let q = admin.from('app_settings').select('role_payment_methods').order('created_at', { ascending: false }).limit(5);
+    if (userId) {
+      q = admin.from('app_settings').select('role_payment_methods').eq('created_by', userId).order('created_at', { ascending: false }).limit(5);
+    }
+    const { data: settingsList, error } = await q;
+    if (error) {
+      console.warn('getAllowZeroStock', error.message);
+      cacheSet(ck, true, 120000);
+      return true;
+    }
+    for (const s of (settingsList || [])) {
+      const rpm = s?.role_payment_methods;
+      if (!rpm || typeof rpm !== 'object') continue;
+      const flag = rpm.__darocha?.allow_zero_stock ?? rpm.allow_zero_stock;
+      if (flag === false || flag === 'false' || flag === 0) {
+        cacheSet(ck, false, 120000);
         return false;
       }
-      const v = s.allow_zero_stock === true || s.allow_zero_stock === 'true' || s.allow_zero_stock === 1;
-      // null/undefined na coluna = ativo (padrão)
-      cacheSet(ck, v || true, 60000);
-      return true;
+      if (flag === true || flag === 'true' || flag === 1) {
+        cacheSet(ck, true, 120000);
+        return true;
+      }
     }
-    // Sem valor gravado: padrão ATIVO
-    if (s) {
-      cacheSet(ck, true, 60000);
-      return true;
-    }
-    // Log global antigo não força mais o padrão — padrão é ATIVO
   } catch (e) {
     console.error('getAllowZeroStock', e.message || e);
   }
-  // Padrão: ATIVO em todas as contas (quem não quiser desativa nas configurações)
-  cacheSet(`azs2:${userId || 'global'}`, true, 30000);
+  cacheSet(`azs2:${userId || 'global'}`, true, 120000);
   return true;
 }
 
@@ -560,14 +564,14 @@ export async function setAllowZeroStock(value, userId = null) {
   if (!admin) return false;
   const enabled = value === true;
   try {
-    // Invalida cache
     try {
-      const { cacheDel, cacheDelPrefix } = await import('./cache.js');
       cacheDel(`azs2:${userId || 'global'}`);
       cacheDelPrefix('azs:');
     } catch (_) {}
-    let q = admin.from('app_settings').select('id,role_payment_methods,created_by').order('created_at', { ascending: false }).limit(30);
-    if (userId) q = admin.from('app_settings').select('id,role_payment_methods,created_by').eq('created_by', userId).order('created_at', { ascending: false }).limit(30);
+    let q = admin.from('app_settings').select('id,role_payment_methods').order('created_at', { ascending: false }).limit(30);
+    if (userId) {
+      q = admin.from('app_settings').select('id,role_payment_methods').eq('created_by', userId).order('created_at', { ascending: false }).limit(30);
+    }
     const { data: rows } = await q;
     if (rows && rows.length) {
       for (const row of rows) {
