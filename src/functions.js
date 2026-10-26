@@ -619,6 +619,51 @@ functions.post("/finalize-sale", async (c) => {
           })();
         });
       }
+      // Celular → PC: notifica + enfileira impressão (sem mudar fluxo do computador local)
+      try {
+        const ua = String(c.req.header('user-agent') || '');
+        const isMobile = !!(
+          body.from_mobile || body.remote_print || body.print_remote ||
+          sale.source === 'pdv_mobile' || sale.source === 'mobile' ||
+          /Android|iPhone|iPad|Mobile/i.test(ua)
+        );
+        if (isMobile && saleId) {
+          const full = { ...saleRow, id: saleId, items: sale.items || saleRow.items };
+          const total = Number(full.total) || 0;
+          const pm = String(full.payment_method || sale.payment_method || 'venda');
+          setImmediate(() => {
+            (async () => {
+              try {
+                // Notificação visível
+                await admin.from('notification').insert({
+                  title: 'Pagamento recebido · ' + (pm === 'pix' ? 'Pix' : pm),
+                  message: 'R$ ' + total.toFixed(2).replace('.', ',') + ' · clique para imprimir a notinha',
+                  sale_id: saleId,
+                  type: 'pagamento_' + (pm || 'venda').replace(/\s+/g, '_').slice(0, 24),
+                  delivery_type: full.delivery_type || '',
+                  read: false,
+                  created_by: user.id,
+                });
+              } catch (e) { console.warn('mobile notify', e?.message || e); }
+              try {
+                const { data: jobDup } = await admin.from('notification')
+                  .select('id').eq('created_by', user.id).eq('type', 'print_job').eq('sale_id', saleId).eq('read', false).limit(1);
+                if (!(jobDup && jobDup.length)) {
+                  await admin.from('notification').insert({
+                    title: 'Imprimir',
+                    message: JSON.stringify({ station_id: null, sale: full, from: 'mobile-finalize', auto: true }),
+                    type: 'print_job',
+                    sale_id: saleId,
+                    delivery_type: full.delivery_type || '',
+                    read: false,
+                    created_by: user.id,
+                  });
+                }
+              } catch (e) { console.warn('mobile print_job', e?.message || e); }
+            })();
+          });
+        }
+      } catch (_) {}
       return c.json({ ok: true, success: true, sale: toBase44Row(saleRow), sale_id: saleId || saleRow.id });
     }
 
