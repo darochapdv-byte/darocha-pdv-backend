@@ -8,7 +8,7 @@ import { cacheGet, cacheSet, cacheDelPrefix } from './cache.js';
 const entities = new Hono();
 
 // Cache curto de listagens pesadas — invalida em escrita
-const LIST_CACHE_TTL_MS = 25_000;
+const LIST_CACHE_TTL_MS = 90_000;
 const CACHEABLE_LIST = new Set(['Product', 'AppSettings', 'Customer', 'Seller']);
 
 function invalidateListCache(entityName, userId) {
@@ -401,7 +401,7 @@ entities.get('/:entity', async (c) => {
     }
   }
   if (entity === 'AppSettings' && Array.isArray(rows)) {
-    const allow = await getAllowZeroStock();
+    const allow = await getAllowZeroStock(user?.id || null);
     const score = (x) =>
       ((x && (x.pin_hash || x.pin_set)) ? 16 : 0) +
       ((x && x.card_installment_rates) ? 8 : 0) +
@@ -411,25 +411,39 @@ entities.get('/:entity', async (c) => {
     const ordered = [...rows].sort((a, b) => score(b) - score(a));
     for (const r of ordered) {
       for (const [k, v] of Object.entries(r || {})) {
+        // Nunca sobrescrever pin_hash/pin_set true com vazio
+        if (k === 'pin_hash' || k === 'pin_set') {
+          if (merged[k] == null || merged[k] === '' || merged[k] === false) {
+            if (v != null && v !== '' && v !== false) merged[k] = v;
+          }
+          continue;
+        }
         if (merged[k] == null || merged[k] === '' || merged[k] === false) {
           if (v != null && v !== '') merged[k] = v;
         }
       }
+      // backup PIN em role_payment_methods.__darocha_security
+      try {
+        const sec = r?.role_payment_methods?.__darocha_security;
+        if (sec?.pin_hash && !merged.pin_hash) {
+          merged.pin_hash = sec.pin_hash;
+          merged.pin_set = true;
+        }
+      } catch (_) {}
     }
     const base = Object.keys(merged).length ? [merged, ...rows.filter((r) => r && r.id !== merged.id)] : rows;
     const enriched = [];
     for (const r of base) {
       const ownerId = r.created_by || user?.id || null;
       let catalog_slug = r.catalog_slug || null;
-      if (ownerId && !catalog_slug) {
-        try {
-          catalog_slug = await ensureCatalogSlug(ownerId, r.company_name || user?.company_name || null);
-        } catch (e) {
-          console.warn('catalog_slug enrich', e.message || e);
-        }
-      }
+      // Não gera slug em toda listagem (lento) — só se já existir
       const catalog_url = catalog_slug ? buildStorePublicUrl(catalog_slug) : null;
-      enriched.push({ ...r, allow_zero_stock: allow, catalog_slug, catalog_url });
+      // allow_zero_stock: true por padrão, false só se explícito na linha
+      let az = allow;
+      if (r && r.allow_zero_stock === false) az = false;
+      else if (r && (r.allow_zero_stock === true || r.allow_zero_stock === 'true')) az = true;
+      else az = true; // padrão ON
+      enriched.push({ ...r, allow_zero_stock: az, catalog_slug: catalog_slug || r.catalog_slug || null, catalog_url });
     }
     rows = enriched;
   }
@@ -645,6 +659,18 @@ entities.post('/:entity', async (c) => {
 
   if (normalizeEntityName(entity) === 'AppSettings' && user?.id && admin) {
     try {
+      // Backup PIN em role_payment_methods (sobrevive se coluna pin_hash falhar)
+      if (body.pin_hash) {
+        body.pin_set = true;
+        const rpm = (body.role_payment_methods && typeof body.role_payment_methods === 'object')
+          ? { ...body.role_payment_methods }
+          : {};
+        rpm.__darocha_security = Object.assign({}, rpm.__darocha_security || {}, {
+          pin_hash: body.pin_hash,
+          pin_set: true,
+        });
+        body.role_payment_methods = rpm;
+      }
       const { data: existingRows } = await admin
         .from(table)
         .select('*')
@@ -654,15 +680,50 @@ entities.post('/:entity', async (c) => {
       const existing = (existingRows && existingRows[0]) || null;
       if (existing?.id) {
         body = await preserveAppSettingsIntegrations(existing.id, body);
-        const { data: updated, error: upErr } = await admin
-          .from(table)
-          .update(body)
-          .eq('id', existing.id)
-          .select()
-          .maybeSingle();
+        // merge security pin into existing rpm
+        if (body.pin_hash) {
+          const prevRpm = (existing.role_payment_methods && typeof existing.role_payment_methods === 'object')
+            ? existing.role_payment_methods : {};
+          body.role_payment_methods = {
+            ...prevRpm,
+            ...(body.role_payment_methods || {}),
+            __darocha_security: {
+              ...(prevRpm.__darocha_security || {}),
+              pin_hash: body.pin_hash,
+              pin_set: true,
+            },
+          };
+        }
+        let updated = null;
+        let upErr = null;
+        try {
+          const r1 = await admin.from(table).update(body).eq('id', existing.id).select().maybeSingle();
+          updated = r1.data;
+          upErr = r1.error;
+        } catch (e1) {
+          upErr = e1;
+        }
+        // Se pin_hash coluna não existe, tenta sem ela
+        if (upErr && body.pin_hash) {
+          const body2 = { ...body };
+          delete body2.pin_hash;
+          delete body2.pin_set;
+          delete body2.pin_failed_attempts;
+          delete body2.pin_locked_until;
+          const r2 = await admin.from(table).update(body2).eq('id', existing.id).select().maybeSingle();
+          if (!r2.error && r2.data) {
+            updated = r2.data;
+            upErr = null;
+          }
+        }
         if (!upErr && updated) {
           const row = toBase44Row(updated);
+          if (body.pin_hash) {
+            row.pin_hash = body.pin_hash;
+            row.pin_set = true;
+          }
           if (allowZeroStockSaved != null) row.allow_zero_stock = allowZeroStockSaved;
+          else row.allow_zero_stock = true;
           try { invalidateListCache(entity, user.id); } catch (_) {}
           return c.json(row);
         }

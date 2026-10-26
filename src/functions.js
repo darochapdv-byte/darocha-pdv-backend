@@ -379,27 +379,29 @@ functions.post("/finalize-sale", async (c) => {
       }
     } catch (_) {}
 
-    // allow_zero_stock com cache (45s)
-    let allowZeroStock = body.allow_zero_stock !== false; // padrão ativo
+    // allow_zero_stock: padrão ATIVO; só desliga se a loja marcou false
+    let allowZeroStock = true;
     try {
       const azKey = `azs:${user.id}`;
       const cachedAz = cacheGet(azKey);
       if (typeof cachedAz === 'boolean') {
-        if (cachedAz) allowZeroStock = true;
+        allowZeroStock = cachedAz;
       } else {
         const { data: ownSettings } = await admin
           .from('app_settings').select('allow_zero_stock')
           .eq('created_by', user.id)
-          .order('created_at', { ascending: false }).limit(5);
-        const fromDb = (ownSettings || []).some((s) => s && s.allow_zero_stock === true);
-        if (fromDb) allowZeroStock = true;
-        else if (!allowZeroStock) allowZeroStock = !!(await getAllowZeroStock(user.id));
-        cacheSet(azKey, allowZeroStock, 45000);
+          .order('created_at', { ascending: false }).limit(3);
+        const explicitOff = (ownSettings || []).some((s) => s && (s.allow_zero_stock === false || s.allow_zero_stock === 'false'));
+        const explicitOn = (ownSettings || []).some((s) => s && (s.allow_zero_stock === true || s.allow_zero_stock === 'true'));
+        if (explicitOff && !explicitOn) allowZeroStock = false;
+        else allowZeroStock = true;
+        cacheSet(azKey, allowZeroStock, 120000);
       }
     } catch {
-      try { allowZeroStock = (await getAllowZeroStock(user.id)) || allowZeroStock; }
-      catch { allowZeroStock = allowZeroStock; }
+      allowZeroStock = true;
     }
+    if (body.allow_zero_stock === false) allowZeroStock = false;
+    if (body.allow_zero_stock === true) allowZeroStock = true;
 
     if (!items.length) {
       return c.json({ error: 'Carrinho vazio. Nenhuma alteração foi realizada.' }, 400);
